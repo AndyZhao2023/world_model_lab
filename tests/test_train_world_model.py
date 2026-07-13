@@ -9,6 +9,7 @@ from world_model_lab.model import WorldModelMLP
 from world_model_lab.train_world_model import (
     evaluate_model,
     load_checkpoint,
+    predict_deltas,
     run_training,
     save_checkpoint,
     train_model,
@@ -24,6 +25,25 @@ def make_linear_dynamics(count: int = 256) -> tuple[np.ndarray, np.ndarray]:
 
 
 class TrainWorldModelTest(unittest.TestCase):
+    def test_predict_deltas_returns_denormalized_physical_values(self):
+        inputs, targets = make_linear_dynamics(count=64)
+        result = train_model(
+            inputs[:48],
+            targets[:48],
+            validation_inputs=inputs[48:],
+            validation_targets=targets[48:],
+            hidden_size=16,
+            epochs=2,
+            batch_size=32,
+            learning_rate=1e-3,
+            seed=3,
+        )
+
+        predictions = predict_deltas(result, inputs[:5])
+
+        self.assertEqual(predictions.shape, (5, 4))
+        self.assertTrue(np.all(np.isfinite(predictions)))
+
     def test_mlp_maps_each_input_row_to_four_deltas(self):
         model = WorldModelMLP(hidden_size=16)
 

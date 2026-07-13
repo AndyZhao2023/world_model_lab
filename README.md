@@ -230,3 +230,56 @@ MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
 heading 和速度误差。默认选择最长的测试 episode 绘制真实/预测 XY 轨迹以及三类
 误差随 rollout 步数的变化。这里使用数据集中记录的动作，不让模型预测动作或终止
 条件。
+
+## 模型诊断实验室
+
+普通 rollout 图适合查看某一条轨迹；模型诊断命令使用固定评估协议回答三个问题：
+
+1. 测试数据覆盖了哪些状态和动作区域？
+2. 模型在哪些区域单步误差较大？
+3. 递归使用预测状态时，误差会怎样随 horizon 累积？
+
+运行完整诊断：
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
+  .venv/bin/python -m world_model_lab.diagnose_model \
+  --data data/transitions.npz \
+  --checkpoint artifacts/world_model.pt \
+  --output-dir artifacts/diagnostics/baseline \
+  --horizons 1 5 10 20 50 \
+  --windows-per-episode 8 \
+  --xy-bins 12 \
+  --feature-bins 8 \
+  --min-bin-count 5
+```
+
+重新执行 editable install 后，也可以使用：
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
+  .venv/bin/world-model-diagnose
+```
+
+命令生成一个可复现的 benchmark bundle：
+
+| 文件 | 内容 |
+|---|---|
+| `metrics.json` | 单步误差、状态/动作分箱、固定窗口 rollout 指标 |
+| `manifest.json` | 数据集和 checkpoint 的 SHA-256、测试 episode 和诊断参数 |
+| `overview.png` | 训练/测试 XY 覆盖、XY 误差、速度和动作误差切片 |
+| `rollout_errors.png` | Teacher Forcing 与 Free Rollout 的 horizon 曲线 |
+
+误差指标只使用 checkpoint 记录的测试 episode。覆盖图同时显示训练集和测试集，
+用于识别分布差异，但训练 transition 不会参与误差计算。
+
+所有 horizon 使用同一组最大长度窗口。每个 episode 最多选择固定数量、均匀分布的
+窗口；聚合时先在 episode 内平均，再对 episode 求平均，避免长 episode 因为窗口多
+而获得更大权重。
+
+- **Teacher Forcing**：每一步都输入数据集中记录的真实状态，反映局部单步误差。
+- **Free Rollout**：只给初始真实状态，后续递归输入模型预测，反映误差累积。
+
+当两条曲线随 horizon 分离时，差值主要来自 compounding error。样本数小于
+`min_bin_count` 的空间或特征区间会在误差图中被遮罩；其样本数量仍保留在 JSON
+和覆盖图中，不能把低覆盖区域误判成模型表现良好。

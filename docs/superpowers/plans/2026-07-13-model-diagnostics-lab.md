@@ -34,7 +34,7 @@
 - Produces: `predict_deltas(result, inputs: np.ndarray) -> np.ndarray` for `TrainingResult | LoadedWorldModel`.
 - Preserves: `build_model_arrays(...)` and `evaluate_model(...)` behavior.
 
-- [ ] **Step 1: Write failing feature-construction test**
+- [x] **Step 1: Write failing feature-construction test**
 
 Add to `tests/test_dataset.py`:
 
@@ -50,13 +50,13 @@ def test_build_model_inputs_encodes_heading_without_targets(self):
     np.testing.assert_allclose(inputs, [[1.0, 2.0, 1.0, 0.0, 0.5, 0.1, -0.2]], atol=1e-12)
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [x] **Step 2: Run the test and verify RED**
 
 Run: `.venv/bin/python -m unittest tests.test_dataset.DatasetTest.test_build_model_inputs_encodes_heading_without_targets -v`
 
 Expected: import failure because `build_model_inputs` does not exist.
 
-- [ ] **Step 3: Implement input construction and refactor the existing array builder**
+- [x] **Step 3: Implement input construction and refactor the existing array builder**
 
 Add to `dataset.py` and make `build_model_arrays` call it after validating `next_states`:
 
@@ -83,13 +83,13 @@ def build_model_inputs(states: np.ndarray, actions: np.ndarray) -> np.ndarray:
     )
 ```
 
-- [ ] **Step 4: Run dataset tests and verify GREEN**
+- [x] **Step 4: Run dataset tests and verify GREEN**
 
 Run: `.venv/bin/python -m unittest tests.test_dataset -v`
 
 Expected: all dataset tests pass.
 
-- [ ] **Step 5: Write failing raw-delta prediction test**
+- [x] **Step 5: Write failing raw-delta prediction test**
 
 Add to `tests/test_train_world_model.py`:
 
@@ -110,13 +110,13 @@ def test_predict_deltas_returns_denormalized_physical_values(self):
     self.assertTrue(np.all(np.isfinite(predictions)))
 ```
 
-- [ ] **Step 6: Run the prediction test and verify RED**
+- [x] **Step 6: Run the prediction test and verify RED**
 
 Run: `.venv/bin/python -m unittest tests.test_train_world_model.TrainWorldModelTest.test_predict_deltas_returns_denormalized_physical_values -v`
 
 Expected: import failure because `predict_deltas` does not exist.
 
-- [ ] **Step 7: Extract the batch prediction function**
+- [x] **Step 7: Extract the batch prediction function**
 
 Add to `train_world_model.py` and call it from `evaluate_model`:
 
@@ -135,7 +135,7 @@ def predict_deltas(
     return result.target_normalizer.denormalize(normalized_predictions)
 ```
 
-- [ ] **Step 8: Verify inference tests and commit**
+- [x] **Step 8: Verify inference tests and commit**
 
 Run: `.venv/bin/python -m unittest tests.test_dataset tests.test_train_world_model -v`
 
@@ -155,7 +155,7 @@ Commit: `git add src/world_model_lab/dataset.py src/world_model_lab/train_world_
 - Produces: `RolloutWindow`, `WindowSelection` dataclasses.
 - Produces: `summarize_values`, `compute_state_errors`, `select_rollout_windows`, `build_feature_slice`, and `build_xy_grid`.
 
-- [ ] **Step 1: Write failing statistics and angle-wrap tests**
+- [x] **Step 1: Write failing statistics and angle-wrap tests**
 
 Create `tests/test_diagnostics.py` with:
 
@@ -186,13 +186,13 @@ class DiagnosticsTest(unittest.TestCase):
         self.assertEqual(summary["max"], 10.0)
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `.venv/bin/python -m unittest tests.test_diagnostics -v`
 
 Expected: import failure because `world_model_lab.diagnostics` does not exist.
 
-- [ ] **Step 3: Implement statistics and state errors**
+- [x] **Step 3: Implement statistics and state errors**
 
 Create `diagnostics.py` with the dataclass imports and these functions:
 
@@ -222,13 +222,13 @@ def compute_state_errors(predicted_states, true_states) -> dict[str, np.ndarray]
     }
 ```
 
-- [ ] **Step 4: Verify GREEN for statistics**
+- [x] **Step 4: Verify GREEN for statistics**
 
 Run: `.venv/bin/python -m unittest tests.test_diagnostics.DiagnosticsTest.test_state_errors_use_euclidean_position_and_wrapped_heading tests.test_diagnostics.DiagnosticsTest.test_summary_reports_distribution_statistics -v`
 
 Expected: both tests pass.
 
-- [ ] **Step 5: Add failing deterministic-window tests**
+- [x] **Step 5: Add failing deterministic-window tests**
 
 Add a synthetic two-episode dataset and assert:
 
@@ -251,13 +251,13 @@ np.testing.assert_array_equal(selection.eligible_episode_ids, [3])
 np.testing.assert_array_equal(selection.skipped_episode_ids, [4])
 ```
 
-- [ ] **Step 6: Run and verify RED**
+- [x] **Step 6: Run and verify RED**
 
 Run: `.venv/bin/python -m unittest tests.test_diagnostics.DiagnosticsTest.test_rollout_windows_are_evenly_spaced_and_skip_short_episodes -v`
 
 Expected: import or attribute failure for the window API.
 
-- [ ] **Step 7: Implement validated trajectory extraction and window selection**
+- [x] **Step 7: Implement validated trajectory extraction and window selection**
 
 Add immutable dataclasses and deterministic index selection:
 
@@ -288,13 +288,13 @@ steps `0..T-1`, verify `states[1:] == next_states[:-1]`, build the `T+1` true
 state sequence, and slice exactly `max_horizon + 1` states plus `max_horizon`
 actions for each selected start.
 
-- [ ] **Step 8: Add failing bin tests**
+- [x] **Step 8: Add failing bin tests**
 
 Test that `build_feature_slice` and `build_xy_grid` retain counts but return
 `None` summaries below `min_bin_count`, and that the final edge includes the
 maximum observed value.
 
-- [ ] **Step 9: Implement shared bin summaries**
+- [x] **Step 9: Implement shared bin summaries**
 
 Use `np.histogram_bin_edges`-equivalent linear edges from explicit minimum and
 maximum values. Assign the maximum to the final bin using `np.searchsorted(...,
@@ -309,7 +309,7 @@ side="right") - 1` followed by clipping. Each bin/cell has this JSON-safe form:
 }
 ```
 
-- [ ] **Step 10: Verify diagnostics primitives and commit**
+- [x] **Step 10: Verify diagnostics primitives and commit**
 
 Run: `.venv/bin/python -m unittest tests.test_diagnostics -v`
 
@@ -329,7 +329,7 @@ Commit: `git add src/world_model_lab/diagnostics.py tests/test_diagnostics.py &&
 - Produces: `predict_next_states(world_model, states, actions)`.
 - Produces: `build_diagnostic_metrics(world_model, arrays, split_episode_ids, horizons, windows_per_episode, xy_bins, feature_bins, min_bin_count) -> dict[str, Any]`.
 
-- [ ] **Step 1: Write failing teacher-forcing/free-rollout test**
+- [x] **Step 1: Write failing teacher-forcing/free-rollout test**
 
 Reuse a constant-delta loaded model. Construct true dynamics whose first step
 matches the model and whose later state-dependent deltas diverge. Assert:
@@ -357,13 +357,13 @@ self.assertGreater(
 )
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `.venv/bin/python -m unittest tests.test_diagnostics.DiagnosticsTest.test_free_rollout_exposes_compounding_error -v`
 
 Expected: missing `build_diagnostic_metrics`.
 
-- [ ] **Step 3: Implement batch next-state prediction**
+- [x] **Step 3: Implement batch next-state prediction**
 
 ```python
 def predict_next_states(world_model, states, actions) -> np.ndarray:
@@ -375,7 +375,7 @@ def predict_next_states(world_model, states, actions) -> np.ndarray:
     return predictions
 ```
 
-- [ ] **Step 4: Implement episode-balanced rollout summaries**
+- [x] **Step 4: Implement episode-balanced rollout summaries**
 
 For every selected window, compute teacher-forced predictions from
 `true_states[:-1]`, and compute free predictions with `rollout_episode`. At each
@@ -383,7 +383,7 @@ horizon, group scalar errors by `episode_id`, average windows within each group,
 then call `summarize_values` over those per-episode means. Return both
 `episodes` and `windows` counts alongside the three error summaries.
 
-- [ ] **Step 5: Assemble the complete JSON-safe metrics structure**
+- [x] **Step 5: Assemble the complete JSON-safe metrics structure**
 
 The top-level mapping must be:
 
@@ -423,13 +423,13 @@ The top-level mapping must be:
 }
 ```
 
-- [ ] **Step 6: Add an episode-balancing regression test**
+- [x] **Step 6: Add an episode-balancing regression test**
 
 Use one episode with one window and large error and another with multiple
 windows and zero error. Assert the reported macro mean gives the two episodes
 equal weight rather than weighting all windows equally.
 
-- [ ] **Step 7: Verify benchmark core and commit**
+- [x] **Step 7: Verify benchmark core and commit**
 
 Run: `.venv/bin/python -m unittest tests.test_diagnostics -v`
 
@@ -449,32 +449,32 @@ Commit: `git add src/world_model_lab/diagnostics.py tests/test_diagnostics.py &&
 - Produces: `plot_diagnostic_overview(metrics, output_path) -> Path`.
 - Produces: `plot_rollout_errors(metrics, output_path) -> Path`.
 
-- [ ] **Step 1: Write failing PNG output tests**
+- [x] **Step 1: Write failing PNG output tests**
 
 Build a minimal JSON-style metrics fixture containing a 2x2 coverage/error grid,
 two-bin feature slices, and horizons 1 and 2. Assert both functions return the
 requested paths and create files beginning with `b"\x89PNG\r\n\x1a\n"`.
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib .venv/bin/python -m unittest tests.test_diagnostic_plots -v`
 
 Expected: import failure because the plotting module does not exist.
 
-- [ ] **Step 3: Implement overview plotting**
+- [x] **Step 3: Implement overview plotting**
 
 Create a 2x3 figure containing train XY counts, test XY counts, test position
 MAE, and position-MAE slices for velocity, steering, and acceleration. Convert
 JSON `None` cells to masked `np.nan` values only inside the plot function. Each
 feature-slice panel uses a secondary Y axis for sample counts.
 
-- [ ] **Step 4: Implement rollout plotting**
+- [x] **Step 4: Implement rollout plotting**
 
 Create one panel each for position, heading, and velocity. Plot macro mean at
 every horizon with separate labelled lines for `Teacher forcing` and `Free
 rollout`. Use physical units in axis labels and close the figure after saving.
 
-- [ ] **Step 5: Verify plots and commit**
+- [x] **Step 5: Verify plots and commit**
 
 Run: `MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib .venv/bin/python -m unittest tests.test_diagnostic_plots -v`
 
@@ -496,7 +496,7 @@ Commit: `git add src/world_model_lab/diagnostic_plots.py tests/test_diagnostic_p
 - Produces: `run_diagnostics(...) -> dict[str, Any]`.
 - Produces: module CLI and `world-model-diagnose` console command.
 
-- [ ] **Step 1: Write failing SHA-256 test**
+- [x] **Step 1: Write failing SHA-256 test**
 
 ```python
 def test_sha256_file_is_content_based(self):
@@ -510,13 +510,13 @@ def test_sha256_file_is_content_based(self):
     )
 ```
 
-- [ ] **Step 2: Run and verify RED**
+- [x] **Step 2: Run and verify RED**
 
 Run: `.venv/bin/python -m unittest tests.test_diagnose_model -v`
 
 Expected: import failure because `diagnose_model` does not exist.
 
-- [ ] **Step 3: Implement hashing and strict JSON writing**
+- [x] **Step 3: Implement hashing and strict JSON writing**
 
 ```python
 def sha256_file(path: Path | str) -> str:
@@ -533,7 +533,7 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     )
 ```
 
-- [ ] **Step 4: Write failing output-bundle smoke test**
+- [x] **Step 4: Write failing output-bundle smoke test**
 
 Create a temporary NPZ with train/test episodes and save a constant-delta
 checkpoint. Call `run_diagnostics` with horizons `(1, 2)`, then assert that
@@ -541,7 +541,7 @@ checkpoint. Call `run_diagnostics` with horizons `(1, 2)`, then assert that
 Load both JSON files and assert hashes, resolved paths, training config, test
 episode IDs, and diagnostic parameters are present.
 
-- [ ] **Step 5: Implement orchestration and manifest**
+- [x] **Step 5: Implement orchestration and manifest**
 
 `run_diagnostics` must validate arrays `states`, `actions`, `next_states`,
 `episode_ids`, and `step_ids`; load the checkpoint; call
@@ -572,7 +572,7 @@ The manifest structure is:
 }
 ```
 
-- [ ] **Step 6: Add CLI arguments and console entry point**
+- [x] **Step 6: Add CLI arguments and console entry point**
 
 Add `main()` with defaults from the design and catch `FileNotFoundError` plus
 `ValueError` with `parser.error`. Add to `pyproject.toml`:
@@ -581,7 +581,7 @@ Add `main()` with defaults from the design and catch `FileNotFoundError` plus
 world-model-diagnose = "world_model_lab.diagnose_model:main"
 ```
 
-- [ ] **Step 7: Verify CLI/bundle tests and commit**
+- [x] **Step 7: Verify CLI/bundle tests and commit**
 
 Run: `MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib .venv/bin/python -m unittest tests.test_diagnose_model -v`
 
@@ -600,14 +600,14 @@ Commit: `git add src/world_model_lab/diagnose_model.py tests/test_diagnose_model
 **Interfaces:**
 - Documents: command, output bundle, metric semantics, and interpretation cautions.
 
-- [ ] **Step 1: Document the exact command and outputs**
+- [x] **Step 1: Document the exact command and outputs**
 
 Add a `模型诊断实验室` section to `README.md` containing the CLI from the design,
 the four output files, the fixed-window/episode-balanced protocol, and the
 meaning of teacher forcing versus free rollout. State that sparse bins are
 masked and that error metrics use only checkpoint test episodes.
 
-- [ ] **Step 2: Run the full test suite**
+- [x] **Step 2: Run the full test suite**
 
 Run:
 
@@ -619,7 +619,7 @@ MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
 Expected: the original 35 tests plus all new diagnostics tests pass with zero
 failures and zero errors.
 
-- [ ] **Step 3: Run the real-data benchmark smoke test**
+- [x] **Step 3: Run the real-data benchmark smoke test**
 
 Run:
 
@@ -639,7 +639,7 @@ MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
 Expected: exit code zero, finite overall/longest-horizon summary values, and all
 four output files.
 
-- [ ] **Step 4: Validate generated artifacts**
+- [x] **Step 4: Validate generated artifacts**
 
 Run:
 
@@ -653,7 +653,7 @@ git diff --check
 Expected: both JSON files parse, both images are PNG files, and `git diff
 --check` exits zero.
 
-- [ ] **Step 5: Mark this plan complete and commit documentation**
+- [x] **Step 5: Mark this plan complete and commit documentation**
 
 Change every completed checkbox in this plan to `[x]` only after its command has
 been run successfully.

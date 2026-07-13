@@ -5,6 +5,7 @@ import numpy as np
 
 from world_model_lab.dataset import (
     build_model_arrays,
+    build_model_inputs,
     fit_normalizer,
     split_episode_ids,
     wrap_angle,
@@ -12,6 +13,18 @@ from world_model_lab.dataset import (
 
 
 class DatasetTest(unittest.TestCase):
+    def test_build_model_inputs_encodes_heading_without_targets(self):
+        states = np.asarray([[1.0, 2.0, math.pi / 2.0, 0.5]])
+        actions = np.asarray([[0.1, -0.2]])
+
+        inputs = build_model_inputs(states, actions)
+
+        np.testing.assert_allclose(
+            inputs,
+            [[1.0, 2.0, 1.0, 0.0, 0.5, 0.1, -0.2]],
+            atol=1e-12,
+        )
+
     def test_wrap_angle_maps_values_to_half_open_pi_interval(self):
         values = np.asarray(
             [-3 * math.pi, -math.pi, -0.2, math.pi, 3 * math.pi],
