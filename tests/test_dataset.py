@@ -4,8 +4,10 @@ import unittest
 import numpy as np
 
 from world_model_lab.dataset import (
+    SequenceWindows,
     build_model_arrays,
     build_model_inputs,
+    build_sequence_windows,
     fit_normalizer,
     split_episode_ids,
     wrap_angle,
@@ -13,6 +15,69 @@ from world_model_lab.dataset import (
 
 
 class DatasetTest(unittest.TestCase):
+    def test_sequence_windows_are_ordered_and_never_cross_episodes(self):
+        states = np.asarray(
+            [
+                [0.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0, 0.0],
+                [10.0, 0.0, 0.0, 0.0],
+                [11.0, 0.0, 0.0, 0.0],
+            ]
+        )
+        next_states = states + np.asarray([1.0, 0.0, 0.0, 0.0])
+        actions = np.arange(10, dtype=np.float64).reshape(5, 2)
+
+        windows = build_sequence_windows(
+            states,
+            actions,
+            next_states,
+            episode_ids=np.asarray([0, 0, 0, 1, 1]),
+            step_ids=np.asarray([0, 1, 2, 0, 1]),
+            selected_episode_ids=np.asarray([0, 1]),
+            horizon=2,
+        )
+
+        self.assertIsInstance(windows, SequenceWindows)
+        self.assertEqual(windows.states.shape, (3, 2, 4))
+        self.assertEqual(windows.actions.shape, (3, 2, 2))
+        self.assertEqual(windows.next_states.shape, (3, 2, 4))
+        np.testing.assert_array_equal(windows.episode_ids, [0, 0, 1])
+        np.testing.assert_array_equal(windows.start_step_ids, [0, 1, 0])
+        np.testing.assert_array_equal(windows.states[1, :, 0], [1.0, 2.0])
+        np.testing.assert_array_equal(windows.states[2, :, 0], [10.0, 11.0])
+
+    def test_sequence_windows_reject_non_contiguous_steps(self):
+        states = np.zeros((2, 4))
+        next_states = states.copy()
+        next_states[0] = states[1]
+
+        with self.assertRaisesRegex(ValueError, "step_ids must be contiguous"):
+            build_sequence_windows(
+                states,
+                np.zeros((2, 2)),
+                next_states,
+                episode_ids=np.asarray([3, 3]),
+                step_ids=np.asarray([0, 2]),
+                selected_episode_ids=np.asarray([3]),
+                horizon=2,
+            )
+
+    def test_sequence_windows_return_typed_empty_arrays_for_short_episodes(self):
+        windows = build_sequence_windows(
+            np.zeros((1, 4)),
+            np.zeros((1, 2)),
+            np.ones((1, 4)),
+            episode_ids=np.asarray([4]),
+            step_ids=np.asarray([0]),
+            selected_episode_ids=np.asarray([4]),
+            horizon=2,
+        )
+
+        self.assertEqual(windows.count, 0)
+        self.assertEqual(windows.states.shape, (0, 2, 4))
+        self.assertEqual(windows.actions.shape, (0, 2, 2))
+
     def test_build_model_inputs_encodes_heading_without_targets(self):
         states = np.asarray([[1.0, 2.0, math.pi / 2.0, 0.5]])
         actions = np.asarray([[0.1, -0.2]])

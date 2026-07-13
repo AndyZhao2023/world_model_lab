@@ -22,6 +22,25 @@ class Normalizer:
         return np.asarray(values, dtype=np.float64) * self.std + self.mean
 
 
+@dataclass(frozen=True)
+class SequenceWindows:
+    """Validated fixed-horizon transition windows."""
+
+    states: np.ndarray
+    actions: np.ndarray
+    next_states: np.ndarray
+    episode_ids: np.ndarray
+    start_step_ids: np.ndarray
+
+    @property
+    def horizon(self) -> int:
+        return int(self.actions.shape[1])
+
+    @property
+    def count(self) -> int:
+        return int(self.actions.shape[0])
+
+
 def wrap_angle(values: np.ndarray | float) -> np.ndarray:
     """Map angles in radians to the half-open interval ``[-pi, pi)``."""
 
@@ -115,6 +134,87 @@ def build_model_arrays(
     targets = next_states - states
     targets[:, 2] = wrap_angle(targets[:, 2])
     return inputs, targets
+
+
+def build_sequence_windows(
+    states: np.ndarray,
+    actions: np.ndarray,
+    next_states: np.ndarray,
+    *,
+    episode_ids: np.ndarray,
+    step_ids: np.ndarray,
+    selected_episode_ids: np.ndarray,
+    horizon: int,
+) -> SequenceWindows:
+    """Return every contiguous fixed-horizon window from selected episodes."""
+
+    states = np.asarray(states, dtype=np.float64)
+    actions = np.asarray(actions, dtype=np.float64)
+    next_states = np.asarray(next_states, dtype=np.float64)
+    episode_ids = np.asarray(episode_ids)
+    step_ids = np.asarray(step_ids)
+    selected_episode_ids = np.asarray(selected_episode_ids)
+    count = states.shape[0]
+    if horizon <= 0:
+        raise ValueError("rollout horizon must be positive")
+    if states.shape != (count, 4) or next_states.shape != (count, 4):
+        raise ValueError("states and next_states must have shape [N, 4]")
+    if actions.shape != (count, 2):
+        raise ValueError("actions must have shape [N, 2]")
+    if episode_ids.shape != (count,) or step_ids.shape != (count,):
+        raise ValueError("episode_ids and step_ids must have shape [N]")
+    if selected_episode_ids.ndim != 1:
+        raise ValueError("selected_episode_ids must be one-dimensional")
+    if not all(
+        np.all(np.isfinite(array)) for array in (states, actions, next_states)
+    ):
+        raise ValueError("sequence arrays must contain only finite values")
+
+    state_windows: list[np.ndarray] = []
+    action_windows: list[np.ndarray] = []
+    next_state_windows: list[np.ndarray] = []
+    window_episode_ids: list[int] = []
+    start_step_ids: list[int] = []
+    for episode_id_value in selected_episode_ids.tolist():
+        episode_id = int(episode_id_value)
+        indices = np.flatnonzero(episode_ids == episode_id)
+        if indices.size == 0:
+            raise ValueError(f"episode {episode_id} is missing from the dataset")
+        indices = indices[np.argsort(step_ids[indices], kind="stable")]
+        ordered_steps = step_ids[indices]
+        if not np.array_equal(ordered_steps, np.arange(indices.size)):
+            raise ValueError(
+                f"episode {episode_id} step_ids must be contiguous from zero"
+            )
+        episode_states = states[indices]
+        episode_next_states = next_states[indices]
+        if indices.size > 1 and not np.allclose(
+            episode_states[1:], episode_next_states[:-1], atol=1e-10
+        ):
+            raise ValueError(f"episode {episode_id} transitions are not contiguous")
+        for start in range(indices.size - horizon + 1):
+            stop = start + horizon
+            state_windows.append(episode_states[start:stop])
+            action_windows.append(actions[indices[start:stop]])
+            next_state_windows.append(episode_next_states[start:stop])
+            window_episode_ids.append(episode_id)
+            start_step_ids.append(start)
+
+    if state_windows:
+        window_states = np.stack(state_windows)
+        window_actions = np.stack(action_windows)
+        window_next_states = np.stack(next_state_windows)
+    else:
+        window_states = np.empty((0, horizon, 4), dtype=np.float64)
+        window_actions = np.empty((0, horizon, 2), dtype=np.float64)
+        window_next_states = np.empty((0, horizon, 4), dtype=np.float64)
+    return SequenceWindows(
+        states=window_states,
+        actions=window_actions,
+        next_states=window_next_states,
+        episode_ids=np.asarray(window_episode_ids, dtype=np.int64),
+        start_step_ids=np.asarray(start_step_ids, dtype=np.int64),
+    )
 
 
 def fit_normalizer(values: np.ndarray) -> Normalizer:
