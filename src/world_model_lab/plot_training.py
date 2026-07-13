@@ -25,12 +25,12 @@ def plot_training_history(
     epochs = range(1, len(checkpoint.train_losses) + 1)
 
     figure, axis = plt.subplots(figsize=(8, 5))
-    axis.plot(epochs, checkpoint.train_losses, label="Train loss", linewidth=2)
+    axis.plot(epochs, checkpoint.train_losses, label="Train total", linewidth=2)
     if checkpoint.validation_losses:
         axis.plot(
             epochs,
             checkpoint.validation_losses,
-            label="Validation loss",
+            label="Validation total",
             linewidth=2,
         )
         best_loss = checkpoint.validation_losses[checkpoint.best_epoch - 1]
@@ -41,6 +41,40 @@ def plot_training_history(
             color="#d1495b",
             zorder=3,
         )
+
+    has_rollout_history = any(
+        loss != 0.0
+        for loss in (
+            checkpoint.train_rollout_losses
+            + checkpoint.validation_rollout_losses
+        )
+    )
+    if has_rollout_history:
+        axis.plot(
+            epochs,
+            checkpoint.train_one_step_losses,
+            label="Train one-step",
+            linestyle="--",
+        )
+        axis.plot(
+            epochs,
+            checkpoint.train_rollout_losses,
+            label="Train rollout",
+            linestyle=":",
+        )
+        if checkpoint.validation_losses:
+            axis.plot(
+                epochs,
+                checkpoint.validation_one_step_losses,
+                label="Validation one-step",
+                linestyle="--",
+            )
+            axis.plot(
+                epochs,
+                checkpoint.validation_rollout_losses,
+                label="Validation rollout",
+                linestyle=":",
+            )
 
     axis.set(
         xlabel="Epoch",

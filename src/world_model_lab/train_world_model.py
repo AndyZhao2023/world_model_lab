@@ -57,6 +57,10 @@ class LoadedWorldModel:
     validation_losses: list[float]
     best_epoch: int
     test_metrics: dict[str, float]
+    train_one_step_losses: list[float] = field(default_factory=list)
+    train_rollout_losses: list[float] = field(default_factory=list)
+    validation_one_step_losses: list[float] = field(default_factory=list)
+    validation_rollout_losses: list[float] = field(default_factory=list)
 
     @property
     def losses(self) -> list[float]:
@@ -356,8 +360,18 @@ def save_checkpoint(
 
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
+    train_one_step_losses = result.train_one_step_losses or result.train_losses
+    train_rollout_losses = result.train_rollout_losses or [
+        0.0
+    ] * len(result.train_losses)
+    validation_one_step_losses = (
+        result.validation_one_step_losses or result.validation_losses
+    )
+    validation_rollout_losses = result.validation_rollout_losses or [
+        0.0
+    ] * len(result.validation_losses)
     payload = {
-        "format_version": 2,
+        "format_version": 3,
         "model_config": {"hidden_size": result.model.hidden_size},
         "model_state_dict": result.model.state_dict(),
         "input_mean": _as_float_tensor(result.input_normalizer.mean),
@@ -371,6 +385,10 @@ def save_checkpoint(
         "training_config": dict(training_config),
         "train_losses": list(result.train_losses),
         "validation_losses": list(result.validation_losses),
+        "train_one_step_losses": list(train_one_step_losses),
+        "train_rollout_losses": list(train_rollout_losses),
+        "validation_one_step_losses": list(validation_one_step_losses),
+        "validation_rollout_losses": list(validation_rollout_losses),
         "best_epoch": result.best_epoch,
         "test_metrics": dict(test_metrics),
     }
@@ -383,7 +401,7 @@ def load_checkpoint(path: Path | str) -> LoadedWorldModel:
 
     payload = torch.load(Path(path), map_location="cpu", weights_only=True)
     format_version = payload.get("format_version")
-    if format_version not in (1, 2):
+    if format_version not in (1, 2, 3):
         raise ValueError("unsupported checkpoint format")
     model = WorldModelMLP(hidden_size=int(payload["model_config"]["hidden_size"]))
     model.load_state_dict(payload["model_state_dict"])
@@ -402,6 +420,24 @@ def load_checkpoint(path: Path | str) -> LoadedWorldModel:
         test_metrics = {
             name: float(value) for name, value in payload["test_metrics"].items()
         }
+    if format_version in (1, 2):
+        train_one_step_losses = list(train_losses)
+        train_rollout_losses = [0.0] * len(train_losses)
+        validation_one_step_losses = list(validation_losses)
+        validation_rollout_losses = [0.0] * len(validation_losses)
+    else:
+        train_one_step_losses = [
+            float(loss) for loss in payload["train_one_step_losses"]
+        ]
+        train_rollout_losses = [
+            float(loss) for loss in payload["train_rollout_losses"]
+        ]
+        validation_one_step_losses = [
+            float(loss) for loss in payload["validation_one_step_losses"]
+        ]
+        validation_rollout_losses = [
+            float(loss) for loss in payload["validation_rollout_losses"]
+        ]
 
     return LoadedWorldModel(
         model=model,
@@ -422,6 +458,10 @@ def load_checkpoint(path: Path | str) -> LoadedWorldModel:
         validation_losses=validation_losses,
         best_epoch=best_epoch,
         test_metrics=test_metrics,
+        train_one_step_losses=train_one_step_losses,
+        train_rollout_losses=train_rollout_losses,
+        validation_one_step_losses=validation_one_step_losses,
+        validation_rollout_losses=validation_rollout_losses,
     )
 
 

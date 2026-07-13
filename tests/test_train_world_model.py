@@ -219,11 +219,29 @@ class TrainWorldModelTest(unittest.TestCase):
                 test_metrics=test_metrics,
             )
             loaded = load_checkpoint(path)
+            payload = torch.load(path, map_location="cpu", weights_only=True)
 
         self.assertEqual(loaded.model.hidden_size, 12)
         self.assertEqual(loaded.training_config, {"epochs": 2, "seed": 5})
         self.assertEqual(loaded.train_losses, result.train_losses)
         self.assertEqual(loaded.validation_losses, result.validation_losses)
+        self.assertEqual(
+            loaded.train_one_step_losses,
+            result.train_one_step_losses,
+        )
+        self.assertEqual(
+            loaded.train_rollout_losses,
+            result.train_rollout_losses,
+        )
+        self.assertEqual(
+            loaded.validation_one_step_losses,
+            result.validation_one_step_losses,
+        )
+        self.assertEqual(
+            loaded.validation_rollout_losses,
+            result.validation_rollout_losses,
+        )
+        self.assertEqual(payload["format_version"], 3)
         self.assertEqual(loaded.best_epoch, result.best_epoch)
         self.assertEqual(loaded.test_metrics, test_metrics)
         for name in split_ids:
@@ -237,6 +255,96 @@ class TrainWorldModelTest(unittest.TestCase):
             expected = result.model(tensor).numpy()
             actual = loaded.model(tensor).numpy()
         np.testing.assert_array_equal(actual, expected)
+
+    def test_checkpoint_loader_supports_versions_one_and_two(self):
+        inputs, targets = make_linear_dynamics(count=64)
+        result = train_model(
+            inputs[:48],
+            targets[:48],
+            validation_inputs=inputs[48:],
+            validation_targets=targets[48:],
+            hidden_size=12,
+            epochs=2,
+            batch_size=32,
+            learning_rate=1e-3,
+            seed=5,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            current_path = directory_path / "world_model_v3.pt"
+            save_checkpoint(
+                current_path,
+                result,
+                split_episode_ids={
+                    "train": np.asarray([0]),
+                    "validation": np.asarray([1]),
+                    "test": np.asarray([2]),
+                },
+                training_config={"epochs": 2},
+                test_metrics={"normalized_mse": 0.25},
+            )
+            payload = torch.load(
+                current_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+            component_keys = (
+                "train_one_step_losses",
+                "train_rollout_losses",
+                "validation_one_step_losses",
+                "validation_rollout_losses",
+            )
+
+            version_two_payload = dict(payload)
+            version_two_payload["format_version"] = 2
+            for key in component_keys:
+                version_two_payload.pop(key)
+            version_two_path = directory_path / "world_model_v2.pt"
+            torch.save(version_two_payload, version_two_path)
+            loaded_v2 = load_checkpoint(version_two_path)
+
+            version_one_payload = dict(payload)
+            version_one_payload["format_version"] = 1
+            version_one_payload["losses"] = version_one_payload.pop(
+                "train_losses"
+            )
+            for key in (
+                "validation_losses",
+                *component_keys,
+                "best_epoch",
+                "test_metrics",
+            ):
+                version_one_payload.pop(key)
+            version_one_path = directory_path / "world_model_v1.pt"
+            torch.save(version_one_payload, version_one_path)
+            loaded_v1 = load_checkpoint(version_one_path)
+
+        self.assertEqual(
+            loaded_v2.train_one_step_losses,
+            loaded_v2.train_losses,
+        )
+        self.assertEqual(
+            loaded_v2.train_rollout_losses,
+            [0.0] * len(loaded_v2.train_losses),
+        )
+        self.assertEqual(
+            loaded_v2.validation_one_step_losses,
+            loaded_v2.validation_losses,
+        )
+        self.assertEqual(
+            loaded_v2.validation_rollout_losses,
+            [0.0] * len(loaded_v2.validation_losses),
+        )
+        self.assertEqual(
+            loaded_v1.train_one_step_losses,
+            loaded_v1.train_losses,
+        )
+        self.assertEqual(
+            loaded_v1.train_rollout_losses,
+            [0.0] * len(loaded_v1.train_losses),
+        )
+        self.assertEqual(loaded_v1.validation_losses, [])
 
     def test_run_training_splits_npz_by_episode_and_saves_checkpoint(self):
         rng = np.random.default_rng(41)
