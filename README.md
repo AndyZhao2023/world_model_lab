@@ -205,6 +205,50 @@ episode 切分和训练参数。
 .venv/bin/world-model-plot-training
 ```
 
+## 多步训练实验
+
+默认的 `--rollout-horizon 1` 保留原来的单步训练路径，只优化真实
+`state_t` 输入下的下一状态变化量误差：
+
+```bash
+# 单步基线
+.venv/bin/python -m world_model_lab.train_world_model \
+  --data data/transitions.npz \
+  --output artifacts/world_model_h1.pt \
+  --rollout-horizon 1 \
+  --epochs 100 \
+  --seed 0
+```
+
+多步模式在单步损失之外加入可微分 Free Rollout 损失。模型只接收序列的真实
+初始状态；之后将自己的预测状态递归作为下一步输入，并与记录的真实状态序列比较：
+
+```bash
+# 单步损失 + 10 步 Free Rollout 损失
+.venv/bin/python -m world_model_lab.train_world_model \
+  --data data/transitions.npz \
+  --output artifacts/world_model_h10.pt \
+  --rollout-horizon 10 \
+  --rollout-loss-weight 1.0 \
+  --epochs 100 \
+  --seed 0
+```
+
+总训练目标为：
+
+```text
+total_loss = one_step_loss + rollout_loss_weight * rollout_loss
+```
+
+两项误差都用训练集 target 标准差缩放。rollout 期间仍使用数据集中记录的动作，
+不预测动作、奖励或终止条件。horizon 1 不要求数据包含 `step_ids`；horizon 大于 1
+时，`step_ids` 用于验证窗口始终位于同一个 episode 内且步数连续。
+
+checkpoint 使用格式版本 3，同时保存 `train_losses`、`validation_losses` 两条总
+损失历史，以及 one-step、rollout 的四条分项历史；加载器仍兼容格式版本 1 和 2。
+最佳 epoch 按总验证损失选择，测试集不参与选择。可以对两个 checkpoint 使用下方
+完全相同的诊断参数，公平比较 horizon 1、5、10、20、50 的 Free Rollout 误差。
+
 ## 多步 Rollout 评估
 
 单步评估每次都使用真实状态。rollout 评估只使用 episode 的真实初始状态，之后
