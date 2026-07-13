@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from world_model_lab.dataset import build_model_arrays, build_sequence_windows
 from world_model_lab.model import WorldModelMLP
 from world_model_lab.train_world_model import (
     evaluate_model,
@@ -24,7 +25,97 @@ def make_linear_dynamics(count: int = 256) -> tuple[np.ndarray, np.ndarray]:
     return inputs, targets
 
 
+def make_sequence_dynamics(
+    episodes: int = 4,
+    steps: int = 4,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    states = []
+    actions = []
+    next_states = []
+    episode_ids = []
+    step_ids = []
+    for episode_id in range(episodes):
+        state = np.asarray(
+            [float(episode_id), 0.2 * episode_id, 0.03 * episode_id, 0.2]
+        )
+        for step in range(steps):
+            action = np.asarray(
+                [0.03 * episode_id + 0.01 * step, 0.05 + 0.02 * step]
+            )
+            delta = np.asarray(
+                [
+                    0.1 + 0.02 * state[3],
+                    0.01 + 0.005 * state[0],
+                    0.01 * action[0] + 0.002 * state[3],
+                    0.01 + 0.02 * action[1],
+                ]
+            )
+            next_state = state + delta
+            states.append(state)
+            actions.append(action)
+            next_states.append(next_state)
+            episode_ids.append(episode_id)
+            step_ids.append(step)
+            state = next_state
+    return tuple(
+        np.asarray(values)
+        for values in (states, actions, next_states, episode_ids, step_ids)
+    )
+
+
 class TrainWorldModelTest(unittest.TestCase):
+    def test_multistep_training_records_finite_component_histories(self):
+        states, actions, next_states, episode_ids, step_ids = (
+            make_sequence_dynamics()
+        )
+        inputs, targets = build_model_arrays(states, actions, next_states)
+        train_mask = episode_ids < 3
+        validation_mask = episode_ids == 3
+        train_sequences = build_sequence_windows(
+            states,
+            actions,
+            next_states,
+            episode_ids=episode_ids,
+            step_ids=step_ids,
+            selected_episode_ids=np.asarray([0, 1, 2]),
+            horizon=3,
+        )
+        validation_sequences = build_sequence_windows(
+            states,
+            actions,
+            next_states,
+            episode_ids=episode_ids,
+            step_ids=step_ids,
+            selected_episode_ids=np.asarray([3]),
+            horizon=3,
+        )
+
+        result = train_model(
+            inputs[train_mask],
+            targets[train_mask],
+            validation_inputs=inputs[validation_mask],
+            validation_targets=targets[validation_mask],
+            train_sequences=train_sequences,
+            validation_sequences=validation_sequences,
+            rollout_loss_weight=1.0,
+            hidden_size=16,
+            epochs=4,
+            batch_size=4,
+            learning_rate=1e-3,
+            seed=9,
+        )
+
+        self.assertEqual(len(result.train_losses), 4)
+        self.assertTrue(np.all(np.isfinite(result.train_one_step_losses)))
+        self.assertTrue(np.all(np.isfinite(result.train_rollout_losses)))
+        self.assertTrue(np.all(np.asarray(result.train_rollout_losses) > 0.0))
+        np.testing.assert_allclose(
+            result.train_losses,
+            np.asarray(result.train_one_step_losses)
+            + np.asarray(result.train_rollout_losses),
+            rtol=1e-6,
+        )
+
     def test_predict_deltas_returns_denormalized_physical_values(self):
         inputs, targets = make_linear_dynamics(count=64)
         result = train_model(
@@ -70,6 +161,10 @@ class TrainWorldModelTest(unittest.TestCase):
 
         self.assertEqual(len(result.train_losses), 100)
         self.assertEqual(len(result.validation_losses), 100)
+        self.assertEqual(result.train_one_step_losses, result.train_losses)
+        self.assertEqual(result.validation_one_step_losses, result.validation_losses)
+        self.assertEqual(result.train_rollout_losses, [0.0] * 100)
+        self.assertEqual(result.validation_rollout_losses, [0.0] * 100)
         self.assertLess(result.train_losses[-1], result.train_losses[0] * 0.1)
         self.assertGreaterEqual(result.best_epoch, 1)
         self.assertLessEqual(result.best_epoch, 100)

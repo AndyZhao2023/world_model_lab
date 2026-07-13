@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import math
 from pathlib import Path
@@ -16,12 +16,14 @@ from torch import nn
 
 from .dataset import (
     Normalizer,
+    SequenceWindows,
     build_model_arrays,
     fit_normalizer,
     split_episode_ids,
     wrap_angle,
 )
 from .model import WorldModelMLP
+from .rollout_training import rollout_state_loss
 
 
 @dataclass
@@ -32,6 +34,10 @@ class TrainingResult:
     train_losses: list[float]
     validation_losses: list[float]
     best_epoch: int
+    train_one_step_losses: list[float] = field(default_factory=list)
+    train_rollout_losses: list[float] = field(default_factory=list)
+    validation_one_step_losses: list[float] = field(default_factory=list)
+    validation_rollout_losses: list[float] = field(default_factory=list)
 
     @property
     def losses(self) -> list[float]:
@@ -63,12 +69,47 @@ def _as_float_tensor(values: np.ndarray) -> torch.Tensor:
     return torch.as_tensor(values, dtype=torch.float32)
 
 
+def _mean_rollout_loss(
+    model: WorldModelMLP,
+    *,
+    sequence_states: torch.Tensor,
+    sequence_actions: torch.Tensor,
+    sequence_next_states: torch.Tensor,
+    batch_size: int,
+    input_mean: torch.Tensor,
+    input_std: torch.Tensor,
+    target_mean: torch.Tensor,
+    target_std: torch.Tensor,
+) -> float:
+    """Evaluate rollout loss across every supplied sequence window."""
+
+    total_loss = 0.0
+    count = sequence_states.shape[0]
+    for start in range(0, count, batch_size):
+        stop = min(start + batch_size, count)
+        loss = rollout_state_loss(
+            model,
+            initial_states=sequence_states[start:stop, 0],
+            actions=sequence_actions[start:stop],
+            true_next_states=sequence_next_states[start:stop],
+            input_mean=input_mean,
+            input_std=input_std,
+            target_mean=target_mean,
+            target_std=target_std,
+        )
+        total_loss += float(loss) * (stop - start)
+    return total_loss / count
+
+
 def train_model(
     inputs: np.ndarray,
     targets: np.ndarray,
     *,
     validation_inputs: np.ndarray,
     validation_targets: np.ndarray,
+    train_sequences: SequenceWindows | None = None,
+    validation_sequences: SequenceWindows | None = None,
+    rollout_loss_weight: float = 1.0,
     hidden_size: int = 128,
     epochs: int = 100,
     batch_size: int = 256,
@@ -96,6 +137,19 @@ def train_model(
         raise ValueError("validation data must not be empty")
     if epochs <= 0 or batch_size <= 0 or learning_rate <= 0.0:
         raise ValueError("epochs, batch_size, and learning_rate must be positive")
+    if (train_sequences is None) != (validation_sequences is None):
+        raise ValueError("train and validation sequences must be provided together")
+    if not math.isfinite(rollout_loss_weight) or rollout_loss_weight < 0.0:
+        raise ValueError("rollout_loss_weight must be finite and non-negative")
+    multi_step = train_sequences is not None
+    if multi_step:
+        assert validation_sequences is not None
+        if train_sequences.count == 0 or validation_sequences.count == 0:
+            raise ValueError("multi-step training requires non-empty sequence windows")
+        if train_sequences.horizon != validation_sequences.horizon:
+            raise ValueError("train and validation horizons must match")
+        if train_sequences.horizon <= 1:
+            raise ValueError("multi-step training requires a horizon greater than one")
 
     input_normalizer = fit_normalizer(inputs)
     target_normalizer = fit_normalizer(targets)
@@ -107,46 +161,123 @@ def train_model(
     normalized_validation_targets = _as_float_tensor(
         target_normalizer.normalize(validation_targets)
     )
+    input_mean = _as_float_tensor(input_normalizer.mean)
+    input_std = _as_float_tensor(input_normalizer.std)
+    target_mean = _as_float_tensor(target_normalizer.mean)
+    target_std = _as_float_tensor(target_normalizer.std)
+    if multi_step:
+        train_sequence_states = _as_float_tensor(train_sequences.states)
+        train_sequence_actions = _as_float_tensor(train_sequences.actions)
+        train_sequence_next_states = _as_float_tensor(train_sequences.next_states)
+        validation_sequence_states = _as_float_tensor(validation_sequences.states)
+        validation_sequence_actions = _as_float_tensor(
+            validation_sequences.actions
+        )
+        validation_sequence_next_states = _as_float_tensor(
+            validation_sequences.next_states
+        )
 
     torch.manual_seed(seed)
     model = WorldModelMLP(hidden_size=hidden_size)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     loss_function = nn.MSELoss()
     generator = torch.Generator().manual_seed(seed)
+    sequence_generator = torch.Generator().manual_seed(seed + 1)
     train_losses: list[float] = []
     validation_losses: list[float] = []
+    train_one_step_losses: list[float] = []
+    train_rollout_losses: list[float] = []
+    validation_one_step_losses: list[float] = []
+    validation_rollout_losses: list[float] = []
     best_validation_loss = math.inf
     best_epoch = 0
     best_state_dict: dict[str, torch.Tensor] | None = None
 
     for epoch_index in range(epochs):
         permutation = torch.randperm(inputs.shape[0], generator=generator)
-        epoch_loss = 0.0
+        sequence_permutation = (
+            torch.randperm(
+                train_sequences.count,
+                generator=sequence_generator,
+            )
+            if multi_step
+            else None
+        )
+        epoch_one_step_loss = 0.0
+        epoch_rollout_loss = 0.0
         model.train()
-        for start in range(0, inputs.shape[0], batch_size):
+        for batch_index, start in enumerate(
+            range(0, inputs.shape[0], batch_size)
+        ):
             indices = permutation[start : start + batch_size]
             batch_inputs = normalized_inputs[indices]
             batch_targets = normalized_targets[indices]
 
             optimizer.zero_grad()
             prediction = model(batch_inputs)
-            loss = loss_function(prediction, batch_targets)
-            loss.backward()
+            one_step_loss = loss_function(prediction, batch_targets)
+            if multi_step:
+                sequence_offsets = (
+                    torch.arange(batch_size) + batch_index * batch_size
+                ) % train_sequences.count
+                sequence_indices = sequence_permutation[sequence_offsets]
+                rollout_loss = rollout_state_loss(
+                    model,
+                    initial_states=train_sequence_states[sequence_indices, 0],
+                    actions=train_sequence_actions[sequence_indices],
+                    true_next_states=train_sequence_next_states[sequence_indices],
+                    input_mean=input_mean,
+                    input_std=input_std,
+                    target_mean=target_mean,
+                    target_std=target_std,
+                )
+            else:
+                rollout_loss = torch.zeros((), dtype=torch.float32)
+            total_loss = one_step_loss + rollout_loss_weight * rollout_loss
+            total_loss.backward()
             optimizer.step()
-            epoch_loss += float(loss.detach()) * indices.numel()
-        train_losses.append(epoch_loss / inputs.shape[0])
+            weight = indices.numel()
+            epoch_one_step_loss += float(one_step_loss.detach()) * weight
+            epoch_rollout_loss += float(rollout_loss.detach()) * weight
+        train_one_step = epoch_one_step_loss / inputs.shape[0]
+        train_rollout = epoch_rollout_loss / inputs.shape[0]
+        train_one_step_losses.append(train_one_step)
+        train_rollout_losses.append(train_rollout)
+        train_losses.append(
+            train_one_step + rollout_loss_weight * train_rollout
+        )
 
         model.eval()
         with torch.no_grad():
-            validation_loss = float(
+            validation_one_step = float(
                 loss_function(
                     model(normalized_validation_inputs),
                     normalized_validation_targets,
                 )
             )
-        validation_losses.append(validation_loss)
-        if validation_loss < best_validation_loss:
-            best_validation_loss = validation_loss
+            validation_rollout = (
+                _mean_rollout_loss(
+                    model,
+                    sequence_states=validation_sequence_states,
+                    sequence_actions=validation_sequence_actions,
+                    sequence_next_states=validation_sequence_next_states,
+                    batch_size=batch_size,
+                    input_mean=input_mean,
+                    input_std=input_std,
+                    target_mean=target_mean,
+                    target_std=target_std,
+                )
+                if multi_step
+                else 0.0
+            )
+        validation_total = (
+            validation_one_step + rollout_loss_weight * validation_rollout
+        )
+        validation_losses.append(validation_total)
+        validation_one_step_losses.append(validation_one_step)
+        validation_rollout_losses.append(validation_rollout)
+        if validation_total < best_validation_loss:
+            best_validation_loss = validation_total
             best_epoch = epoch_index + 1
             best_state_dict = copy.deepcopy(model.state_dict())
 
@@ -161,6 +292,10 @@ def train_model(
         train_losses=train_losses,
         validation_losses=validation_losses,
         best_epoch=best_epoch,
+        train_one_step_losses=train_one_step_losses,
+        train_rollout_losses=train_rollout_losses,
+        validation_one_step_losses=validation_one_step_losses,
+        validation_rollout_losses=validation_rollout_losses,
     )
 
 
