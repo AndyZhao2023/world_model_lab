@@ -66,28 +66,24 @@ def split_episode_ids(
     }
 
 
-def build_model_arrays(
+def build_model_inputs(
     states: np.ndarray,
     actions: np.ndarray,
-    next_states: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Convert raw transitions into continuous inputs and delta targets."""
+) -> np.ndarray:
+    """Encode raw states and actions as continuous model inputs."""
 
     states = np.asarray(states, dtype=np.float64)
     actions = np.asarray(actions, dtype=np.float64)
-    next_states = np.asarray(next_states, dtype=np.float64)
     if states.ndim != 2 or states.shape[1] != 4:
         raise ValueError("states must have shape [N, 4]")
     if actions.ndim != 2 or actions.shape[1] != 2:
         raise ValueError("actions must have shape [N, 2]")
-    if next_states.shape != states.shape:
-        raise ValueError("next_states must have the same [N, 4] shape as states")
     if actions.shape[0] != states.shape[0]:
-        raise ValueError("states, actions, and next_states must have equal lengths")
-    if not all(np.all(np.isfinite(values)) for values in (states, actions, next_states)):
-        raise ValueError("transition arrays must contain only finite values")
+        raise ValueError("states and actions must have equal lengths")
+    if not np.all(np.isfinite(states)) or not np.all(np.isfinite(actions)):
+        raise ValueError("state and action arrays must contain only finite values")
 
-    inputs = np.column_stack(
+    return np.column_stack(
         (
             states[:, 0],
             states[:, 1],
@@ -98,6 +94,24 @@ def build_model_arrays(
             actions[:, 1],
         )
     )
+
+
+def build_model_arrays(
+    states: np.ndarray,
+    actions: np.ndarray,
+    next_states: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert raw transitions into continuous inputs and delta targets."""
+
+    states = np.asarray(states, dtype=np.float64)
+    actions = np.asarray(actions, dtype=np.float64)
+    next_states = np.asarray(next_states, dtype=np.float64)
+    inputs = build_model_inputs(states, actions)
+    if next_states.shape != states.shape:
+        raise ValueError("next_states must have the same [N, 4] shape as states")
+    if not np.all(np.isfinite(next_states)):
+        raise ValueError("transition arrays must contain only finite values")
+
     targets = next_states - states
     targets[:, 2] = wrap_angle(targets[:, 2])
     return inputs, targets

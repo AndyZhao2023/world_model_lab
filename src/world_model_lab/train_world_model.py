@@ -164,6 +164,24 @@ def train_model(
     )
 
 
+def predict_deltas(
+    result: TrainingResult | LoadedWorldModel,
+    inputs: np.ndarray,
+) -> np.ndarray:
+    """Predict denormalized state deltas for a batch of model inputs."""
+
+    inputs = np.asarray(inputs, dtype=np.float64)
+    if inputs.ndim != 2 or inputs.shape[1] != WorldModelMLP.input_size:
+        raise ValueError("inputs must have shape [N, 7]")
+    if not np.all(np.isfinite(inputs)):
+        raise ValueError("inputs must contain only finite values")
+    normalized_inputs = _as_float_tensor(result.input_normalizer.normalize(inputs))
+    result.model.eval()
+    with torch.no_grad():
+        normalized_predictions = result.model(normalized_inputs).cpu().numpy()
+    return result.target_normalizer.denormalize(normalized_predictions)
+
+
 def evaluate_model(
     result: TrainingResult | LoadedWorldModel,
     inputs: np.ndarray,
@@ -173,10 +191,8 @@ def evaluate_model(
 
     inputs = np.asarray(inputs, dtype=np.float64)
     targets = np.asarray(targets, dtype=np.float64)
-    normalized_inputs = _as_float_tensor(result.input_normalizer.normalize(inputs))
-    with torch.no_grad():
-        normalized_predictions = result.model(normalized_inputs).cpu().numpy()
-    predictions = result.target_normalizer.denormalize(normalized_predictions)
+    predictions = predict_deltas(result, inputs)
+    normalized_predictions = result.target_normalizer.normalize(predictions)
     errors = predictions - targets
     errors[:, 2] = wrap_angle(errors[:, 2])
     absolute_errors = np.abs(errors)
