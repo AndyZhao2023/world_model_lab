@@ -12,6 +12,7 @@ from .train_world_model import LoadedWorldModel, predict_deltas
 
 
 ERROR_NAMES = ("position", "heading_degrees", "velocity")
+STATE_COMPONENT_NAMES = ("x", "y", "heading", "velocity")
 
 
 @dataclass(frozen=True)
@@ -48,12 +49,10 @@ def summarize_values(values: np.ndarray) -> dict[str, float | int]:
     }
 
 
-def compute_state_errors(
+def _state_differences(
     predicted_states: np.ndarray,
     true_states: np.ndarray,
-) -> dict[str, np.ndarray]:
-    """Compute absolute errors in physical units for matching state batches."""
-
+) -> np.ndarray:
     predicted = np.asarray(predicted_states, dtype=np.float64)
     true = np.asarray(true_states, dtype=np.float64)
     if (
@@ -66,9 +65,48 @@ def compute_state_errors(
         raise ValueError("predicted and true states must contain only finite values")
 
     difference = predicted - true
+    difference[:, 2] = wrap_angle(difference[:, 2])
+    return difference
+
+
+def _validate_target_std(target_std: np.ndarray) -> np.ndarray:
+    array = np.asarray(target_std, dtype=np.float64)
+    if (
+        array.shape != (4,)
+        or not np.all(np.isfinite(array))
+        or np.any(array <= 0.0)
+    ):
+        raise ValueError(
+            "target_std must have shape [4] and contain only finite positive values"
+        )
+    return array
+
+
+def _compute_normalized_squared_errors(
+    predicted_states: np.ndarray,
+    true_states: np.ndarray,
+    target_std: np.ndarray,
+) -> dict[str, np.ndarray]:
+    difference = _state_differences(predicted_states, true_states)
+    normalized_squared = np.square(difference / _validate_target_std(target_std))
+    result = {
+        name: normalized_squared[:, index]
+        for index, name in enumerate(STATE_COMPONENT_NAMES)
+    }
+    result["total"] = np.mean(normalized_squared, axis=1)
+    return result
+
+
+def compute_state_errors(
+    predicted_states: np.ndarray,
+    true_states: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Compute absolute errors in physical units for matching state batches."""
+
+    difference = _state_differences(predicted_states, true_states)
     return {
         "position": np.linalg.norm(difference[:, :2], axis=1),
-        "heading_degrees": np.degrees(np.abs(wrap_angle(difference[:, 2]))),
+        "heading_degrees": np.degrees(np.abs(difference[:, 2])),
         "velocity": np.abs(difference[:, 3]),
     }
 

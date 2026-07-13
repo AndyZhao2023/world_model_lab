@@ -7,6 +7,7 @@ import torch
 
 from world_model_lab.dataset import Normalizer
 from world_model_lab.diagnostics import (
+    _compute_normalized_squared_errors,
     build_diagnostic_metrics,
     build_feature_slice,
     build_xy_grid,
@@ -107,6 +108,43 @@ class DiagnosticsTest(unittest.TestCase):
             atol=1e-10,
         )
         np.testing.assert_allclose(errors["velocity"], [0.25])
+
+    def test_normalized_squared_errors_use_target_std_and_wrapped_heading(self):
+        true = np.asarray([[0.0, 0.0, math.radians(-179.0), 1.0]])
+        predicted = np.asarray([[3.0, 4.0, math.radians(179.0), 1.25]])
+        target_std = np.asarray([2.0, 4.0, math.radians(1.0), 0.5])
+
+        errors = _compute_normalized_squared_errors(
+            predicted,
+            true,
+            target_std,
+        )
+
+        np.testing.assert_allclose(errors["x"], [2.25])
+        np.testing.assert_allclose(errors["y"], [1.0])
+        np.testing.assert_allclose(errors["heading"], [4.0], atol=1e-10)
+        np.testing.assert_allclose(errors["velocity"], [0.25])
+        np.testing.assert_allclose(errors["total"], [1.875], atol=1e-10)
+
+    def test_normalized_squared_errors_reject_invalid_target_std(self):
+        states = np.zeros((1, 4), dtype=np.float64)
+        invalid_values = (
+            np.ones(3),
+            np.asarray([1.0, 1.0, 0.0, 1.0]),
+            np.asarray([1.0, 1.0, np.inf, 1.0]),
+        )
+
+        for target_std in invalid_values:
+            with self.subTest(target_std=target_std):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "target_std must have shape.*finite positive",
+                ):
+                    _compute_normalized_squared_errors(
+                        states,
+                        states,
+                        target_std,
+                    )
 
     def test_summary_reports_distribution_statistics(self):
         summary = summarize_values(np.asarray([1.0, 2.0, 3.0, 10.0]))
