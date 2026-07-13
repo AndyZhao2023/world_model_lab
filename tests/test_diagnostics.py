@@ -44,19 +44,28 @@ def make_constant_delta_world_model(
     delta: np.ndarray,
     *,
     test_episode_ids: np.ndarray,
+    target_std: np.ndarray | None = None,
 ) -> LoadedWorldModel:
+    target_std_array = (
+        np.ones(4, dtype=np.float64)
+        if target_std is None
+        else np.asarray(target_std, dtype=np.float64)
+    )
     model = WorldModelMLP(hidden_size=4)
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.zero_()
         model.network[-1].bias.copy_(
-            torch.as_tensor(delta, dtype=torch.float32)
+            torch.as_tensor(delta / target_std_array, dtype=torch.float32)
         )
     model.eval()
     return LoadedWorldModel(
         model=model,
         input_normalizer=Normalizer(mean=np.zeros(7), std=np.ones(7)),
-        target_normalizer=Normalizer(mean=np.zeros(4), std=np.ones(4)),
+        target_normalizer=Normalizer(
+            mean=np.zeros(4),
+            std=target_std_array,
+        ),
         split_episode_ids={
             "train": np.asarray([0]),
             "validation": np.asarray([99]),
@@ -263,6 +272,7 @@ class DiagnosticsTest(unittest.TestCase):
         world_model = make_constant_delta_world_model(
             np.asarray([1.0, 0.0, 0.0, 0.0]),
             test_episode_ids=np.asarray([1]),
+            target_std=np.asarray([2.0, 1.0, 1.0, 1.0]),
         )
 
         metrics = build_diagnostic_metrics(
@@ -290,6 +300,46 @@ class DiagnosticsTest(unittest.TestCase):
             horizon_3["free_rollout"]["position"]["mean"],
             3.0,
         )
+        self.assertEqual(metrics["schema_version"], 2)
+        curves = metrics["rollout"]["step_curves"]
+        self.assertEqual(curves["steps"], [1, 2, 3])
+        self.assertEqual(curves["aggregation"], "episode_macro_mean")
+        np.testing.assert_allclose(
+            curves["teacher_forcing"]["physical"]["position"],
+            [0.0, 1.0, 2.0],
+        )
+        np.testing.assert_allclose(
+            curves["free_rollout"]["physical"]["position"],
+            [0.0, 1.0, 3.0],
+        )
+        np.testing.assert_allclose(
+            curves["teacher_forcing"]["normalized_mse"]["x"],
+            [0.0, 0.25, 1.0],
+        )
+        np.testing.assert_allclose(
+            curves["free_rollout"]["normalized_mse"]["x"],
+            [0.0, 0.25, 2.25],
+        )
+        np.testing.assert_allclose(
+            curves["teacher_forcing"]["normalized_mse"]["total"],
+            [0.0, 0.0625, 0.25],
+        )
+        np.testing.assert_allclose(
+            curves["free_rollout"]["normalized_mse"]["total"],
+            [0.0, 0.0625, 0.5625],
+        )
+        for horizon in (1, 2, 3):
+            sparse = metrics["rollout"]["horizons"][str(horizon)]
+            for mode_name in ("teacher_forcing", "free_rollout"):
+                self.assertAlmostEqual(
+                    sparse[mode_name]["position"]["mean"],
+                    curves[mode_name]["physical"]["position"][horizon - 1],
+                )
+        for mode_name in ("teacher_forcing", "free_rollout"):
+            for group in ("physical", "normalized_mse"):
+                for values in curves[mode_name][group].values():
+                    self.assertEqual(len(values), 3)
+                    self.assertTrue(np.all(np.isfinite(values)))
         json.dumps(metrics, allow_nan=False)
 
     def test_rollout_metrics_weight_episodes_equally(self):
@@ -332,6 +382,56 @@ class DiagnosticsTest(unittest.TestCase):
         self.assertEqual(summary["episodes"], 2)
         self.assertEqual(summary["windows"], 4)
         self.assertEqual(summary["position"]["mean"], 1.0)
+
+        curves = metrics["rollout"]["step_curves"]
+        self.assertEqual(
+            curves["free_rollout"]["physical"]["position"],
+            [1.0],
+        )
+        self.assertEqual(
+            curves["free_rollout"]["normalized_mse"]["x"],
+            [2.0],
+        )
+        self.assertEqual(
+            curves["free_rollout"]["normalized_mse"]["total"],
+            [0.5],
+        )
+
+    def test_build_diagnostic_metrics_rejects_invalid_checkpoint_target_std(self):
+        train_episode = make_state_sequence(
+            np.asarray([-1.0, 0.0, 0.0, 0.0]),
+            np.zeros(4),
+            steps=1,
+        )
+        test_episode = make_state_sequence(
+            np.asarray([0.0, 0.0, 0.0, 0.0]),
+            np.zeros(4),
+            steps=1,
+        )
+        arrays = arrays_from_episodes({0: train_episode, 1: test_episode})
+        world_model = make_constant_delta_world_model(
+            np.zeros(4),
+            test_episode_ids=np.asarray([1]),
+        )
+        world_model.target_normalizer = Normalizer(
+            mean=np.zeros(4),
+            std=np.asarray([1.0, 1.0, 0.0, 1.0]),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "target_std must have shape.*finite positive",
+        ):
+            build_diagnostic_metrics(
+                world_model,
+                arrays=arrays,
+                split_episode_ids=world_model.split_episode_ids,
+                horizons=(1,),
+                windows_per_episode=1,
+                xy_bins=2,
+                feature_bins=2,
+                min_bin_count=1,
+            )
 
 
 if __name__ == "__main__":
