@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Any, Mapping
 
 import numpy as np
 
-from .dataset import wrap_angle
+from .dataset import build_model_inputs, wrap_angle
+from .train_world_model import LoadedWorldModel, predict_deltas
 
 
 ERROR_NAMES = ("position", "heading_degrees", "velocity")
@@ -317,3 +318,286 @@ def select_rollout_windows(
         eligible_episode_ids=np.asarray(eligible_ids, dtype=np.int64),
         skipped_episode_ids=np.asarray(skipped_ids, dtype=np.int64),
     )
+
+
+def predict_next_states(
+    world_model: LoadedWorldModel,
+    states: np.ndarray,
+    actions: np.ndarray,
+) -> np.ndarray:
+    """Predict next states from raw state/action batches."""
+
+    state_array = np.asarray(states, dtype=np.float64)
+    inputs = build_model_inputs(state_array, actions)
+    deltas = predict_deltas(world_model, inputs)
+    predictions = state_array + deltas
+    predictions[:, 2] = wrap_angle(predictions[:, 2])
+    return predictions
+
+
+def _free_rollout(
+    world_model: LoadedWorldModel,
+    initial_state: np.ndarray,
+    actions: np.ndarray,
+) -> np.ndarray:
+    predicted_states = [np.asarray(initial_state, dtype=np.float64).copy()]
+    for action in np.asarray(actions, dtype=np.float64):
+        predicted_states.append(
+            predict_next_states(
+                world_model,
+                predicted_states[-1][None, :],
+                action[None, :],
+            )[0]
+        )
+    return np.asarray(predicted_states, dtype=np.float64)
+
+
+def _summarize_error_components(
+    errors: Mapping[str, np.ndarray],
+) -> dict[str, dict[str, float | int]]:
+    return {name: summarize_values(np.asarray(errors[name])) for name in ERROR_NAMES}
+
+
+def _xy_counts(
+    xy: np.ndarray,
+    *,
+    x_edges: np.ndarray,
+    y_edges: np.ndarray,
+) -> list[list[int]]:
+    counts, _, _ = np.histogram2d(
+        np.asarray(xy)[:, 1],
+        np.asarray(xy)[:, 0],
+        bins=(y_edges, x_edges),
+    )
+    return counts.astype(np.int64).tolist()
+
+
+def _empty_episode_records() -> dict[str, list[float]]:
+    return {name: [] for name in ERROR_NAMES}
+
+
+def _summarize_episode_records(
+    records: Mapping[int, Mapping[str, list[float]]],
+) -> dict[str, object]:
+    episode_ids = sorted(records)
+    window_count = sum(len(records[episode_id]["position"]) for episode_id in episode_ids)
+    summary: dict[str, object] = {
+        "episodes": len(episode_ids),
+        "windows": window_count,
+    }
+    for name in ERROR_NAMES:
+        per_episode_means = np.asarray(
+            [np.mean(records[episode_id][name]) for episode_id in episode_ids],
+            dtype=np.float64,
+        )
+        summary[name] = summarize_values(per_episode_means)
+    return summary
+
+
+def _validate_horizons(horizons: tuple[int, ...]) -> tuple[int, ...]:
+    values = tuple(int(value) for value in horizons)
+    if not values or any(value <= 0 for value in values):
+        raise ValueError("horizons must contain positive integers")
+    if values != tuple(sorted(set(values))):
+        raise ValueError("horizons must be unique and strictly increasing")
+    return values
+
+
+def build_diagnostic_metrics(
+    world_model: LoadedWorldModel,
+    *,
+    arrays: Mapping[str, np.ndarray],
+    split_episode_ids: Mapping[str, np.ndarray],
+    horizons: tuple[int, ...] = (1, 5, 10, 20, 50),
+    windows_per_episode: int = 8,
+    xy_bins: int = 12,
+    feature_bins: int = 8,
+    min_bin_count: int = 5,
+) -> dict[str, Any]:
+    """Build a JSON-safe one-step and fixed-window diagnostic report."""
+
+    required_arrays = {
+        "states",
+        "actions",
+        "next_states",
+        "episode_ids",
+        "step_ids",
+    }
+    missing = required_arrays - set(arrays)
+    if missing:
+        raise ValueError(f"diagnostic arrays are missing: {', '.join(sorted(missing))}")
+    if "train" not in split_episode_ids or "test" not in split_episode_ids:
+        raise ValueError("split_episode_ids must contain train and test IDs")
+    horizon_values = _validate_horizons(tuple(horizons))
+    if windows_per_episode <= 0:
+        raise ValueError("windows_per_episode must be positive")
+    if xy_bins <= 0 or feature_bins <= 0 or min_bin_count <= 0:
+        raise ValueError("bin counts and min_bin_count must be positive")
+
+    states = np.asarray(arrays["states"], dtype=np.float64)
+    actions = np.asarray(arrays["actions"], dtype=np.float64)
+    next_states = np.asarray(arrays["next_states"], dtype=np.float64)
+    episode_ids = np.asarray(arrays["episode_ids"])
+    step_ids = np.asarray(arrays["step_ids"])
+    count = states.shape[0]
+    if states.shape != (count, 4) or next_states.shape != (count, 4):
+        raise ValueError("states and next_states must have shape [N, 4]")
+    if actions.shape != (count, 2):
+        raise ValueError("actions must have shape [N, 2]")
+    if episode_ids.shape != (count,) or step_ids.shape != (count,):
+        raise ValueError("episode_ids and step_ids must have shape [N]")
+    if count == 0:
+        raise ValueError("diagnostic arrays must not be empty")
+    if not all(
+        np.all(np.isfinite(values))
+        for values in (states, actions, next_states)
+    ):
+        raise ValueError("diagnostic transition arrays must contain only finite values")
+
+    train_ids = np.asarray(split_episode_ids["train"])
+    test_ids = np.asarray(split_episode_ids["test"])
+    if train_ids.ndim != 1 or test_ids.ndim != 1 or train_ids.size == 0 or test_ids.size == 0:
+        raise ValueError("train and test episode IDs must be non-empty vectors")
+    available_ids = set(np.asarray(np.unique(episode_ids)).tolist())
+    missing_train_ids = set(train_ids.tolist()) - available_ids
+    missing_test_ids = set(test_ids.tolist()) - available_ids
+    if missing_train_ids or missing_test_ids:
+        missing_ids = sorted(missing_train_ids | missing_test_ids)
+        raise ValueError(f"split episodes are missing from the dataset: {missing_ids}")
+    train_mask = np.isin(episode_ids, train_ids)
+    test_mask = np.isin(episode_ids, test_ids)
+
+    test_predictions = predict_next_states(
+        world_model,
+        states[test_mask],
+        actions[test_mask],
+    )
+    one_step_errors = compute_state_errors(test_predictions, next_states[test_mask])
+    x_edges = linear_bin_edges(states[:, 0], bin_count=xy_bins)
+    y_edges = linear_bin_edges(states[:, 1], bin_count=xy_bins)
+    velocity_edges = linear_bin_edges(states[:, 3], bin_count=feature_bins)
+    steering_edges = linear_bin_edges(actions[:, 0], bin_count=feature_bins)
+    acceleration_edges = linear_bin_edges(actions[:, 1], bin_count=feature_bins)
+
+    selection = select_rollout_windows(
+        states=states,
+        actions=actions,
+        next_states=next_states,
+        episode_ids=episode_ids,
+        step_ids=step_ids,
+        selected_episode_ids=test_ids,
+        max_horizon=horizon_values[-1],
+        windows_per_episode=windows_per_episode,
+    )
+    window_predictions = []
+    for window in selection.windows:
+        window_predictions.append(
+            (
+                window,
+                predict_next_states(
+                    world_model,
+                    window.true_states[:-1],
+                    window.actions,
+                ),
+                _free_rollout(world_model, window.true_states[0], window.actions),
+            )
+        )
+
+    horizon_metrics: dict[str, object] = {}
+    for horizon in horizon_values:
+        teacher_records: dict[int, dict[str, list[float]]] = {}
+        free_records: dict[int, dict[str, list[float]]] = {}
+        for window, teacher_predictions, free_predictions in window_predictions:
+            teacher_errors = compute_state_errors(
+                teacher_predictions[horizon - 1 : horizon],
+                window.true_states[horizon : horizon + 1],
+            )
+            free_errors = compute_state_errors(
+                free_predictions[horizon : horizon + 1],
+                window.true_states[horizon : horizon + 1],
+            )
+            teacher_episode = teacher_records.setdefault(
+                window.episode_id,
+                _empty_episode_records(),
+            )
+            free_episode = free_records.setdefault(
+                window.episode_id,
+                _empty_episode_records(),
+            )
+            for name in ERROR_NAMES:
+                teacher_episode[name].append(float(teacher_errors[name][0]))
+                free_episode[name].append(float(free_errors[name][0]))
+        horizon_metrics[str(horizon)] = {
+            "teacher_forcing": _summarize_episode_records(teacher_records),
+            "free_rollout": _summarize_episode_records(free_records),
+        }
+
+    return {
+        "schema_version": 1,
+        "population": {
+            "train_episode_ids": [int(value) for value in train_ids.tolist()],
+            "test_episode_ids": [int(value) for value in test_ids.tolist()],
+            "test_transitions": int(np.count_nonzero(test_mask)),
+        },
+        "coverage": {
+            "x_edges": x_edges.tolist(),
+            "y_edges": y_edges.tolist(),
+            "train_counts": _xy_counts(
+                states[train_mask, :2],
+                x_edges=x_edges,
+                y_edges=y_edges,
+            ),
+            "test_counts": _xy_counts(
+                states[test_mask, :2],
+                x_edges=x_edges,
+                y_edges=y_edges,
+            ),
+        },
+        "one_step": {
+            "overall": _summarize_error_components(one_step_errors),
+            "xy_grid": build_xy_grid(
+                states[test_mask, :2],
+                one_step_errors,
+                x_edges=x_edges,
+                y_edges=y_edges,
+                min_bin_count=min_bin_count,
+            ),
+            "feature_slices": {
+                "velocity": build_feature_slice(
+                    states[test_mask, 3],
+                    one_step_errors,
+                    edges=velocity_edges,
+                    min_bin_count=min_bin_count,
+                ),
+                "steering": build_feature_slice(
+                    actions[test_mask, 0],
+                    one_step_errors,
+                    edges=steering_edges,
+                    min_bin_count=min_bin_count,
+                ),
+                "acceleration": build_feature_slice(
+                    actions[test_mask, 1],
+                    one_step_errors,
+                    edges=acceleration_edges,
+                    min_bin_count=min_bin_count,
+                ),
+            },
+        },
+        "rollout": {
+            "protocol": {
+                "horizons": list(horizon_values),
+                "max_horizon": horizon_values[-1],
+                "windows_per_episode": windows_per_episode,
+                "eligible_episode_ids": selection.eligible_episode_ids.tolist(),
+                "skipped_episode_ids": selection.skipped_episode_ids.tolist(),
+                "windows": [
+                    {
+                        "episode_id": window.episode_id,
+                        "start_step": window.start_step,
+                    }
+                    for window in selection.windows
+                ],
+            },
+            "horizons": horizon_metrics,
+        },
+    }

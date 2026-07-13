@@ -1,9 +1,13 @@
 import math
+import json
 import unittest
 
 import numpy as np
+import torch
 
+from world_model_lab.dataset import Normalizer
 from world_model_lab.diagnostics import (
+    build_diagnostic_metrics,
     build_feature_slice,
     build_xy_grid,
     compute_state_errors,
@@ -11,6 +15,8 @@ from world_model_lab.diagnostics import (
     select_rollout_windows,
     summarize_values,
 )
+from world_model_lab.model import WorldModelMLP
+from world_model_lab.train_world_model import LoadedWorldModel
 
 
 def make_state_sequence(
@@ -30,6 +36,60 @@ def make_error_components(values: list[float]) -> dict[str, np.ndarray]:
         "position": array,
         "heading_degrees": array + 10.0,
         "velocity": array + 20.0,
+    }
+
+
+def make_constant_delta_world_model(
+    delta: np.ndarray,
+    *,
+    test_episode_ids: np.ndarray,
+) -> LoadedWorldModel:
+    model = WorldModelMLP(hidden_size=4)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.zero_()
+        model.network[-1].bias.copy_(
+            torch.as_tensor(delta, dtype=torch.float32)
+        )
+    model.eval()
+    return LoadedWorldModel(
+        model=model,
+        input_normalizer=Normalizer(mean=np.zeros(7), std=np.ones(7)),
+        target_normalizer=Normalizer(mean=np.zeros(4), std=np.ones(4)),
+        split_episode_ids={
+            "train": np.asarray([0]),
+            "validation": np.asarray([99]),
+            "test": np.asarray(test_episode_ids),
+        },
+        training_config={},
+        train_losses=[],
+        validation_losses=[],
+        best_epoch=0,
+        test_metrics={},
+    )
+
+
+def arrays_from_episodes(
+    episodes: dict[int, np.ndarray],
+) -> dict[str, np.ndarray]:
+    states = []
+    actions = []
+    next_states = []
+    episode_ids = []
+    step_ids = []
+    for episode_id, sequence in episodes.items():
+        transition_count = sequence.shape[0] - 1
+        states.append(sequence[:-1])
+        actions.append(np.zeros((transition_count, 2), dtype=np.float64))
+        next_states.append(sequence[1:])
+        episode_ids.extend([episode_id] * transition_count)
+        step_ids.extend(range(transition_count))
+    return {
+        "states": np.vstack(states),
+        "actions": np.vstack(actions),
+        "next_states": np.vstack(next_states),
+        "episode_ids": np.asarray(episode_ids),
+        "step_ids": np.asarray(step_ids),
     }
 
 
@@ -146,6 +206,94 @@ class DiagnosticsTest(unittest.TestCase):
         self.assertEqual(edges.shape, (3,))
         self.assertLess(edges[0], 0.5)
         self.assertGreater(edges[-1], 0.5)
+
+    def test_free_rollout_exposes_compounding_error(self):
+        train_episode = make_state_sequence(
+            np.asarray([-2.0, 0.0, 0.0, 0.0]),
+            np.asarray([1.0, 0.0, 0.0, 0.0]),
+            steps=3,
+        )
+        test_episode = np.asarray(
+            [
+                [0.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [3.0, 0.0, 0.0, 0.0],
+                [6.0, 0.0, 0.0, 0.0],
+            ]
+        )
+        arrays = arrays_from_episodes({0: train_episode, 1: test_episode})
+        world_model = make_constant_delta_world_model(
+            np.asarray([1.0, 0.0, 0.0, 0.0]),
+            test_episode_ids=np.asarray([1]),
+        )
+
+        metrics = build_diagnostic_metrics(
+            world_model,
+            arrays=arrays,
+            split_episode_ids=world_model.split_episode_ids,
+            horizons=(1, 2, 3),
+            windows_per_episode=1,
+            xy_bins=2,
+            feature_bins=2,
+            min_bin_count=1,
+        )
+
+        horizon_1 = metrics["rollout"]["horizons"]["1"]
+        horizon_3 = metrics["rollout"]["horizons"]["3"]
+        self.assertAlmostEqual(
+            horizon_1["teacher_forcing"]["position"]["mean"],
+            horizon_1["free_rollout"]["position"]["mean"],
+        )
+        self.assertEqual(
+            horizon_3["teacher_forcing"]["position"]["mean"],
+            2.0,
+        )
+        self.assertEqual(
+            horizon_3["free_rollout"]["position"]["mean"],
+            3.0,
+        )
+        json.dumps(metrics, allow_nan=False)
+
+    def test_rollout_metrics_weight_episodes_equally(self):
+        train_episode = make_state_sequence(
+            np.asarray([-2.0, 0.0, 0.0, 0.0]),
+            np.zeros(4),
+            steps=1,
+        )
+        high_error_episode = np.asarray(
+            [
+                [0.0, 0.0, 0.0, 0.0],
+                [2.0, 0.0, 0.0, 0.0],
+            ]
+        )
+        zero_error_episode = make_state_sequence(
+            np.asarray([10.0, 0.0, 0.0, 0.0]),
+            np.zeros(4),
+            steps=3,
+        )
+        arrays = arrays_from_episodes(
+            {0: train_episode, 1: high_error_episode, 2: zero_error_episode}
+        )
+        world_model = make_constant_delta_world_model(
+            np.zeros(4),
+            test_episode_ids=np.asarray([1, 2]),
+        )
+
+        metrics = build_diagnostic_metrics(
+            world_model,
+            arrays=arrays,
+            split_episode_ids=world_model.split_episode_ids,
+            horizons=(1,),
+            windows_per_episode=3,
+            xy_bins=2,
+            feature_bins=2,
+            min_bin_count=1,
+        )
+
+        summary = metrics["rollout"]["horizons"]["1"]["free_rollout"]
+        self.assertEqual(summary["episodes"], 2)
+        self.assertEqual(summary["windows"], 4)
+        self.assertEqual(summary["position"]["mean"], 1.0)
 
 
 if __name__ == "__main__":
