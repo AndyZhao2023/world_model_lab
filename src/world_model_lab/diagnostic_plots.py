@@ -148,6 +148,32 @@ def plot_diagnostic_overview(
     return _save_figure(figure, output_path)
 
 
+def _physical_rollout_curve(
+    rollout: Mapping[str, Any],
+    mode_name: str,
+    metric_name: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    step_curves = rollout.get("step_curves")
+    if step_curves is not None:
+        return (
+            np.asarray(step_curves["steps"], dtype=np.int64),
+            np.asarray(
+                step_curves[mode_name]["physical"][metric_name],
+                dtype=np.float64,
+            ),
+        )
+
+    horizons = np.asarray(rollout["protocol"]["horizons"], dtype=np.int64)
+    values = np.asarray(
+        [
+            rollout["horizons"][str(int(horizon))][mode_name][metric_name]["mean"]
+            for horizon in horizons
+        ],
+        dtype=np.float64,
+    )
+    return horizons, values
+
+
 def plot_rollout_errors(
     metrics: Mapping[str, Any],
     output_path: Path | str,
@@ -155,7 +181,9 @@ def plot_rollout_errors(
     """Compare teacher-forced and free-rollout errors over horizon."""
 
     rollout = metrics["rollout"]
-    horizons = [int(value) for value in rollout["protocol"]["horizons"]]
+    if int(metrics.get("schema_version", 1)) >= 2 and "step_curves" not in rollout:
+        raise ValueError("schema version 2 rollout metrics require step_curves")
+
     figure, axes = plt.subplots(1, 3, figsize=(15, 4.5))
     metric_specs = (
         ("position", "Position error", "macro mean (m)"),
@@ -172,14 +200,15 @@ def plot_rollout_errors(
         strict=True,
     ):
         for mode_name, label, color in modes:
-            values = [
-                rollout["horizons"][str(horizon)][mode_name][metric_name]["mean"]
-                for horizon in horizons
-            ]
+            steps, values = _physical_rollout_curve(
+                rollout,
+                mode_name,
+                metric_name,
+            )
             axis.plot(
-                horizons,
+                steps,
                 values,
-                marker="o",
+                marker=None if "step_curves" in rollout else "o",
                 linewidth=2,
                 label=label,
                 color=color,
@@ -189,4 +218,51 @@ def plot_rollout_errors(
         axis.legend()
 
     figure.suptitle("Teacher Forcing vs Free Rollout")
+    return _save_figure(figure, output_path)
+
+
+def plot_rollout_loss_components(
+    metrics: Mapping[str, Any],
+    output_path: Path | str,
+) -> Path:
+    """Plot normalized rollout MSE components for every diagnostic step."""
+
+    rollout = metrics["rollout"]
+    step_curves = rollout.get("step_curves")
+    if step_curves is None:
+        raise ValueError("normalized rollout components require step_curves")
+    steps = np.asarray(step_curves["steps"], dtype=np.int64)
+    modes = (
+        ("teacher_forcing", "Teacher forcing", "#4c78a8"),
+        ("free_rollout", "Free rollout", "#e45756"),
+    )
+
+    figure, axes = plt.subplots(2, 2, figsize=(11, 8))
+    for axis, component_name in zip(
+        axes.flat,
+        ("x", "y", "heading", "velocity"),
+        strict=True,
+    ):
+        for mode_name, label, color in modes:
+            values = np.asarray(
+                step_curves[mode_name]["normalized_mse"][component_name],
+                dtype=np.float64,
+            )
+            axis.plot(
+                steps,
+                values,
+                linewidth=2,
+                label=label,
+                color=color,
+            )
+        axis.set(
+            title=component_name,
+            xlabel="rollout step",
+            ylabel="normalized MSE",
+        )
+        axis.set_ylim(bottom=0.0)
+        axis.grid(True, alpha=0.3)
+        axis.legend()
+
+    figure.suptitle("Normalized Rollout Loss Components")
     return _save_figure(figure, output_path)
