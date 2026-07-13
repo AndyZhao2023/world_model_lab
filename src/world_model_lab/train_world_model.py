@@ -18,6 +18,7 @@ from .dataset import (
     Normalizer,
     SequenceWindows,
     build_model_arrays,
+    build_sequence_windows,
     fit_normalizer,
     split_episode_ids,
     wrap_angle,
@@ -474,11 +475,22 @@ def run_training(
     batch_size: int = 256,
     learning_rate: float = 1e-3,
     seed: int = 0,
+    rollout_horizon: int = 1,
+    rollout_loss_weight: float = 1.0,
 ) -> dict[str, Any]:
     """Load an NPZ dataset, train by episode split, and save a checkpoint."""
 
+    if rollout_horizon <= 0:
+        raise ValueError("rollout_horizon must be positive")
+    if not math.isfinite(rollout_loss_weight) or rollout_loss_weight < 0.0:
+        raise ValueError("rollout_loss_weight must be finite and non-negative")
+    effective_rollout_weight = (
+        rollout_loss_weight if rollout_horizon > 1 else 0.0
+    )
     data_path = Path(data_path)
     required_arrays = {"states", "actions", "next_states", "episode_ids"}
+    if rollout_horizon > 1:
+        required_arrays.add("step_ids")
     with np.load(data_path, allow_pickle=False) as loaded:
         missing = required_arrays - set(loaded.files)
         if missing:
@@ -487,18 +499,48 @@ def run_training(
         actions = loaded["actions"]
         next_states = loaded["next_states"]
         episode_ids = loaded["episode_ids"]
+        step_ids = loaded["step_ids"] if rollout_horizon > 1 else None
 
     inputs, targets = build_model_arrays(states, actions, next_states)
     if episode_ids.ndim != 1 or episode_ids.shape[0] != inputs.shape[0]:
         raise ValueError("episode_ids must have shape [N]")
     splits = split_episode_ids(episode_ids, seed=seed)
     masks = {name: np.isin(episode_ids, ids) for name, ids in splits.items()}
+    train_sequences = validation_sequences = None
+    if rollout_horizon > 1:
+        assert step_ids is not None
+        train_sequences = build_sequence_windows(
+            states,
+            actions,
+            next_states,
+            episode_ids=episode_ids,
+            step_ids=step_ids,
+            selected_episode_ids=splits["train"],
+            horizon=rollout_horizon,
+        )
+        validation_sequences = build_sequence_windows(
+            states,
+            actions,
+            next_states,
+            episode_ids=episode_ids,
+            step_ids=step_ids,
+            selected_episode_ids=splits["validation"],
+            horizon=rollout_horizon,
+        )
+        if train_sequences.count == 0 or validation_sequences.count == 0:
+            raise ValueError(
+                f"rollout horizon {rollout_horizon} has no eligible "
+                "training or validation windows"
+            )
 
     result = train_model(
         inputs[masks["train"]],
         targets[masks["train"]],
         validation_inputs=inputs[masks["validation"]],
         validation_targets=targets[masks["validation"]],
+        train_sequences=train_sequences,
+        validation_sequences=validation_sequences,
+        rollout_loss_weight=effective_rollout_weight,
         hidden_size=hidden_size,
         epochs=epochs,
         batch_size=batch_size,
@@ -512,6 +554,8 @@ def run_training(
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "seed": seed,
+        "rollout_horizon": rollout_horizon,
+        "rollout_loss_weight": effective_rollout_weight,
     }
     validation_metrics = evaluate_model(
         result, inputs[masks["validation"]], targets[masks["validation"]]
@@ -526,16 +570,37 @@ def run_training(
         training_config=training_config,
         test_metrics=test_metrics,
     )
+    best_index = result.best_epoch - 1
     return {
         "transitions": int(inputs.shape[0]),
+        "rollout_horizon": rollout_horizon,
+        "rollout_loss_weight": effective_rollout_weight,
+        "train_sequence_windows": (
+            train_sequences.count if train_sequences is not None else 0
+        ),
+        "validation_sequence_windows": (
+            validation_sequences.count
+            if validation_sequences is not None
+            else 0
+        ),
         "split_episodes": {name: int(ids.size) for name, ids in splits.items()},
         "split_transitions": {
             name: int(np.count_nonzero(mask)) for name, mask in masks.items()
         },
         "initial_train_loss": result.train_losses[0],
         "final_train_loss": result.train_losses[-1],
+        "initial_train_one_step_loss": result.train_one_step_losses[0],
+        "final_train_one_step_loss": result.train_one_step_losses[-1],
+        "initial_train_rollout_loss": result.train_rollout_losses[0],
+        "final_train_rollout_loss": result.train_rollout_losses[-1],
         "best_epoch": result.best_epoch,
         "best_validation_loss": min(result.validation_losses),
+        "best_validation_one_step_loss": (
+            result.validation_one_step_losses[best_index]
+        ),
+        "best_validation_rollout_loss": (
+            result.validation_rollout_losses[best_index]
+        ),
         "validation": validation_metrics,
         "test": test_metrics,
         "checkpoint": str(Path(output_path)),
@@ -553,6 +618,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--rollout-horizon", type=int, default=1)
+    parser.add_argument("--rollout-loss-weight", type=float, default=1.0)
     args = parser.parse_args()
 
     try:
@@ -564,6 +631,8 @@ def main() -> None:
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
             seed=args.seed,
+            rollout_horizon=args.rollout_horizon,
+            rollout_loss_weight=args.rollout_loss_weight,
         )
     except (FileNotFoundError, ValueError) as error:
         parser.error(str(error))

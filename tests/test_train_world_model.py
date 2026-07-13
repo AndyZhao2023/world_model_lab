@@ -391,8 +391,20 @@ class TrainWorldModelTest(unittest.TestCase):
                 seed=7,
             )
             loaded = load_checkpoint(checkpoint_path)
+            with self.assertRaisesRegex(ValueError, "step_ids"):
+                run_training(
+                    data_path=dataset_path,
+                    output_path=directory_path / "world_model_h2.pt",
+                    hidden_size=8,
+                    epochs=1,
+                    batch_size=16,
+                    rollout_horizon=2,
+                )
 
         self.assertEqual(summary["transitions"], count)
+        self.assertEqual(summary["rollout_horizon"], 1)
+        self.assertEqual(summary["rollout_loss_weight"], 0.0)
+        self.assertEqual(summary["train_sequence_windows"], 0)
         self.assertEqual(summary["split_episodes"], {"train": 8, "validation": 1, "test": 1})
         self.assertEqual(loaded.training_config["epochs"], 3)
         self.assertEqual(len(loaded.train_losses), 3)
@@ -404,6 +416,45 @@ class TrainWorldModelTest(unittest.TestCase):
         )
         self.assertTrue(np.isfinite(summary["validation"]["normalized_mse"]))
         self.assertTrue(np.isfinite(summary["test"]["normalized_mse"]))
+
+    def test_run_training_supports_multistep_sequences(self):
+        states, actions, next_states, episode_ids, step_ids = (
+            make_sequence_dynamics(episodes=10, steps=4)
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            dataset_path = directory_path / "transitions.npz"
+            checkpoint_path = directory_path / "world_model.pt"
+            np.savez_compressed(
+                dataset_path,
+                states=states,
+                actions=actions,
+                next_states=next_states,
+                episode_ids=episode_ids,
+                step_ids=step_ids,
+            )
+
+            summary = run_training(
+                data_path=dataset_path,
+                output_path=checkpoint_path,
+                hidden_size=16,
+                epochs=2,
+                batch_size=8,
+                learning_rate=1e-3,
+                seed=7,
+                rollout_horizon=2,
+                rollout_loss_weight=0.5,
+            )
+            loaded = load_checkpoint(checkpoint_path)
+
+        self.assertEqual(summary["rollout_horizon"], 2)
+        self.assertEqual(summary["rollout_loss_weight"], 0.5)
+        self.assertGreater(summary["train_sequence_windows"], 0)
+        self.assertGreater(summary["validation_sequence_windows"], 0)
+        self.assertEqual(loaded.training_config["rollout_horizon"], 2)
+        self.assertEqual(loaded.training_config["rollout_loss_weight"], 0.5)
+        self.assertGreater(summary["final_train_rollout_loss"], 0.0)
 
 
 if __name__ == "__main__":
