@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "world-model-lab"
+version = "0.1.0"
+description = "A small state-space world-model learning lab"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=2.0",
+  "matplotlib>=3.8",
+  "torch>=2.6",
+]
+
+[project.scripts]
+world-model-car-demo = "world_model_lab.demo_random_drive:main"
+world-model-collect-data = "world_model_lab.collect_data:main"
+world-model-evaluate-rollout = "world_model_lab.evaluate_rollout:main"
+world-model-plot-training = "world_model_lab.plot_training:main"
+world-model-train = "world_model_lab.train_world_model:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

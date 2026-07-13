@@ -1,0 +1,10 @@
+.venv/
+.matplotlib/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+demo*.png
+data/
+artifacts/
