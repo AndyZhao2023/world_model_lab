@@ -111,7 +111,7 @@ class DiagnoseModelTest(unittest.TestCase):
             output_names,
             {"metrics.json", "manifest.json", "overview.png", "rollout_errors.png"},
         )
-        self.assertEqual(metrics["schema_version"], 1)
+        self.assertEqual(metrics["schema_version"], 2)
         self.assertEqual(manifest["schema_version"], 1)
         self.assertEqual(manifest["dataset"]["sha256"], dataset_hash)
         self.assertEqual(manifest["checkpoint"]["hidden_size"], 4)
