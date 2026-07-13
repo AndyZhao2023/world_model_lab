@@ -312,7 +312,7 @@ def select_rollout_windows(
             )
 
     if not windows:
-        raise ValueError("no selected episode is long enough for the maximum horizon")
+        raise ValueError("selected episodes are not long enough for the maximum horizon")
     return WindowSelection(
         windows=tuple(windows),
         eligible_episode_ids=np.asarray(eligible_ids, dtype=np.int64),
