@@ -5,7 +5,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from world_model_lab.dataset import build_model_arrays, build_sequence_windows
+from world_model_lab.dataset import (
+    Normalizer,
+    build_model_arrays,
+    build_sequence_windows,
+    fit_normalizer,
+)
 from world_model_lab.model import WorldModelMLP
 from world_model_lab.train_world_model import (
     evaluate_model,
@@ -78,6 +83,222 @@ def _save_sequence_dataset(path: Path) -> None:
 
 
 class TrainWorldModelTest(unittest.TestCase):
+    def test_train_model_uses_explicit_shared_normalizers(self):
+        inputs, targets = make_linear_dynamics(count=80)
+        shared_input = fit_normalizer(inputs[:64])
+        shared_target = fit_normalizer(targets[:64])
+
+        result = train_model(
+            inputs[:32],
+            targets[:32],
+            validation_inputs=inputs[64:],
+            validation_targets=targets[64:],
+            input_normalizer=shared_input,
+            target_normalizer=shared_target,
+            hidden_size=8,
+            epochs=1,
+            batch_size=16,
+            seed=3,
+        )
+
+        np.testing.assert_array_equal(
+            result.input_normalizer.mean,
+            shared_input.mean,
+        )
+        np.testing.assert_array_equal(
+            result.input_normalizer.std,
+            shared_input.std,
+        )
+        np.testing.assert_array_equal(
+            result.target_normalizer.mean,
+            shared_target.mean,
+        )
+        np.testing.assert_array_equal(
+            result.target_normalizer.std,
+            shared_target.std,
+        )
+
+    def test_train_model_requires_both_explicit_normalizers(self):
+        inputs, targets = make_linear_dynamics(count=64)
+        shared_input = fit_normalizer(inputs[:48])
+        shared_target = fit_normalizer(targets[:48])
+        cases = (
+            {"input_normalizer": shared_input},
+            {"target_normalizer": shared_target},
+        )
+
+        for provided in cases:
+            with self.subTest(provided=tuple(provided)):
+                with self.assertRaisesRegex(ValueError, "provided together"):
+                    train_model(
+                        inputs[:48],
+                        targets[:48],
+                        validation_inputs=inputs[48:],
+                        validation_targets=targets[48:],
+                        hidden_size=8,
+                        epochs=1,
+                        **provided,
+                    )
+
+    def test_train_model_rejects_invalid_normalizer_shapes(self):
+        inputs, targets = make_linear_dynamics(count=64)
+        shared_input = fit_normalizer(inputs[:48])
+        shared_target = fit_normalizer(targets[:48])
+        cases = (
+            (
+                "input mean",
+                Normalizer(shared_input.mean[:-1], shared_input.std),
+                shared_target,
+                "input_normalizer.*shape \\[7\\]",
+            ),
+            (
+                "input std",
+                Normalizer(shared_input.mean, shared_input.std[:-1]),
+                shared_target,
+                "input_normalizer.*shape \\[7\\]",
+            ),
+            (
+                "target mean",
+                shared_input,
+                Normalizer(shared_target.mean[:-1], shared_target.std),
+                "target_normalizer.*shape \\[4\\]",
+            ),
+            (
+                "target std",
+                shared_input,
+                Normalizer(shared_target.mean, shared_target.std[:-1]),
+                "target_normalizer.*shape \\[4\\]",
+            ),
+        )
+
+        for name, input_normalizer, target_normalizer, message in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, message):
+                    train_model(
+                        inputs[:48],
+                        targets[:48],
+                        validation_inputs=inputs[48:],
+                        validation_targets=targets[48:],
+                        input_normalizer=input_normalizer,
+                        target_normalizer=target_normalizer,
+                        hidden_size=8,
+                        epochs=1,
+                    )
+
+    def test_train_model_rejects_non_finite_normalizer_values(self):
+        inputs, targets = make_linear_dynamics(count=64)
+        shared_input = fit_normalizer(inputs[:48])
+        shared_target = fit_normalizer(targets[:48])
+
+        def changed(values, *, index, value):
+            result = values.copy()
+            result[index] = value
+            return result
+
+        cases = (
+            (
+                "input mean",
+                Normalizer(
+                    changed(shared_input.mean, index=0, value=np.nan),
+                    shared_input.std,
+                ),
+                shared_target,
+                "input_normalizer.*finite",
+            ),
+            (
+                "input std",
+                Normalizer(
+                    shared_input.mean,
+                    changed(shared_input.std, index=0, value=np.inf),
+                ),
+                shared_target,
+                "input_normalizer.*finite",
+            ),
+            (
+                "target mean",
+                shared_input,
+                Normalizer(
+                    changed(shared_target.mean, index=0, value=np.nan),
+                    shared_target.std,
+                ),
+                "target_normalizer.*finite",
+            ),
+            (
+                "target std",
+                shared_input,
+                Normalizer(
+                    shared_target.mean,
+                    changed(shared_target.std, index=0, value=np.inf),
+                ),
+                "target_normalizer.*finite",
+            ),
+        )
+
+        for name, input_normalizer, target_normalizer, message in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, message):
+                    train_model(
+                        inputs[:48],
+                        targets[:48],
+                        validation_inputs=inputs[48:],
+                        validation_targets=targets[48:],
+                        input_normalizer=input_normalizer,
+                        target_normalizer=target_normalizer,
+                        hidden_size=8,
+                        epochs=1,
+                    )
+
+    def test_train_model_rejects_non_positive_normalizer_std(self):
+        inputs, targets = make_linear_dynamics(count=64)
+        shared_input = fit_normalizer(inputs[:48])
+        shared_target = fit_normalizer(targets[:48])
+
+        def changed(values, *, value):
+            result = values.copy()
+            result[0] = value
+            return result
+
+        cases = (
+            (
+                "zero input std",
+                Normalizer(shared_input.mean, changed(shared_input.std, value=0.0)),
+                shared_target,
+                "input_normalizer.*positive std",
+            ),
+            (
+                "negative input std",
+                Normalizer(shared_input.mean, changed(shared_input.std, value=-1.0)),
+                shared_target,
+                "input_normalizer.*positive std",
+            ),
+            (
+                "zero target std",
+                shared_input,
+                Normalizer(shared_target.mean, changed(shared_target.std, value=0.0)),
+                "target_normalizer.*positive std",
+            ),
+            (
+                "negative target std",
+                shared_input,
+                Normalizer(shared_target.mean, changed(shared_target.std, value=-1.0)),
+                "target_normalizer.*positive std",
+            ),
+        )
+
+        for name, input_normalizer, target_normalizer, message in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, message):
+                    train_model(
+                        inputs[:48],
+                        targets[:48],
+                        validation_inputs=inputs[48:],
+                        validation_targets=targets[48:],
+                        input_normalizer=input_normalizer,
+                        target_normalizer=target_normalizer,
+                        hidden_size=8,
+                        epochs=1,
+                    )
+
     def test_multistep_training_records_finite_component_histories(self):
         states, actions, next_states, episode_ids, step_ids = (
             make_sequence_dynamics()
