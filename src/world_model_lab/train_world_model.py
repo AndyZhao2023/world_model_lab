@@ -14,6 +14,11 @@ import numpy as np
 import torch
 from torch import nn
 
+from .bootstrap import (
+    EpisodeBootstrap,
+    expand_episode_transition_indices,
+    sample_episode_bootstrap,
+)
 from .dataset import (
     Normalizer,
     SequenceWindows,
@@ -106,6 +111,28 @@ def _mean_rollout_loss(
     return total_loss / count
 
 
+def _validated_normalizer(
+    normalizer: Normalizer,
+    *,
+    size: int,
+    name: str,
+) -> Normalizer:
+    mean = np.asarray(normalizer.mean, dtype=np.float64)
+    std = np.asarray(normalizer.std, dtype=np.float64)
+    if (
+        mean.shape != (size,)
+        or std.shape != (size,)
+        or not np.all(np.isfinite(mean))
+        or not np.all(np.isfinite(std))
+        or np.any(std <= 0.0)
+    ):
+        raise ValueError(
+            f"{name} must have finite mean/std shape [{size}] "
+            "and positive std"
+        )
+    return Normalizer(mean.copy(), std.copy())
+
+
 def train_model(
     inputs: np.ndarray,
     targets: np.ndarray,
@@ -115,6 +142,8 @@ def train_model(
     train_sequences: SequenceWindows | None = None,
     validation_sequences: SequenceWindows | None = None,
     rollout_loss_weight: float = 1.0,
+    input_normalizer: Normalizer | None = None,
+    target_normalizer: Normalizer | None = None,
     hidden_size: int = 128,
     epochs: int = 100,
     batch_size: int = 256,
@@ -131,6 +160,10 @@ def train_model(
         raise ValueError("inputs must have shape [N, 7]")
     if targets.ndim != 2 or targets.shape != (inputs.shape[0], 4):
         raise ValueError("targets must have shape [N, 4]")
+    if inputs.shape[0] == 0:
+        raise ValueError("training data must not be empty")
+    if not np.all(np.isfinite(inputs)) or not np.all(np.isfinite(targets)):
+        raise ValueError("training data must contain only finite values")
     if (
         validation_inputs.ndim != 2
         or validation_inputs.shape[1] != WorldModelMLP.input_size
@@ -156,8 +189,23 @@ def train_model(
         if train_sequences.horizon <= 1:
             raise ValueError("multi-step training requires a horizon greater than one")
 
-    input_normalizer = fit_normalizer(inputs)
-    target_normalizer = fit_normalizer(targets)
+    if (input_normalizer is None) != (target_normalizer is None):
+        raise ValueError("input and target normalizers must be provided together")
+    if input_normalizer is None:
+        input_normalizer = fit_normalizer(inputs)
+        target_normalizer = fit_normalizer(targets)
+    else:
+        input_normalizer = _validated_normalizer(
+            input_normalizer,
+            size=WorldModelMLP.input_size,
+            name="input_normalizer",
+        )
+        assert target_normalizer is not None
+        target_normalizer = _validated_normalizer(
+            target_normalizer,
+            size=4,
+            name="target_normalizer",
+        )
     normalized_inputs = _as_float_tensor(input_normalizer.normalize(inputs))
     normalized_targets = _as_float_tensor(target_normalizer.normalize(targets))
     normalized_validation_inputs = _as_float_tensor(
@@ -478,6 +526,7 @@ def run_training(
     split_seed: int | None = None,
     rollout_horizon: int = 1,
     rollout_loss_weight: float = 1.0,
+    bootstrap_seed: int | None = None,
 ) -> dict[str, Any]:
     """Load an NPZ dataset, train by episode split, and save a checkpoint."""
 
@@ -508,6 +557,22 @@ def run_training(
     effective_split_seed = seed if split_seed is None else split_seed
     splits = split_episode_ids(episode_ids, seed=effective_split_seed)
     masks = {name: np.isin(episode_ids, ids) for name, ids in splits.items()}
+    full_train_indices = np.flatnonzero(masks["train"])
+    shared_input_normalizer = fit_normalizer(inputs[full_train_indices])
+    shared_target_normalizer = fit_normalizer(targets[full_train_indices])
+    bootstrap: EpisodeBootstrap | None = None
+    training_episode_ids = splits["train"]
+    training_indices = full_train_indices
+    if bootstrap_seed is not None:
+        bootstrap = sample_episode_bootstrap(
+            splits["train"],
+            seed=bootstrap_seed,
+        )
+        training_episode_ids = bootstrap.drawn_episode_ids
+        training_indices = expand_episode_transition_indices(
+            episode_ids,
+            training_episode_ids,
+        )
     train_sequences = validation_sequences = None
     if rollout_horizon > 1:
         assert step_ids is not None
@@ -517,7 +582,7 @@ def run_training(
             next_states,
             episode_ids=episode_ids,
             step_ids=step_ids,
-            selected_episode_ids=splits["train"],
+            selected_episode_ids=training_episode_ids,
             horizon=rollout_horizon,
         )
         validation_sequences = build_sequence_windows(
@@ -536,13 +601,15 @@ def run_training(
             )
 
     result = train_model(
-        inputs[masks["train"]],
-        targets[masks["train"]],
+        inputs[training_indices],
+        targets[training_indices],
         validation_inputs=inputs[masks["validation"]],
         validation_targets=targets[masks["validation"]],
         train_sequences=train_sequences,
         validation_sequences=validation_sequences,
         rollout_loss_weight=effective_rollout_weight,
+        input_normalizer=shared_input_normalizer,
+        target_normalizer=shared_target_normalizer,
         hidden_size=hidden_size,
         epochs=epochs,
         batch_size=batch_size,
@@ -560,6 +627,18 @@ def run_training(
         "rollout_horizon": rollout_horizon,
         "rollout_loss_weight": effective_rollout_weight,
     }
+    if bootstrap is not None:
+        training_config.update(
+            {
+                "bootstrap_seed": int(bootstrap_seed),
+                "bootstrap_episode_draws": bootstrap.draw_count,
+                "bootstrap_unique_episodes": bootstrap.unique_count,
+                "bootstrap_episode_counts": {
+                    str(episode_id): count
+                    for episode_id, count in bootstrap.episode_counts.items()
+                },
+            }
+        )
     validation_metrics = evaluate_model(
         result, inputs[masks["validation"]], targets[masks["validation"]]
     )
@@ -577,6 +656,10 @@ def run_training(
     return {
         "transitions": int(inputs.shape[0]),
         "split_seed": effective_split_seed,
+        "bootstrap_seed": (
+            int(bootstrap_seed) if bootstrap_seed is not None else None
+        ),
+        "bootstrap_train_transitions": int(training_indices.size),
         "rollout_horizon": rollout_horizon,
         "rollout_loss_weight": effective_rollout_weight,
         "train_sequence_windows": (
@@ -623,6 +706,7 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--split-seed", type=int)
+    parser.add_argument("--bootstrap-seed", type=int)
     parser.add_argument("--rollout-horizon", type=int, default=1)
     parser.add_argument("--rollout-loss-weight", type=float, default=1.0)
     args = parser.parse_args()
@@ -637,6 +721,7 @@ def main() -> None:
             learning_rate=args.learning_rate,
             seed=args.seed,
             split_seed=args.split_seed,
+            bootstrap_seed=args.bootstrap_seed,
             rollout_horizon=args.rollout_horizon,
             rollout_loss_weight=args.rollout_loss_weight,
         )

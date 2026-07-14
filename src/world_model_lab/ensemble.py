@@ -260,7 +260,7 @@ def predict_ensemble_next_states(
 
 
 def load_ensemble(paths: Iterable[Path | str]) -> WorldModelEnsemble:
-    resolved = tuple(Path(path).resolve() for path in paths)
+    resolved = tuple(Path(path).expanduser().resolve() for path in paths)
     if len(set(resolved)) != len(resolved):
         raise ValueError("checkpoint paths must be unique")
     for path in resolved:
