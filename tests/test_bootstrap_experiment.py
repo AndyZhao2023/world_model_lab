@@ -1,7 +1,18 @@
+import csv
 import json
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
-from world_model_lab.bootstrap_experiment import build_bootstrap_comparison
+import numpy as np
+
+from world_model_lab import bootstrap_experiment
+from world_model_lab.bootstrap_experiment import (
+    build_bootstrap_comparison,
+    plot_bootstrap_comparison,
+    write_comparison_csv,
+)
 
 
 METRICS = (
@@ -57,6 +68,128 @@ def make_ensemble_metrics(
 
 
 class BootstrapExperimentTest(unittest.TestCase):
+    def test_comparison_csv_has_exact_header_and_stable_row_order(self):
+        comparison = build_bootstrap_comparison(
+            make_ensemble_metrics(error=2.0, correlation=0.1),
+            make_ensemble_metrics(error=1.5, correlation=0.4),
+            horizons=(1, 2),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_comparison_csv(
+                comparison,
+                Path(directory) / "nested" / "comparison.csv",
+            )
+            with path.open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+                handle.seek(0)
+                fieldnames = next(csv.reader(handle))
+
+        self.assertEqual(
+            fieldnames,
+            [
+                "evaluation",
+                "horizon",
+                "metric",
+                "baseline_error",
+                "bootstrap_error",
+                "error_delta",
+                "baseline_disagreement",
+                "bootstrap_disagreement",
+                "disagreement_delta",
+                "baseline_correlation",
+                "bootstrap_correlation",
+                "correlation_delta",
+            ],
+        )
+        self.assertEqual(len(rows), 12)
+        self.assertEqual(
+            [
+                (row["evaluation"], row["horizon"], row["metric"])
+                for row in rows
+            ],
+            [
+                ("one_step", "", metric)
+                for metric in METRICS
+            ]
+            + [
+                ("rollout", str(horizon), metric)
+                for horizon in (1, 2)
+                for metric in METRICS
+            ],
+        )
+
+    def test_comparison_csv_leaves_inapplicable_and_null_cells_empty(self):
+        comparison = build_bootstrap_comparison(
+            make_ensemble_metrics(error=2.0, correlation=None),
+            make_ensemble_metrics(error=1.5, correlation=0.4),
+            horizons=(1, 2),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_comparison_csv(
+                comparison,
+                Path(directory) / "comparison.csv",
+            )
+            with path.open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+
+        for row in rows[:4]:
+            self.assertEqual(row["horizon"], "")
+            self.assertEqual(row["baseline_disagreement"], "")
+            self.assertEqual(row["bootstrap_disagreement"], "")
+            self.assertEqual(row["disagreement_delta"], "")
+        for row in rows:
+            self.assertEqual(row["baseline_correlation"], "")
+            self.assertEqual(row["correlation_delta"], "")
+            self.assertNotIn("None", row.values())
+            self.assertNotIn("nan", row.values())
+
+    def test_comparison_plot_is_four_panels_with_null_correlation_gaps(self):
+        comparison = build_bootstrap_comparison(
+            make_ensemble_metrics(error=2.0, correlation=None),
+            make_ensemble_metrics(error=1.5, correlation=0.4),
+            horizons=(1, 2),
+        )
+        real_subplots = bootstrap_experiment.plt.subplots
+        captured = {}
+
+        def capture_subplots(*args, **kwargs):
+            figure, axes = real_subplots(*args, **kwargs)
+            captured["figure"] = figure
+            captured["axes"] = axes
+            return figure, axes
+
+        figure_numbers_before = set(bootstrap_experiment.plt.get_fignums())
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "nested" / "comparison.png"
+            with patch.object(
+                bootstrap_experiment.plt,
+                "subplots",
+                side_effect=capture_subplots,
+            ) as subplots_spy:
+                path = plot_bootstrap_comparison(comparison, output)
+            contents = path.read_bytes()
+
+        subplots_spy.assert_called_once_with(2, 2, figsize=(11, 8))
+        self.assertEqual(captured["axes"].shape, (2, 2))
+        self.assertEqual(len(captured["figure"].axes), 8)
+        for correlation_axis in captured["figure"].axes[4:]:
+            self.assertEqual(len(correlation_axis.lines), 2)
+            self.assertTrue(
+                np.isnan(correlation_axis.lines[0].get_ydata()).all()
+            )
+            np.testing.assert_allclose(
+                correlation_axis.lines[1].get_ydata(),
+                [0.4, 0.4],
+            )
+        self.assertEqual(contents[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertGreater(len(contents), 1000)
+        self.assertEqual(
+            set(bootstrap_experiment.plt.get_fignums()),
+            figure_numbers_before,
+        )
+
     def test_comparison_uses_bootstrap_minus_baseline_finite_deltas(self):
         comparison = build_bootstrap_comparison(
             make_ensemble_metrics(

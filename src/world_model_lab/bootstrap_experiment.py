@@ -3,15 +3,162 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+import csv
 import math
+from pathlib import Path
 from typing import Any
 
+import matplotlib.pyplot as plt
 import numpy as np
 
 from .ensemble import DISAGREEMENT_NAMES
 
 
 METRIC_NAMES = DISAGREEMENT_NAMES
+COMPARISON_FIELDS = (
+    "evaluation",
+    "horizon",
+    "metric",
+    "baseline_error",
+    "bootstrap_error",
+    "error_delta",
+    "baseline_disagreement",
+    "bootstrap_disagreement",
+    "disagreement_delta",
+    "baseline_correlation",
+    "bootstrap_correlation",
+    "correlation_delta",
+)
+
+
+def write_comparison_csv(
+    comparison: Mapping[str, Any],
+    output_path: Path | str,
+) -> Path:
+    """Write the comparison in a stable tidy layout."""
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=COMPARISON_FIELDS)
+        writer.writeheader()
+        for metric in METRIC_NAMES:
+            writer.writerow(
+                {
+                    "evaluation": "one_step",
+                    "horizon": "",
+                    "metric": metric,
+                    **comparison["one_step"][metric],
+                }
+            )
+        for horizon in comparison["horizons"]:
+            for metric in METRIC_NAMES:
+                writer.writerow(
+                    {
+                        "evaluation": "rollout",
+                        "horizon": horizon,
+                        "metric": metric,
+                        **comparison["rollout"][str(horizon)][metric],
+                    }
+                )
+    return output
+
+
+def plot_bootstrap_comparison(
+    comparison: Mapping[str, Any],
+    output_path: Path | str,
+) -> Path:
+    """Plot baseline and bootstrap rollout diagnostics."""
+
+    horizons = np.asarray(comparison["horizons"], dtype=np.int64)
+    metric_specs = (
+        ("position", "Position", "error (m)"),
+        ("heading_degrees", "Heading", "error (degrees)"),
+        ("velocity", "Velocity", "error (m/s)"),
+        ("normalized_total", "Normalized total", "normalized error"),
+    )
+    figure, axes = plt.subplots(2, 2, figsize=(11, 8))
+    for index, (axis, (metric, title, error_label)) in enumerate(
+        zip(axes.flat, metric_specs, strict=True)
+    ):
+        records = [
+            comparison["rollout"][str(int(horizon))][metric]
+            for horizon in horizons
+        ]
+        baseline_error = np.asarray(
+            [record["baseline_error"] for record in records],
+            dtype=np.float64,
+        )
+        bootstrap_error = np.asarray(
+            [record["bootstrap_error"] for record in records],
+            dtype=np.float64,
+        )
+        baseline_correlation = np.asarray(
+            [
+                np.nan
+                if record["baseline_correlation"] is None
+                else record["baseline_correlation"]
+                for record in records
+            ],
+            dtype=np.float64,
+        )
+        bootstrap_correlation = np.asarray(
+            [
+                np.nan
+                if record["bootstrap_correlation"] is None
+                else record["bootstrap_correlation"]
+                for record in records
+            ],
+            dtype=np.float64,
+        )
+
+        axis.plot(
+            horizons,
+            baseline_error,
+            color="#4c78a8",
+            linewidth=2,
+            label="Baseline error",
+        )
+        axis.plot(
+            horizons,
+            bootstrap_error,
+            color="#f58518",
+            linewidth=2,
+            label="Bootstrap error",
+        )
+        axis.set_title(title)
+        axis.set_ylabel(error_label)
+        axis.grid(True, alpha=0.3)
+        if index >= 2:
+            axis.set_xlabel("rollout horizon")
+
+        correlation_axis = axis.twinx()
+        correlation_axis.plot(
+            horizons,
+            baseline_correlation,
+            color="#4c78a8",
+            linestyle="--",
+            label="Baseline correlation",
+        )
+        correlation_axis.plot(
+            horizons,
+            bootstrap_correlation,
+            color="#f58518",
+            linestyle="--",
+            label="Bootstrap correlation",
+        )
+        correlation_axis.set_ylabel("Pearson correlation")
+
+        lines = axis.lines + correlation_axis.lines
+        axis.legend(lines, [line.get_label() for line in lines], fontsize=8)
+
+    figure.suptitle("Seed-only vs Episode-bootstrap Ensemble")
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    figure.tight_layout()
+    figure.savefig(output, dpi=160)
+    plt.close(figure)
+    return output
 
 
 def _required_mapping(value: object, *, name: str) -> Mapping[str, Any]:
