@@ -7,13 +7,19 @@ from collections.abc import Iterable, Mapping
 import csv
 import json
 import math
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .dataset import build_model_arrays, build_sequence_windows, fit_normalizer
+from .dataset import (
+    build_model_arrays,
+    build_sequence_windows,
+    fit_normalizer,
+    split_episode_ids,
+)
 from .diagnose_ensemble import run_ensemble_diagnostics
 from .diagnose_model import sha256_file
 from .ensemble import DISAGREEMENT_NAMES, WorldModelEnsemble, load_ensemble
@@ -579,6 +585,23 @@ def _positive_integer(name: str, value: object) -> int:
     return int(value)
 
 
+def _finite_real(
+    name: str,
+    value: object,
+    *,
+    positive: bool,
+) -> float:
+    requirement = "positive" if positive else "non-negative"
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be finite and {requirement}")
+    normalized = float(value)
+    if not math.isfinite(normalized) or (
+        normalized <= 0.0 if positive else normalized < 0.0
+    ):
+        raise ValueError(f"{name} must be finite and {requirement}")
+    return normalized
+
+
 def _validate_seeds(seeds: Iterable[int]) -> tuple[int, ...]:
     try:
         values = tuple(seeds)
@@ -645,10 +668,155 @@ def _validate_baseline_protocol(
             )
 
 
+def _sha256_value(value: object, *, name: str) -> str:
+    if not isinstance(value, str) or len(value) != 64:
+        raise ValueError(f"{name} must be a 64-character hexadecimal string")
+    normalized = value.lower()
+    if any(character not in "0123456789abcdef" for character in normalized):
+        raise ValueError(f"{name} must be a 64-character hexadecimal string")
+    return normalized
+
+
+def _load_and_validate_baseline_manifest(
+    manifest_path: Path,
+    *,
+    data_path: Path,
+    dataset_hash: str,
+    baseline: WorldModelEnsemble,
+) -> dict[str, Any]:
+    try:
+        raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"baseline manifest must contain valid JSON: {manifest_path}"
+        ) from error
+    manifest = dict(_required_mapping(raw_manifest, name="baseline manifest"))
+    schema_version = _required_value(
+        manifest,
+        "schema_version",
+        parent="baseline manifest",
+    )
+    if not _is_integer(schema_version) or int(schema_version) != 1:
+        raise ValueError("baseline manifest schema_version must equal 1")
+
+    dataset = _required_child_mapping(
+        manifest,
+        "dataset",
+        parent="baseline manifest",
+    )
+    recorded_data_path = _required_value(
+        dataset,
+        "path",
+        parent="baseline manifest.dataset",
+    )
+    if not isinstance(recorded_data_path, (str, Path)):
+        raise ValueError("baseline manifest dataset path must be a path string")
+    if Path(recorded_data_path).expanduser().resolve() != data_path:
+        raise ValueError(
+            "baseline manifest dataset path differs from the current dataset"
+        )
+    recorded_dataset_hash = _sha256_value(
+        _required_value(
+            dataset,
+            "sha256",
+            parent="baseline manifest.dataset",
+        ),
+        name="baseline manifest dataset SHA-256",
+    )
+    if recorded_dataset_hash != dataset_hash:
+        raise ValueError(
+            "baseline manifest dataset SHA-256 differs from the current dataset"
+        )
+
+    raw_checkpoints = _required_value(
+        manifest,
+        "checkpoints",
+        parent="baseline manifest",
+    )
+    if not isinstance(raw_checkpoints, list) or not raw_checkpoints:
+        raise ValueError(
+            "baseline manifest checkpoints must be a non-empty list"
+        )
+    recorded_checkpoints = []
+    for index, raw_record in enumerate(raw_checkpoints):
+        parent = f"baseline manifest.checkpoints[{index}]"
+        record = _required_mapping(raw_record, name=parent)
+        seed = _required_value(record, "seed", parent=parent)
+        if not _is_integer(seed) or int(seed) < 0:
+            raise ValueError(f"{parent}.seed must be a non-negative integer")
+        checkpoint_path = _required_value(record, "path", parent=parent)
+        if not isinstance(checkpoint_path, (str, Path)):
+            raise ValueError(f"{parent}.path must be a path string")
+        checkpoint_hash = _sha256_value(
+            _required_value(record, "sha256", parent=parent),
+            name=f"{parent}.sha256",
+        )
+        recorded_checkpoints.append(
+            (
+                int(seed),
+                Path(checkpoint_path).expanduser().resolve(),
+                checkpoint_hash,
+            )
+        )
+    recorded_checkpoints.sort(key=lambda record: record[0])
+    recorded_seeds = tuple(record[0] for record in recorded_checkpoints)
+    if len(set(recorded_seeds)) != len(recorded_seeds):
+        raise ValueError("baseline manifest checkpoint seeds must be unique")
+
+    member_seeds = _required_value(
+        manifest,
+        "member_seeds",
+        parent="baseline manifest",
+    )
+    if not isinstance(member_seeds, list) or any(
+        not _is_integer(seed) for seed in member_seeds
+    ):
+        raise ValueError(
+            "baseline manifest member_seeds must be an integer list"
+        )
+    if tuple(int(seed) for seed in member_seeds) != recorded_seeds:
+        raise ValueError(
+            "baseline manifest member_seeds differ from checkpoint records"
+        )
+
+    actual_checkpoints = tuple(
+        (
+            int(seed),
+            path.resolve(),
+            sha256_file(path),
+        )
+        for seed, path in zip(
+            baseline.seeds,
+            baseline.checkpoint_paths,
+            strict=True,
+        )
+    )
+    if recorded_seeds != baseline.seeds:
+        raise ValueError(
+            "baseline manifest checkpoint seeds differ from supplied checkpoints"
+        )
+    for recorded, actual in zip(
+        recorded_checkpoints,
+        actual_checkpoints,
+        strict=True,
+    ):
+        if recorded[1] != actual[1]:
+            raise ValueError(
+                "baseline manifest checkpoint paths differ from supplied checkpoints"
+            )
+        if recorded[2] != actual[2]:
+            raise ValueError(
+                "baseline manifest checkpoint SHA-256 values differ from "
+                "supplied checkpoints"
+            )
+    return manifest
+
+
 def _validate_dataset_split_coverage(
     data_path: Path,
     ensemble: WorldModelEnsemble,
     *,
+    split_seed: int,
     max_diagnostic_horizon: int = 10,
 ) -> None:
     required_arrays = {
@@ -684,8 +852,14 @@ def _validate_dataset_split_coverage(
         )
     available = set(int(value) for value in np.unique(episode_ids).tolist())
     reference = ensemble.members[0]
+    expected_splits = split_episode_ids(episode_ids, seed=split_seed)
     for split_name in ("train", "validation", "test"):
         split_ids = np.asarray(reference.split_episode_ids[split_name])
+        if not np.array_equal(split_ids, expected_splits[split_name]):
+            raise ValueError(
+                "split_seed recomputation differs from checkpoint "
+                f"{split_name} split episode IDs"
+            )
         missing = sorted(
             int(value) for value in split_ids.tolist() if int(value) not in available
         )
@@ -775,6 +949,7 @@ def run_bootstrap_experiment(
     *,
     data_path: Path | str,
     baseline_checkpoint_paths: Iterable[Path | str],
+    baseline_manifest_path: Path | str,
     output_dir: Path | str,
     seeds: Iterable[int] = (0, 1, 2, 3, 4),
     split_seed: int = 0,
@@ -793,6 +968,13 @@ def run_bootstrap_experiment(
     if not data.is_file():
         raise FileNotFoundError(f"dataset is not a regular file: {data}")
     data = data.resolve()
+    baseline_manifest_file = Path(baseline_manifest_path).expanduser()
+    if not baseline_manifest_file.is_file():
+        raise FileNotFoundError(
+            "baseline manifest is not a regular file: "
+            f"{baseline_manifest_file}"
+        )
+    baseline_manifest_file = baseline_manifest_file.resolve()
     output = Path(output_dir).expanduser().resolve()
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise ValueError("output directory must be absent or empty")
@@ -808,22 +990,16 @@ def run_bootstrap_experiment(
         "windows_per_episode", windows_per_episode
     )
     normalized_bins = _positive_integer("calibration_bins", calibration_bins)
-    if (
-        isinstance(learning_rate, (bool, np.bool_))
-        or not math.isfinite(learning_rate)
-        or learning_rate <= 0.0
-    ):
-        raise ValueError("learning_rate must be finite and positive")
-    normalized_learning_rate = float(learning_rate)
-    if (
-        isinstance(rollout_loss_weight, (bool, np.bool_))
-        or not math.isfinite(rollout_loss_weight)
-        or rollout_loss_weight < 0.0
-    ):
-        raise ValueError(
-            "rollout_loss_weight must be finite and non-negative"
-        )
-    normalized_rollout_weight = float(rollout_loss_weight)
+    normalized_learning_rate = _finite_real(
+        "learning_rate",
+        learning_rate,
+        positive=True,
+    )
+    normalized_rollout_weight = _finite_real(
+        "rollout_loss_weight",
+        rollout_loss_weight,
+        positive=False,
+    )
     try:
         horizon_values = _validate_horizons(diagnostic_horizons)
     except ValueError as error:
@@ -842,6 +1018,13 @@ def run_bootstrap_experiment(
                 f"checkpoint is not a regular file: {path}"
             )
     baseline = load_ensemble(requested_baseline_paths)
+    dataset_hash = sha256_file(data)
+    _load_and_validate_baseline_manifest(
+        baseline_manifest_file,
+        data_path=data,
+        dataset_hash=dataset_hash,
+        baseline=baseline,
+    )
     _validate_baseline_protocol(
         baseline,
         data_path=data,
@@ -856,9 +1039,9 @@ def run_bootstrap_experiment(
     _validate_dataset_split_coverage(
         data,
         baseline,
+        split_seed=normalized_split_seed,
         max_diagnostic_horizon=horizon_values[-1],
     )
-    dataset_hash = sha256_file(data)
 
     output.mkdir(parents=True, exist_ok=True)
     bootstrap_paths: list[Path] = []
@@ -943,6 +1126,10 @@ def run_bootstrap_experiment(
     manifest = {
         "schema_version": 1,
         "dataset": {"path": str(data), "sha256": dataset_hash},
+        "baseline_manifest": {
+            "path": str(baseline_manifest_file),
+            "sha256": sha256_file(baseline_manifest_file),
+        },
         "baseline_checkpoints": baseline_records,
         "bootstrap_checkpoints": bootstrap_records,
         "training": {
@@ -999,6 +1186,11 @@ def main() -> None:
         required=True,
     )
     parser.add_argument(
+        "--baseline-manifest",
+        type=Path,
+        required=True,
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("artifacts/experiments/bootstrap-h10-seeds-0-4"),
@@ -1024,6 +1216,7 @@ def main() -> None:
         result = run_bootstrap_experiment(
             data_path=args.data,
             baseline_checkpoint_paths=args.baseline_checkpoints,
+            baseline_manifest_path=args.baseline_manifest,
             output_dir=args.output_dir,
             seeds=args.seeds,
             split_seed=args.split_seed,

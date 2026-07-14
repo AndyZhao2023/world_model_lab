@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
+import torch
 
 from world_model_lab import bootstrap_experiment
 from world_model_lab.bootstrap_experiment import (
@@ -21,6 +22,7 @@ from world_model_lab.bootstrap_experiment import (
 )
 from world_model_lab.train_world_model import load_checkpoint, run_training
 from world_model_lab.ensemble import WorldModelEnsemble, load_ensemble
+from world_model_lab.diagnose_model import sha256_file
 
 
 METRICS = (
@@ -137,6 +139,29 @@ class BootstrapExperimentTest(unittest.TestCase):
                 rollout_loss_weight=1.0,
             )
             cls.baseline_paths.append(checkpoint_path)
+        cls.baseline_manifest_path = cls.fixture_root / "baseline-manifest.json"
+        cls.baseline_manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "dataset": {
+                        "path": str(cls.data_path.resolve()),
+                        "sha256": sha256_file(cls.data_path),
+                    },
+                    "checkpoints": [
+                        {
+                            "seed": seed,
+                            "path": str(path.resolve()),
+                            "sha256": sha256_file(path),
+                        }
+                        for seed, path in enumerate(cls.baseline_paths)
+                    ],
+                    "member_seeds": [0, 1],
+                },
+                allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -173,6 +198,7 @@ class BootstrapExperimentTest(unittest.TestCase):
         for flag in (
             "--data",
             "--baseline-checkpoints",
+            "--baseline-manifest",
             "--output-dir",
             "--seeds",
             "--split-seed",
@@ -202,6 +228,8 @@ class BootstrapExperimentTest(unittest.TestCase):
                     str(root / "missing.npz"),
                     "--baseline-checkpoints",
                     str(root / "missing.pt"),
+                    "--baseline-manifest",
+                    str(root / "missing-manifest.json"),
                 ],
             ):
                 with redirect_stderr(standard_error):
@@ -220,6 +248,7 @@ class BootstrapExperimentTest(unittest.TestCase):
                     self.baseline_paths[1],
                     self.baseline_paths[0],
                 ),
+                baseline_manifest_path=self.baseline_manifest_path,
                 output_dir=output_dir,
                 seeds=(1, 0),
                 split_seed=0,
@@ -291,6 +320,13 @@ class BootstrapExperimentTest(unittest.TestCase):
                 [record["seed"] for record in manifest["bootstrap_checkpoints"]],
                 [0, 1],
             )
+            self.assertEqual(
+                manifest["baseline_manifest"],
+                {
+                    "path": str(self.baseline_manifest_path.resolve()),
+                    "sha256": sha256_file(self.baseline_manifest_path),
+                },
+            )
             json.dumps(manifest, allow_nan=False)
             json.dumps(comparison, allow_nan=False)
             for name in (
@@ -308,7 +344,10 @@ class BootstrapExperimentTest(unittest.TestCase):
             ("training seeds", {"seeds": (0, 2)}),
             ("hidden_size", {"hidden_size": 4}),
             ("split_seed", {"split_seed": 1}),
-            ("data_path", {"data_path": mismatched_data}),
+            (
+                "baseline manifest dataset path",
+                {"data_path": mismatched_data},
+            ),
         )
         for index, (message, overrides) in enumerate(cases):
             with self.subTest(message=message):
@@ -316,6 +355,7 @@ class BootstrapExperimentTest(unittest.TestCase):
                 arguments = {
                     "data_path": self.data_path,
                     "baseline_checkpoint_paths": self.baseline_paths,
+                    "baseline_manifest_path": self.baseline_manifest_path,
                     "output_dir": output,
                     "seeds": (0, 1),
                     "split_seed": 0,
@@ -332,6 +372,41 @@ class BootstrapExperimentTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     run_bootstrap_experiment(**arguments)
                 self.assertFalse(output.exists())
+
+    def test_runner_rejects_untrusted_baseline_dataset_digest_before_training(self):
+        manifest = json.loads(
+            self.baseline_manifest_path.read_text(encoding="utf-8")
+        )
+        manifest["dataset"]["sha256"] = "0" * 64
+        bad_manifest = self.fixture_root / "bad-dataset-digest-manifest.json"
+        bad_manifest.write_text(
+            json.dumps(manifest, allow_nan=False),
+            encoding="utf-8",
+        )
+        output = self.fixture_root / "bad-dataset-digest-output"
+
+        with patch.object(bootstrap_experiment, "run_training") as training_spy:
+            with self.assertRaisesRegex(
+                ValueError,
+                "baseline manifest dataset SHA-256",
+            ):
+                run_bootstrap_experiment(
+                    data_path=self.data_path,
+                    baseline_checkpoint_paths=self.baseline_paths,
+                    baseline_manifest_path=bad_manifest,
+                    output_dir=output,
+                    seeds=(0, 1),
+                    split_seed=0,
+                    hidden_size=8,
+                    epochs=1,
+                    batch_size=32,
+                    diagnostic_horizons=(1, 2),
+                    windows_per_episode=2,
+                    calibration_bins=2,
+                )
+
+        training_spy.assert_not_called()
+        self.assertFalse(output.exists())
 
     def test_cross_ensemble_validation_rejects_data_path_mismatch(self):
         baseline = load_ensemble(self.baseline_paths)
@@ -370,7 +445,62 @@ class BootstrapExperimentTest(unittest.TestCase):
             bootstrap_experiment._validate_dataset_split_coverage(
                 malformed,
                 baseline,
+                split_seed=0,
             )
+
+    def test_runner_recomputes_requested_split_before_training(self):
+        altered_paths = []
+        for seed, source in enumerate(self.baseline_paths):
+            payload = torch.load(source, weights_only=True)
+            split_ids = payload["split_episode_ids"]
+            split_ids["validation"], split_ids["test"] = (
+                split_ids["test"].clone(),
+                split_ids["validation"].clone(),
+            )
+            target = self.fixture_root / f"altered-split-seed-{seed}.pt"
+            torch.save(payload, target)
+            altered_paths.append(target)
+
+        manifest = json.loads(
+            self.baseline_manifest_path.read_text(encoding="utf-8")
+        )
+        manifest["checkpoints"] = [
+            {
+                "seed": seed,
+                "path": str(path.resolve()),
+                "sha256": sha256_file(path),
+            }
+            for seed, path in enumerate(altered_paths)
+        ]
+        altered_manifest = self.fixture_root / "altered-split-manifest.json"
+        altered_manifest.write_text(
+            json.dumps(manifest, allow_nan=False),
+            encoding="utf-8",
+        )
+        output = self.fixture_root / "altered-split-output"
+
+        with patch.object(bootstrap_experiment, "run_training") as training_spy:
+            with self.assertRaisesRegex(
+                ValueError,
+                "split_seed.*validation split episode IDs",
+            ):
+                run_bootstrap_experiment(
+                    data_path=self.data_path,
+                    baseline_checkpoint_paths=altered_paths,
+                    baseline_manifest_path=altered_manifest,
+                    output_dir=output,
+                    seeds=(0, 1),
+                    split_seed=0,
+                    hidden_size=8,
+                    epochs=1,
+                    batch_size=32,
+                    diagnostic_horizons=(1, 2),
+                    windows_per_episode=2,
+                    calibration_bins=2,
+                )
+
+        training_spy.assert_not_called()
+        self.assertFalse(output.exists())
 
     def test_runner_rejects_invalid_protocol_and_nonempty_output(self):
         invalid_cases = (
@@ -378,7 +508,10 @@ class BootstrapExperimentTest(unittest.TestCase):
             ("training seeds", {"seeds": (0, -1)}),
             ("hidden_size", {"hidden_size": 0}),
             ("learning_rate", {"learning_rate": float("nan")}),
+            ("learning_rate", {"learning_rate": "fast"}),
+            ("learning_rate", {"learning_rate": 1.0 + 0.0j}),
             ("rollout_loss_weight", {"rollout_loss_weight": float("inf")}),
+            ("rollout_loss_weight", {"rollout_loss_weight": None}),
             ("diagnostic_horizons", {"diagnostic_horizons": (2, 1)}),
             ("windows_per_episode", {"windows_per_episode": 0}),
             ("calibration_bins", {"calibration_bins": 0}),
@@ -389,6 +522,7 @@ class BootstrapExperimentTest(unittest.TestCase):
                 arguments = {
                     "data_path": self.data_path,
                     "baseline_checkpoint_paths": self.baseline_paths,
+                    "baseline_manifest_path": self.baseline_manifest_path,
                     "output_dir": output,
                     "seeds": (0, 1),
                     "split_seed": 0,
@@ -413,6 +547,7 @@ class BootstrapExperimentTest(unittest.TestCase):
             run_bootstrap_experiment(
                 data_path=self.data_path,
                 baseline_checkpoint_paths=self.baseline_paths,
+                baseline_manifest_path=self.baseline_manifest_path,
                 output_dir=nonempty_output,
                 seeds=(0, 1),
                 split_seed=0,
@@ -447,6 +582,7 @@ class BootstrapExperimentTest(unittest.TestCase):
                     run_bootstrap_experiment(
                         data_path=self.data_path,
                         baseline_checkpoint_paths=self.baseline_paths,
+                        baseline_manifest_path=self.baseline_manifest_path,
                         output_dir=output_dir,
                         seeds=(0, 1),
                         split_seed=0,
@@ -492,6 +628,7 @@ class BootstrapExperimentTest(unittest.TestCase):
                     run_bootstrap_experiment(
                         data_path=self.data_path,
                         baseline_checkpoint_paths=self.baseline_paths,
+                        baseline_manifest_path=self.baseline_manifest_path,
                         output_dir=output_dir,
                         seeds=(0, 1),
                         split_seed=0,
