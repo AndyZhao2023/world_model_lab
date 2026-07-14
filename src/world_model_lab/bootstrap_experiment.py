@@ -1008,14 +1008,16 @@ def run_bootstrap_experiment(
         ) from None
 
     try:
-        requested_baseline_paths = tuple(baseline_checkpoint_paths)
+        requested_baseline_paths = tuple(
+            Path(path).expanduser().resolve()
+            for path in baseline_checkpoint_paths
+        )
     except TypeError:
         raise ValueError("baseline_checkpoint_paths must be an iterable") from None
     for checkpoint_path in requested_baseline_paths:
-        path = Path(checkpoint_path).expanduser()
-        if not path.is_file():
+        if not checkpoint_path.is_file():
             raise FileNotFoundError(
-                f"checkpoint is not a regular file: {path}"
+                f"checkpoint is not a regular file: {checkpoint_path}"
             )
     baseline = load_ensemble(requested_baseline_paths)
     dataset_hash = sha256_file(data)

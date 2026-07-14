@@ -1,7 +1,8 @@
 import math
+from pathlib import Path
 import tempfile
 import unittest
-from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -278,6 +279,33 @@ class EnsembleTest(unittest.TestCase):
                 load_ensemble((seed_zero, seed_zero))
             with self.assertRaisesRegex(FileNotFoundError, "regular file"):
                 load_ensemble((seed_zero, root / "missing.pt"))
+
+    def test_load_expands_user_checkpoint_paths(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            checkpoint_directory = home / "models"
+            checkpoint_directory.mkdir()
+            seed_one = save_member_checkpoint(
+                checkpoint_directory / "seed_1.pt",
+                make_member(1, np.ones(4)),
+            )
+            seed_zero = save_member_checkpoint(
+                checkpoint_directory / "seed_0.pt",
+                make_member(0, np.zeros(4)),
+            )
+
+            with patch.dict("os.environ", {"HOME": str(home)}):
+                try:
+                    ensemble = load_ensemble(
+                        ("~/models/seed_1.pt", "~/models/seed_0.pt")
+                    )
+                except FileNotFoundError as error:
+                    self.fail(f"load_ensemble did not expand user paths: {error}")
+
+            self.assertEqual(
+                ensemble.checkpoint_paths,
+                (seed_zero.resolve(), seed_one.resolve()),
+            )
 
     def test_rollout_recursively_advances_each_member_independently(self):
         ensemble = build_ensemble(

@@ -160,6 +160,10 @@ def train_model(
         raise ValueError("inputs must have shape [N, 7]")
     if targets.ndim != 2 or targets.shape != (inputs.shape[0], 4):
         raise ValueError("targets must have shape [N, 4]")
+    if inputs.shape[0] == 0:
+        raise ValueError("training data must not be empty")
+    if not np.all(np.isfinite(inputs)) or not np.all(np.isfinite(targets)):
+        raise ValueError("training data must contain only finite values")
     if (
         validation_inputs.ndim != 2
         or validation_inputs.shape[1] != WorldModelMLP.input_size

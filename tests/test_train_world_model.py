@@ -320,6 +320,49 @@ class TrainWorldModelTest(unittest.TestCase):
             shared_target.std,
         )
 
+    def test_train_model_rejects_empty_data_with_explicit_normalizers(self):
+        inputs, targets = make_linear_dynamics(count=64)
+        shared_input = fit_normalizer(inputs[:48])
+        shared_target = fit_normalizer(targets[:48])
+
+        with self.assertRaisesRegex(ValueError, "training data.*empty"):
+            train_model(
+                inputs[:0],
+                targets[:0],
+                validation_inputs=inputs[48:],
+                validation_targets=targets[48:],
+                input_normalizer=shared_input,
+                target_normalizer=shared_target,
+                hidden_size=8,
+                epochs=1,
+            )
+
+    def test_train_model_rejects_non_finite_data_with_explicit_normalizers(self):
+        inputs, targets = make_linear_dynamics(count=64)
+        shared_input = fit_normalizer(inputs[:48])
+        shared_target = fit_normalizer(targets[:48])
+        invalid_inputs = inputs[:48].copy()
+        invalid_inputs[0, 0] = np.nan
+        invalid_targets = targets[:48].copy()
+        invalid_targets[0, 0] = np.inf
+
+        for name, training_inputs, training_targets in (
+            ("inputs", invalid_inputs, targets[:48]),
+            ("targets", inputs[:48], invalid_targets),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, "training data.*finite"):
+                    train_model(
+                        training_inputs,
+                        training_targets,
+                        validation_inputs=inputs[48:],
+                        validation_targets=targets[48:],
+                        input_normalizer=shared_input,
+                        target_normalizer=shared_target,
+                        hidden_size=8,
+                        epochs=1,
+                    )
+
     def test_train_model_requires_both_explicit_normalizers(self):
         inputs, targets = make_linear_dynamics(count=64)
         shared_input = fit_normalizer(inputs[:48])
