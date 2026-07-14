@@ -1,14 +1,69 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+import matplotlib.pyplot as plt
 import numpy as np
 
 from tests.test_ensemble import make_member
 from world_model_lab.diagnose_ensemble import (
     build_calibration_bins,
     evaluate_one_step_calibration,
+    evaluate_ensemble_rollouts,
     pearson_correlation,
+    plot_one_step_calibration,
+    plot_rollout_uncertainty,
 )
+from world_model_lab.diagnostics import RolloutWindow
 from world_model_lab.ensemble import build_ensemble
+
+
+PLOT_METRIC_NAMES = (
+    "position",
+    "heading_degrees",
+    "velocity",
+    "normalized_total",
+)
+
+
+def make_one_step_metrics():
+    return {
+        "metrics": {
+            name: {
+                "calibration_bins": [
+                    {
+                        "count": 2,
+                        "disagreement_mean": 0.25,
+                        "error_mean": 0.5,
+                    },
+                    {
+                        "count": 2,
+                        "disagreement_mean": 0.75,
+                        "error_mean": 1.5,
+                    },
+                ]
+            }
+            for name in PLOT_METRIC_NAMES
+        }
+    }
+
+
+def make_rollout_metrics():
+    return {
+        "steps": [1, 2],
+        "metrics": {
+            name: {
+                "ensemble_error_mean": [0.5, 1.0],
+                "mean_member_error_mean": [0.75, 1.5],
+                "min_member_error_mean": [0.25, 0.5],
+                "max_member_error_mean": [1.0, 2.0],
+                "disagreement_mean": [0.2, 0.4],
+                "pearson_correlation": [0.1, 0.2],
+            }
+            for name in PLOT_METRIC_NAMES
+        },
+    }
 
 
 class DiagnoseEnsembleTest(unittest.TestCase):
@@ -109,6 +164,231 @@ class DiagnoseEnsembleTest(unittest.TestCase):
         self.assertEqual(position["mean_member_error"]["mean"], 1.5)
         self.assertEqual(position["ensemble_gain_mean"], 0.5)
         self.assertIsNone(position["pearson_correlation"])
+
+    def test_rollout_metrics_weight_episodes_equally_and_keep_member_divergence(self):
+        ensemble = build_ensemble(
+            (
+                make_member(0, np.asarray([1.0, 0.0, 0.0, 0.0])),
+                make_member(1, np.asarray([3.0, 0.0, 0.0, 0.0])),
+            )
+        )
+        windows = (
+            RolloutWindow(
+                10,
+                0,
+                np.asarray(
+                    [[0, 0, 0, 0], [2, 0, 0, 0], [4, 0, 0, 0]],
+                    dtype=float,
+                ),
+                np.zeros((2, 2)),
+            ),
+            RolloutWindow(
+                10,
+                1,
+                np.asarray(
+                    [[0, 0, 0, 0], [2, 0, 0, 0], [4, 0, 0, 0]],
+                    dtype=float,
+                ),
+                np.zeros((2, 2)),
+            ),
+            RolloutWindow(
+                20,
+                0,
+                np.asarray(
+                    [[0, 0, 0, 0], [4, 0, 0, 0], [8, 0, 0, 0]],
+                    dtype=float,
+                ),
+                np.zeros((2, 2)),
+            ),
+        )
+
+        result = evaluate_ensemble_rollouts(
+            ensemble,
+            windows=windows,
+            eligible_episode_ids=np.asarray([10, 20]),
+        )
+
+        self.assertEqual(result["steps"], [1, 2])
+        self.assertEqual(result["episodes"], 2)
+        self.assertEqual(result["windows"], 3)
+        self.assertEqual(
+            result["metrics"]["position"]["ensemble_error_mean"],
+            [1.0, 2.0],
+        )
+        self.assertEqual(
+            result["metrics"]["position"]["mean_member_error_mean"],
+            [1.5, 3.0],
+        )
+        self.assertEqual(
+            result["metrics"]["position"]["min_member_error_mean"],
+            [1.0, 2.0],
+        )
+        self.assertEqual(
+            result["metrics"]["position"]["max_member_error_mean"],
+            [2.0, 4.0],
+        )
+        self.assertEqual(
+            result["metrics"]["position"]["disagreement_mean"],
+            [1.0, 2.0],
+        )
+
+    def test_rollout_metrics_keep_heading_circular_across_wrap_boundary(self):
+        ensemble = build_ensemble(
+            (
+                make_member(
+                    0,
+                    np.asarray([0.0, 0.0, np.deg2rad(179.0), 0.0]),
+                ),
+                make_member(
+                    1,
+                    np.asarray([0.0, 0.0, np.deg2rad(-179.0), 0.0]),
+                ),
+            )
+        )
+        window = RolloutWindow(
+            10,
+            0,
+            np.asarray(
+                [
+                    [0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, np.pi, 0.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                ]
+            ),
+            np.zeros((2, 2)),
+        )
+
+        result = evaluate_ensemble_rollouts(
+            ensemble,
+            windows=(window,),
+            eligible_episode_ids=np.asarray([10]),
+        )
+
+        heading = result["metrics"]["heading_degrees"]
+        np.testing.assert_allclose(
+            heading["ensemble_error_mean"],
+            [0.0, 0.0],
+            atol=1e-5,
+        )
+        np.testing.assert_allclose(
+            heading["disagreement_mean"],
+            [1.0, 2.0],
+            atol=1e-5,
+        )
+
+    def test_rollout_metrics_use_json_null_for_constant_correlations(self):
+        ensemble = build_ensemble(
+            (
+                make_member(0, np.asarray([1.0, 0.0, 0.0, 0.0])),
+                make_member(1, np.asarray([3.0, 0.0, 0.0, 0.0])),
+            )
+        )
+        windows = tuple(
+            RolloutWindow(
+                episode_id,
+                0,
+                np.asarray(
+                    [[0, 0, 0, 0], [target, 0, 0, 0]],
+                    dtype=float,
+                ),
+                np.zeros((1, 2)),
+            )
+            for episode_id, target in ((10, 2.0), (20, 4.0))
+        )
+
+        result = evaluate_ensemble_rollouts(
+            ensemble,
+            windows=windows,
+            eligible_episode_ids=np.asarray([10, 20]),
+        )
+
+        for metric in result["metrics"].values():
+            self.assertEqual(metric["pearson_correlation"], [None])
+
+    def test_ensemble_plots_save_png_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calibration_path = plot_one_step_calibration(
+                make_one_step_metrics(),
+                root / "calibration.png",
+            )
+            rollout_path = plot_rollout_uncertainty(
+                make_rollout_metrics(),
+                root / "rollout.png",
+            )
+
+            self.assertGreater(calibration_path.stat().st_size, 0)
+            self.assertGreater(rollout_path.stat().st_size, 0)
+
+    def test_ensemble_plots_label_all_metric_panels_and_secondary_axes(self):
+        labels = (
+            ("Position", "error (m)", "disagreement (m)"),
+            ("Heading", "error (degrees)", "disagreement (degrees)"),
+            ("Velocity", "error (m/s)", "disagreement (m/s)"),
+            (
+                "Normalized total",
+                "normalized MSE",
+                "normalized RMS disagreement",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calibration_figure, calibration_axes = plt.subplots(2, 2)
+            with patch.object(
+                plt,
+                "subplots",
+                return_value=(calibration_figure, calibration_axes),
+            ):
+                plot_one_step_calibration(
+                    make_one_step_metrics(),
+                    root / "calibration.png",
+                )
+
+            rollout_figure, rollout_axes = plt.subplots(2, 2)
+            with patch.object(
+                plt,
+                "subplots",
+                return_value=(rollout_figure, rollout_axes),
+            ):
+                plot_rollout_uncertainty(
+                    make_rollout_metrics(),
+                    root / "rollout.png",
+                )
+
+        for axis, (title, error_label, disagreement_label) in zip(
+            calibration_axes.flat,
+            labels,
+        ):
+            self.assertEqual(axis.get_title(), title)
+            self.assertEqual(axis.get_xlabel(), disagreement_label)
+            self.assertEqual(axis.get_ylabel(), error_label)
+        for axis, (title, error_label, _) in zip(rollout_axes.flat, labels):
+            self.assertEqual(axis.get_title(), title)
+            self.assertEqual(axis.get_xlabel(), "Rollout step")
+            self.assertEqual(axis.get_ylabel(), error_label)
+        self.assertEqual(
+            [axis.get_ylabel() for axis in rollout_figure.axes[4:]],
+            [item[2] for item in labels],
+        )
+
+    def test_ensemble_plots_reject_missing_fields_by_name(self):
+        one_step = make_one_step_metrics()
+        del one_step["metrics"]["position"]["calibration_bins"]
+        rollout = make_rollout_metrics()
+        del rollout["metrics"]["velocity"]["disagreement_mean"]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(
+                ValueError,
+                "position.*calibration_bins",
+            ):
+                plot_one_step_calibration(one_step, root / "calibration.png")
+            with self.assertRaisesRegex(
+                ValueError,
+                "velocity.*disagreement_mean",
+            ):
+                plot_rollout_uncertainty(rollout, root / "rollout.png")
 
 
 if __name__ == "__main__":
