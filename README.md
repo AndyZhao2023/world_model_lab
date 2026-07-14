@@ -369,6 +369,8 @@ MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
 | `summary.csv` | 每个 seed、horizon 和指标的 H1、H10 与 paired delta 明细 |
 | `multiseed_comparison.png` | position、heading、velocity、normalized total 的 2×2 均值与样本标准差图 |
 
+这里的 `mean ± sample standard deviation` 只作为五个训练 seed 之间变异性的描述性证据，不是正式的统计显著性检验。
+
 每个 `runs/seed_<seed>/{h1,h10}/` 目录包含 `world_model.pt` checkpoint 和一个
 `diagnostics/` bundle。bundle 内含 `metrics.json`、`manifest.json`、`overview.png`、
 `rollout_errors.png` 与 `rollout_loss_components.png`，可追溯并检查单次训练的完整
