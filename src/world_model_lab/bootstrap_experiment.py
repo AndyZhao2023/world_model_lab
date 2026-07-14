@@ -1,0 +1,307 @@
+"""Compare seed-only and episode-bootstrap ensemble diagnostics."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
+import math
+from typing import Any
+
+import numpy as np
+
+from .ensemble import DISAGREEMENT_NAMES
+
+
+METRIC_NAMES = DISAGREEMENT_NAMES
+
+
+def _required_mapping(value: object, *, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    return value
+
+
+def _required_value(
+    values: Mapping[str, Any],
+    field: str,
+    *,
+    parent: str,
+) -> Any:
+    if field not in values:
+        raise ValueError(f"{parent}.{field} is missing")
+    return values[field]
+
+
+def _required_child_mapping(
+    values: Mapping[str, Any],
+    field: str,
+    *,
+    parent: str,
+) -> Mapping[str, Any]:
+    name = f"{parent}.{field}"
+    return _required_mapping(
+        _required_value(values, field, parent=parent),
+        name=name,
+    )
+
+
+def _finite_float(value: object, *, name: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{name} must be finite") from None
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+def _correlation(value: object, *, name: str) -> float | None:
+    if value is None:
+        return None
+    return _finite_float(value, name=name)
+
+
+def _finite_delta(
+    current: float,
+    baseline: float,
+    *,
+    name: str,
+) -> float:
+    result = current - baseline
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+def _correlation_delta(
+    current: float | None,
+    baseline: float | None,
+    *,
+    name: str,
+) -> float | None:
+    if current is None or baseline is None:
+        return None
+    return _finite_delta(current, baseline, name=name)
+
+
+def _validate_schema(
+    value: object,
+    *,
+    name: str,
+) -> Mapping[str, Any]:
+    metrics = _required_mapping(value, name=name)
+    version = _required_value(metrics, "schema_version", parent=name)
+    if (
+        isinstance(version, (bool, np.bool_))
+        or not isinstance(version, (int, np.integer))
+        or int(version) != 1
+    ):
+        raise ValueError(f"{name}.schema_version must equal 1")
+    return metrics
+
+
+def _validate_horizons(horizons: Iterable[int]) -> tuple[int, ...]:
+    try:
+        values = tuple(horizons)
+    except TypeError:
+        raise ValueError("horizons must be an iterable") from None
+    if not values:
+        raise ValueError("horizons must be non-empty")
+    if any(
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, np.integer))
+        or int(value) <= 0
+        for value in values
+    ):
+        raise ValueError("horizons must contain positive integers")
+    normalized = tuple(int(value) for value in values)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("horizons must be unique")
+    if any(left >= right for left, right in zip(normalized, normalized[1:])):
+        raise ValueError("horizons must be strictly increasing")
+    return normalized
+
+
+def _extract_one_step_metric(
+    metrics: Mapping[str, Any],
+    *,
+    source: str,
+    metric: str,
+) -> tuple[float, float | None]:
+    one_step = _required_child_mapping(metrics, "one_step", parent=source)
+    records = _required_child_mapping(
+        one_step,
+        "metrics",
+        parent=f"{source}.one_step",
+    )
+    record_path = f"{source}.one_step.metrics.{metric}"
+    record = _required_child_mapping(
+        records,
+        metric,
+        parent=f"{source}.one_step.metrics",
+    )
+    error_path = f"{record_path}.ensemble_error"
+    error_record = _required_child_mapping(
+        record,
+        "ensemble_error",
+        parent=record_path,
+    )
+    error = _finite_float(
+        _required_value(error_record, "mean", parent=error_path),
+        name=f"{error_path}.mean",
+    )
+    correlation_path = f"{record_path}.pearson_correlation"
+    correlation = _correlation(
+        _required_value(record, "pearson_correlation", parent=record_path),
+        name=correlation_path,
+    )
+    return error, correlation
+
+
+def _extract_rollout_metric(
+    metrics: Mapping[str, Any],
+    *,
+    source: str,
+    horizon: int,
+    metric: str,
+) -> tuple[float, float, float | None]:
+    rollout = _required_child_mapping(metrics, "rollout", parent=source)
+    snapshots = _required_child_mapping(
+        rollout,
+        "horizons",
+        parent=f"{source}.rollout",
+    )
+    horizon_key = str(horizon)
+    snapshot_path = f"{source}.rollout.horizons.{horizon_key}"
+    snapshot = _required_child_mapping(
+        snapshots,
+        horizon_key,
+        parent=f"{source}.rollout.horizons",
+    )
+    records = _required_child_mapping(
+        snapshot,
+        "metrics",
+        parent=snapshot_path,
+    )
+    record_path = f"{snapshot_path}.metrics.{metric}"
+    record = _required_child_mapping(
+        records,
+        metric,
+        parent=f"{snapshot_path}.metrics",
+    )
+
+    error_name = f"{record_path}.ensemble_error_mean"
+    error = _finite_float(
+        _required_value(record, "ensemble_error_mean", parent=record_path),
+        name=error_name,
+    )
+    disagreement_name = f"{record_path}.disagreement_mean"
+    disagreement = _finite_float(
+        _required_value(record, "disagreement_mean", parent=record_path),
+        name=disagreement_name,
+    )
+    correlation_name = f"{record_path}.pearson_correlation"
+    correlation = _correlation(
+        _required_value(record, "pearson_correlation", parent=record_path),
+        name=correlation_name,
+    )
+    return error, disagreement, correlation
+
+def build_bootstrap_comparison(
+    baseline_metrics: Mapping[str, Any],
+    bootstrap_metrics: Mapping[str, Any],
+    *,
+    horizons: Iterable[int],
+) -> dict[str, Any]:
+    """Build a JSON-safe baseline-versus-bootstrap comparison."""
+
+    baseline = _validate_schema(baseline_metrics, name="baseline")
+    bootstrap = _validate_schema(bootstrap_metrics, name="bootstrap")
+    horizon_values = _validate_horizons(horizons)
+
+    one_step = {}
+    for metric in METRIC_NAMES:
+        baseline_error, baseline_correlation = _extract_one_step_metric(
+            baseline,
+            source="baseline",
+            metric=metric,
+        )
+        bootstrap_error, bootstrap_correlation = _extract_one_step_metric(
+            bootstrap,
+            source="bootstrap",
+            metric=metric,
+        )
+        output_path = f"one_step.{metric}"
+        one_step[metric] = {
+            "baseline_error": baseline_error,
+            "bootstrap_error": bootstrap_error,
+            "error_delta": _finite_delta(
+                bootstrap_error,
+                baseline_error,
+                name=f"{output_path}.error_delta",
+            ),
+            "baseline_correlation": baseline_correlation,
+            "bootstrap_correlation": bootstrap_correlation,
+            "correlation_delta": _correlation_delta(
+                bootstrap_correlation,
+                baseline_correlation,
+                name=f"{output_path}.correlation_delta",
+            ),
+        }
+
+    rollout = {}
+    for horizon in horizon_values:
+        horizon_metrics = {}
+        for metric in METRIC_NAMES:
+            (
+                baseline_error,
+                baseline_disagreement,
+                baseline_correlation,
+            ) = _extract_rollout_metric(
+                baseline,
+                source="baseline",
+                horizon=horizon,
+                metric=metric,
+            )
+            (
+                bootstrap_error,
+                bootstrap_disagreement,
+                bootstrap_correlation,
+            ) = _extract_rollout_metric(
+                bootstrap,
+                source="bootstrap",
+                horizon=horizon,
+                metric=metric,
+            )
+            output_path = f"rollout.{horizon}.{metric}"
+            horizon_metrics[metric] = {
+                "baseline_error": baseline_error,
+                "bootstrap_error": bootstrap_error,
+                "error_delta": _finite_delta(
+                    bootstrap_error,
+                    baseline_error,
+                    name=f"{output_path}.error_delta",
+                ),
+                "baseline_disagreement": baseline_disagreement,
+                "bootstrap_disagreement": bootstrap_disagreement,
+                "disagreement_delta": _finite_delta(
+                    bootstrap_disagreement,
+                    baseline_disagreement,
+                    name=f"{output_path}.disagreement_delta",
+                ),
+                "baseline_correlation": baseline_correlation,
+                "bootstrap_correlation": bootstrap_correlation,
+                "correlation_delta": _correlation_delta(
+                    bootstrap_correlation,
+                    baseline_correlation,
+                    name=f"{output_path}.correlation_delta",
+                ),
+            }
+        rollout[str(horizon)] = horizon_metrics
+
+    return {
+        "schema_version": 1,
+        "delta_definition": "bootstrap minus baseline",
+        "horizons": list(horizon_values),
+        "one_step": one_step,
+        "rollout": rollout,
+    }
