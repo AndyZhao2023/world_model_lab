@@ -12,6 +12,8 @@ from .train_world_model import LoadedWorldModel, predict_deltas
 
 
 ERROR_NAMES = ("position", "heading_degrees", "velocity")
+STATE_COMPONENT_NAMES = ("x", "y", "heading", "velocity")
+NORMALIZED_MSE_NAMES = (*STATE_COMPONENT_NAMES, "total")
 
 
 @dataclass(frozen=True)
@@ -48,12 +50,10 @@ def summarize_values(values: np.ndarray) -> dict[str, float | int]:
     }
 
 
-def compute_state_errors(
+def _state_differences(
     predicted_states: np.ndarray,
     true_states: np.ndarray,
-) -> dict[str, np.ndarray]:
-    """Compute absolute errors in physical units for matching state batches."""
-
+) -> np.ndarray:
     predicted = np.asarray(predicted_states, dtype=np.float64)
     true = np.asarray(true_states, dtype=np.float64)
     if (
@@ -66,9 +66,48 @@ def compute_state_errors(
         raise ValueError("predicted and true states must contain only finite values")
 
     difference = predicted - true
+    difference[:, 2] = wrap_angle(difference[:, 2])
+    return difference
+
+
+def _validate_target_std(target_std: np.ndarray) -> np.ndarray:
+    array = np.asarray(target_std, dtype=np.float64)
+    if (
+        array.shape != (4,)
+        or not np.all(np.isfinite(array))
+        or np.any(array <= 0.0)
+    ):
+        raise ValueError(
+            "target_std must have shape [4] and contain only finite positive values"
+        )
+    return array
+
+
+def _compute_normalized_squared_errors(
+    predicted_states: np.ndarray,
+    true_states: np.ndarray,
+    target_std: np.ndarray,
+) -> dict[str, np.ndarray]:
+    difference = _state_differences(predicted_states, true_states)
+    normalized_squared = np.square(difference / _validate_target_std(target_std))
+    result = {
+        name: normalized_squared[:, index]
+        for index, name in enumerate(STATE_COMPONENT_NAMES)
+    }
+    result["total"] = np.mean(normalized_squared, axis=1)
+    return result
+
+
+def compute_state_errors(
+    predicted_states: np.ndarray,
+    true_states: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Compute absolute errors in physical units for matching state batches."""
+
+    difference = _state_differences(predicted_states, true_states)
     return {
         "position": np.linalg.norm(difference[:, :2], axis=1),
-        "heading_degrees": np.degrees(np.abs(wrap_angle(difference[:, 2]))),
+        "heading_degrees": np.degrees(np.abs(difference[:, 2])),
         "velocity": np.abs(difference[:, 3]),
     }
 
@@ -394,6 +433,114 @@ def _summarize_episode_records(
     return summary
 
 
+def _empty_named_records(names: tuple[str, ...]) -> dict[str, list[float]]:
+    return {name: [] for name in names}
+
+
+def _append_episode_errors(
+    records: dict[int, dict[str, list[float]]],
+    *,
+    episode_id: int,
+    errors: Mapping[str, np.ndarray],
+    step_index: int,
+    names: tuple[str, ...],
+) -> None:
+    episode_records = records.setdefault(
+        episode_id,
+        _empty_named_records(names),
+    )
+    for name in names:
+        episode_records[name].append(float(errors[name][step_index]))
+
+
+def _macro_mean_curves(
+    records_by_step: list[dict[int, dict[str, list[float]]]],
+    *,
+    names: tuple[str, ...],
+) -> dict[str, list[float]]:
+    curves = {name: [] for name in names}
+    for records in records_by_step:
+        episode_ids = sorted(records)
+        if not episode_ids:
+            raise ValueError("step curves require at least one episode")
+        for name in names:
+            per_episode_means = np.asarray(
+                [np.mean(records[episode_id][name]) for episode_id in episode_ids],
+                dtype=np.float64,
+            )
+            value = float(np.mean(per_episode_means))
+            if not np.isfinite(value):
+                raise ValueError("step curves must contain only finite values")
+            curves[name].append(value)
+    return curves
+
+
+def _build_step_curves(
+    window_predictions: list[tuple[RolloutWindow, np.ndarray, np.ndarray]],
+    *,
+    target_std: np.ndarray,
+    max_horizon: int,
+) -> dict[str, object]:
+    mode_records = {
+        mode_name: {
+            "physical": [{} for _ in range(max_horizon)],
+            "normalized_mse": [{} for _ in range(max_horizon)],
+        }
+        for mode_name in ("teacher_forcing", "free_rollout")
+    }
+
+    for window, teacher_predictions, free_predictions in window_predictions:
+        true_states = window.true_states[1 : max_horizon + 1]
+        predictions_by_mode = {
+            "teacher_forcing": teacher_predictions,
+            "free_rollout": free_predictions[1:],
+        }
+        for mode_name, predictions in predictions_by_mode.items():
+            if predictions.shape != (max_horizon, 4):
+                raise ValueError(
+                    "cached rollout predictions must have shape [max_horizon, 4]"
+                )
+            physical_errors = compute_state_errors(predictions, true_states)
+            normalized_errors = _compute_normalized_squared_errors(
+                predictions,
+                true_states,
+                target_std,
+            )
+            for step_index in range(max_horizon):
+                _append_episode_errors(
+                    mode_records[mode_name]["physical"][step_index],
+                    episode_id=window.episode_id,
+                    errors=physical_errors,
+                    step_index=step_index,
+                    names=ERROR_NAMES,
+                )
+                _append_episode_errors(
+                    mode_records[mode_name]["normalized_mse"][step_index],
+                    episode_id=window.episode_id,
+                    errors=normalized_errors,
+                    step_index=step_index,
+                    names=NORMALIZED_MSE_NAMES,
+                )
+
+    return {
+        "steps": list(range(1, max_horizon + 1)),
+        "aggregation": "episode_macro_mean",
+        **{
+            mode_name: {
+                "physical": _macro_mean_curves(
+                    records["physical"],
+                    names=ERROR_NAMES,
+                ),
+                "normalized_mse": _macro_mean_curves(
+                    records["normalized_mse"],
+                    names=NORMALIZED_MSE_NAMES,
+                ),
+            }
+            for mode_name, records in mode_records.items()
+        },
+    }
+
+
 def _validate_horizons(horizons: tuple[int, ...]) -> tuple[int, ...]:
     values = tuple(int(value) for value in horizons)
     if not values or any(value <= 0 for value in values):
@@ -433,6 +580,7 @@ def build_diagnostic_metrics(
         raise ValueError("windows_per_episode must be positive")
     if xy_bins <= 0 or feature_bins <= 0 or min_bin_count <= 0:
         raise ValueError("bin counts and min_bin_count must be positive")
+    target_std = _validate_target_std(world_model.target_normalizer.std)
 
     states = np.asarray(arrays["states"], dtype=np.float64)
     actions = np.asarray(arrays["actions"], dtype=np.float64)
@@ -502,6 +650,11 @@ def build_diagnostic_metrics(
                 _free_rollout(world_model, window.true_states[0], window.actions),
             )
         )
+    step_curves = _build_step_curves(
+        window_predictions,
+        target_std=target_std,
+        max_horizon=horizon_values[-1],
+    )
 
     horizon_metrics: dict[str, object] = {}
     for horizon in horizon_values:
@@ -533,7 +686,7 @@ def build_diagnostic_metrics(
         }
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "population": {
             "train_episode_ids": [int(value) for value in train_ids.tolist()],
             "test_episode_ids": [int(value) for value in test_ids.tolist()],
@@ -599,5 +752,6 @@ def build_diagnostic_metrics(
                 ],
             },
             "horizons": horizon_metrics,
+            "step_curves": step_curves,
         },
     }

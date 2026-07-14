@@ -10,7 +10,11 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from .diagnostic_plots import plot_diagnostic_overview, plot_rollout_errors
+from .diagnostic_plots import (
+    plot_diagnostic_overview,
+    plot_rollout_errors,
+    plot_rollout_loss_components,
+)
 from .diagnostics import build_diagnostic_metrics
 from .train_world_model import load_checkpoint
 
@@ -105,10 +109,12 @@ def run_diagnostics(
     manifest_path = output / "manifest.json"
     overview_path = output / "overview.png"
     rollout_path = output / "rollout_errors.png"
+    rollout_components_path = output / "rollout_loss_components.png"
     _write_json(metrics_path, metrics)
     _write_json(manifest_path, manifest)
     plot_diagnostic_overview(metrics, overview_path)
     plot_rollout_errors(metrics, rollout_path)
+    plot_rollout_loss_components(metrics, rollout_components_path)
 
     longest_horizon = horizon_values[-1]
     longest_metrics = metrics["rollout"]["horizons"][str(longest_horizon)]
@@ -118,6 +124,7 @@ def run_diagnostics(
         "manifest": str(manifest_path),
         "overview_plot": str(overview_path),
         "rollout_plot": str(rollout_path),
+        "rollout_loss_components_plot": str(rollout_components_path),
         "one_step": {
             name: metrics["one_step"]["overall"][name]["mean"]
             for name in ("position", "heading_degrees", "velocity")

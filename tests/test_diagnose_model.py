@@ -99,20 +99,53 @@ class DiagnoseModelTest(unittest.TestCase):
                 feature_bins=2,
                 min_bin_count=1,
             )
+            second_output_dir = root / "diagnostics-second"
+            second_summary = run_diagnostics(
+                data_path=data_path,
+                checkpoint_path=checkpoint_path,
+                output_dir=second_output_dir,
+                horizons=(1, 2),
+                windows_per_episode=2,
+                xy_bins=2,
+                feature_bins=2,
+                min_bin_count=1,
+            )
 
             output_names = {
                 path.name for path in output_dir.iterdir() if path.is_file()
             }
-            metrics = json.loads((output_dir / "metrics.json").read_text())
-            manifest = json.loads((output_dir / "manifest.json").read_text())
+            metrics_bytes = (output_dir / "metrics.json").read_bytes()
+            manifest_bytes = (output_dir / "manifest.json").read_bytes()
+            metrics = json.loads(metrics_bytes)
+            manifest = json.loads(manifest_bytes)
             dataset_hash = sha256_file(data_path)
+            second_metrics_bytes = (second_output_dir / "metrics.json").read_bytes()
+            second_manifest_bytes = (
+                second_output_dir / "manifest.json"
+            ).read_bytes()
 
         self.assertEqual(
             output_names,
-            {"metrics.json", "manifest.json", "overview.png", "rollout_errors.png"},
+            {
+                "metrics.json",
+                "manifest.json",
+                "overview.png",
+                "rollout_errors.png",
+                "rollout_loss_components.png",
+            },
         )
-        self.assertEqual(metrics["schema_version"], 1)
+        self.assertEqual(metrics["schema_version"], 2)
         self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(metrics_bytes, second_metrics_bytes)
+        self.assertEqual(manifest_bytes, second_manifest_bytes)
+        self.assertEqual(
+            summary["rollout_loss_components_plot"],
+            str(output_dir / "rollout_loss_components.png"),
+        )
+        self.assertEqual(
+            second_summary["rollout_loss_components_plot"],
+            str(second_output_dir / "rollout_loss_components.png"),
+        )
         self.assertEqual(manifest["dataset"]["sha256"], dataset_hash)
         self.assertEqual(manifest["checkpoint"]["hidden_size"], 4)
         self.assertEqual(manifest["checkpoint"]["test_episode_ids"], [2])

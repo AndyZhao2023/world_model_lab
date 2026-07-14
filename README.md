@@ -309,10 +309,11 @@ MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
 
 | 文件 | 内容 |
 |---|---|
-| `metrics.json` | 单步误差、状态/动作分箱、固定窗口 rollout 指标 |
+| `metrics.json` | schema v2：单步误差、状态/动作分箱、稀疏 horizon 汇总，以及每一步的物理误差和归一化 MSE 分量 |
 | `manifest.json` | 数据集和 checkpoint 的 SHA-256、测试 episode 和诊断参数 |
 | `overview.png` | 训练/测试 XY 覆盖、XY 误差、速度和动作误差切片 |
-| `rollout_errors.png` | Teacher Forcing 与 Free Rollout 的 horizon 曲线 |
+| `rollout_errors.png` | Teacher Forcing 与 Free Rollout 从第 1 步到最大 horizon 的稠密物理误差曲线 |
+| `rollout_loss_components.png` | `x`、`y`、heading、velocity 四个归一化 MSE 分量的 2×2 对比图 |
 
 误差指标只使用 checkpoint 记录的测试 episode。覆盖图同时显示训练集和测试集，
 用于识别分布差异，但训练 transition 不会参与误差计算。
@@ -323,6 +324,12 @@ MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
 
 - **Teacher Forcing**：每一步都输入数据集中记录的真实状态，反映局部单步误差。
 - **Free Rollout**：只给初始真实状态，后续递归输入模型预测，反映误差累积。
+
+`--horizons` 仍定义稀疏 benchmark 点，其中最大值同时决定稠密曲线长度。例如
+`--horizons 1 5 10 20 50` 会保留五个带分布统计的 horizon，同时在
+`metrics.json` 和两张 rollout 图中记录第 1 到第 50 步。归一化分量使用 checkpoint
+保存的 target-delta 标准差，与多步训练目标处于同一尺度；`total` 是四个分量的算术
+平均值。所有曲线先在同一 episode 内平均窗口，再对 episode 等权平均。
 
 当两条曲线随 horizon 分离时，差值主要来自 compounding error。样本数小于
 `min_bin_count` 的空间或特征区间会在误差图中被遮罩；其样本数量仍保留在 JSON
