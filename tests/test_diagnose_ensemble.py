@@ -121,6 +121,13 @@ def save_diagnostic_checkpoints(root: Path) -> tuple[Path, Path]:
     return seed_0_path, seed_1_path
 
 
+def replace_dataset_array(path: Path, name: str, values: np.ndarray) -> None:
+    with np.load(path, allow_pickle=False) as loaded:
+        arrays = {field: loaded[field] for field in loaded.files}
+    arrays[name] = values
+    np.savez_compressed(path, **arrays)
+
+
 class DiagnoseEnsembleTest(unittest.TestCase):
     def test_pyproject_registers_ensemble_diagnostic_command(self):
         pyproject = (Path(__file__).parents[1] / "pyproject.toml").read_text(
@@ -162,15 +169,7 @@ class DiagnoseEnsembleTest(unittest.TestCase):
         self.assertTrue(callable(entrypoint))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            empty_dataset = root / "empty.npz"
-            np.savez_compressed(
-                empty_dataset,
-                states=np.empty((0, 4)),
-                actions=np.empty((0, 2)),
-                next_states=np.empty((0, 4)),
-                episode_ids=np.empty(0, dtype=np.int64),
-                step_ids=np.empty(0, dtype=np.int64),
-            )
+            valid_dataset = save_diagnostic_dataset(root / "valid.npz")
             cases = (
                 (
                     [
@@ -185,7 +184,7 @@ class DiagnoseEnsembleTest(unittest.TestCase):
                 (
                     [
                         "--data",
-                        str(empty_dataset),
+                        str(valid_dataset),
                         "--checkpoints",
                         str(root / "missing-0.pt"),
                         str(root / "missing-1.pt"),
@@ -344,6 +343,138 @@ class DiagnoseEnsembleTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(ValueError, "missing arrays: step_ids"):
+                run_ensemble_diagnostics(
+                    data_path=data_path,
+                    checkpoint_paths=(root / "missing-0.pt", root / "missing-1.pt"),
+                    output_dir=root / "diagnostics",
+                    horizons=(1,),
+                )
+
+    def test_run_rejects_malformed_episode_id_shape_as_value_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = save_diagnostic_dataset(root / "transitions.npz")
+            with np.load(data_path, allow_pickle=False) as loaded:
+                episode_ids = loaded["episode_ids"].copy()
+            replace_dataset_array(
+                data_path,
+                "episode_ids",
+                episode_ids[:, None],
+            )
+            seed_0_path, seed_1_path = save_diagnostic_checkpoints(root)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                r"episode_ids must have shape \[N\]",
+            ):
+                run_ensemble_diagnostics(
+                    data_path=data_path,
+                    checkpoint_paths=(seed_0_path, seed_1_path),
+                    output_dir=root / "diagnostics",
+                    horizons=(1, 2),
+                )
+
+    def test_run_validates_dataset_arrays_before_loading_checkpoints(self):
+        invalid_arrays = (
+            ("states", lambda values: values[:, :3], r"states.*\[N, 4\]"),
+            ("actions", lambda values: values[:, :1], r"actions.*\[N, 2\]"),
+            (
+                "next_states",
+                lambda values: values[:, :3],
+                r"next_states.*\[N, 4\]",
+            ),
+            (
+                "states",
+                lambda values: np.where(
+                    np.arange(values.size).reshape(values.shape) == 0,
+                    np.nan,
+                    values,
+                ),
+                r"states.*finite",
+            ),
+            (
+                "actions",
+                lambda values: np.where(
+                    np.arange(values.size).reshape(values.shape) == 0,
+                    np.inf,
+                    values,
+                ),
+                r"actions.*finite",
+            ),
+            (
+                "next_states",
+                lambda values: np.where(
+                    np.arange(values.size).reshape(values.shape) == 0,
+                    np.nan,
+                    values,
+                ),
+                r"next_states.*finite",
+            ),
+            (
+                "episode_ids",
+                lambda values: values.astype(np.float64),
+                r"episode_ids.*integer dtype",
+            ),
+            (
+                "step_ids",
+                lambda values: values.astype(np.float64),
+                r"step_ids.*integer dtype",
+            ),
+            (
+                "episode_ids",
+                lambda values: np.where(values == values[0], np.nan, values),
+                r"episode_ids.*finite",
+            ),
+            (
+                "step_ids",
+                lambda values: np.where(values == values[0], np.inf, values),
+                r"step_ids.*finite",
+            ),
+            (
+                "episode_ids",
+                lambda values: np.where(values == values[0], -1, values),
+                r"episode_ids.*non-negative",
+            ),
+            (
+                "step_ids",
+                lambda values: np.where(values == values[0], -1, values),
+                r"step_ids.*non-negative",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for index, (name, mutate, message) in enumerate(invalid_arrays):
+                with self.subTest(name=name, message=message):
+                    data_path = save_diagnostic_dataset(root / f"data-{index}.npz")
+                    with np.load(data_path, allow_pickle=False) as loaded:
+                        values = loaded[name].copy()
+                    replace_dataset_array(data_path, name, mutate(values))
+
+                    with self.assertRaisesRegex(ValueError, message):
+                        run_ensemble_diagnostics(
+                            data_path=data_path,
+                            checkpoint_paths=(
+                                root / "missing-0.pt",
+                                root / "missing-1.pt",
+                            ),
+                            output_dir=root / "diagnostics",
+                            horizons=(1,),
+                        )
+
+    def test_run_rejects_empty_dataset_before_loading_checkpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = root / "empty.npz"
+            np.savez_compressed(
+                data_path,
+                states=np.empty((0, 4)),
+                actions=np.empty((0, 2)),
+                next_states=np.empty((0, 4)),
+                episode_ids=np.empty(0, dtype=np.int64),
+                step_ids=np.empty(0, dtype=np.int64),
+            )
+
+            with self.assertRaisesRegex(ValueError, "dataset arrays must not be empty"):
                 run_ensemble_diagnostics(
                     data_path=data_path,
                     checkpoint_paths=(root / "missing-0.pt", root / "missing-1.pt"),

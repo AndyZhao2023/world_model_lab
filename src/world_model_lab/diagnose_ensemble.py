@@ -79,6 +79,49 @@ def _validate_positive_integer(name: str, value: Any) -> int:
     return int(value)
 
 
+def _validate_dataset_arrays(
+    arrays: Mapping[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    validated = {name: np.asarray(values) for name, values in arrays.items()}
+    states = validated["states"]
+    actions = validated["actions"]
+    next_states = validated["next_states"]
+    episode_ids = validated["episode_ids"]
+    step_ids = validated["step_ids"]
+
+    if states.ndim != 2 or states.shape[1:] != (4,):
+        raise ValueError("states must have shape [N, 4]")
+    count = states.shape[0]
+    if count == 0:
+        raise ValueError("dataset arrays must not be empty")
+    if actions.shape != (count, 2):
+        raise ValueError("actions must have shape [N, 2]")
+    if next_states.shape != (count, 4):
+        raise ValueError("next_states must have shape [N, 4]")
+    if episode_ids.shape != (count,):
+        raise ValueError("episode_ids must have shape [N]")
+    if step_ids.shape != (count,):
+        raise ValueError("step_ids must have shape [N]")
+
+    for name, values in validated.items():
+        try:
+            finite = bool(np.all(np.isfinite(values)))
+        except TypeError:
+            finite = False
+        if not finite:
+            raise ValueError(f"{name} must contain only finite values")
+
+    for name, values in (("episode_ids", episode_ids), ("step_ids", step_ids)):
+        if np.issubdtype(values.dtype, np.bool_) or not np.issubdtype(
+            values.dtype,
+            np.integer,
+        ):
+            raise ValueError(f"{name} must use a non-boolean integer dtype")
+        if np.any(values < 0):
+            raise ValueError(f"{name} must contain only non-negative values")
+    return validated
+
+
 def _rollout_horizon_snapshots(
     rollout: Mapping[str, Any],
     horizons: tuple[int, ...],
@@ -193,6 +236,7 @@ def run_ensemble_diagnostics(
                 f"dataset is missing arrays: {', '.join(sorted(missing))}"
             )
         arrays = {name: loaded[name] for name in required_arrays}
+    arrays = _validate_dataset_arrays(arrays)
 
     ensemble = load_ensemble(tuple(checkpoint_paths))
     test_ids = np.asarray(ensemble.members[0].split_episode_ids["test"])
