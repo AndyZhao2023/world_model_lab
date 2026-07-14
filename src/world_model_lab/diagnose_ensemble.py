@@ -30,7 +30,9 @@ def pearson_correlation(left: np.ndarray, right: np.ndarray) -> float | None:
         raise ValueError("correlation values must be finite")
     if np.ptp(x) == 0.0 or np.ptp(y) == 0.0:
         return None
-    return float(np.corrcoef(x, y)[0, 1])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        coefficient = float(np.corrcoef(x, y)[0, 1])
+    return coefficient if np.isfinite(coefficient) else None
 
 
 def build_calibration_bins(

@@ -17,6 +17,13 @@ class DiagnoseEnsembleTest(unittest.TestCase):
             pearson_correlation(np.ones(3), np.asarray([1.0, 2.0, 3.0]))
         )
 
+    def test_pearson_returns_none_when_finite_subnormals_produce_nan(self):
+        subnormal = np.nextafter(np.float64(0.0), np.float64(1.0))
+        values = np.asarray([0.0, subnormal])
+
+        self.assertTrue(np.all(np.isfinite(values)))
+        self.assertIsNone(pearson_correlation(values, values))
+
     def test_pearson_rejects_invalid_shape_or_non_finite_values(self):
         for left, right, message in (
             (np.ones((1, 3)), np.ones((1, 3)), "matching non-empty vectors"),
