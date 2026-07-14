@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
+import csv
+import json
 from pathlib import Path
+import shutil
+import tempfile
 from typing import Any, Iterable, Mapping
 
 import matplotlib.pyplot as plt
@@ -12,11 +17,14 @@ from .diagnostics import (
     RolloutWindow,
     compute_normalized_squared_errors,
     compute_state_errors,
+    select_rollout_windows,
     summarize_values,
 )
+from .diagnose_model import sha256_file
 from .ensemble import (
     DISAGREEMENT_NAMES,
     WorldModelEnsemble,
+    load_ensemble,
     predict_ensemble_next_states,
     rollout_ensemble,
 )
@@ -37,6 +45,270 @@ METRIC_LABELS = {
         "normalized RMS disagreement",
     ),
 }
+
+
+def _write_json(path: Path, value: dict[str, Any]) -> Path:
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _is_integer(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, np.integer))
+
+
+def _validate_horizons(horizons: Iterable[int]) -> tuple[int, ...]:
+    values = tuple(horizons)
+    if not values:
+        raise ValueError("horizons must be non-empty")
+    if any(not _is_integer(value) or int(value) <= 0 for value in values):
+        raise ValueError("horizons must contain positive integers")
+    normalized = tuple(int(value) for value in values)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("horizons must be unique")
+    if any(left >= right for left, right in zip(normalized, normalized[1:])):
+        raise ValueError("horizons must be strictly increasing")
+    return normalized
+
+
+def _validate_positive_integer(name: str, value: Any) -> int:
+    if not _is_integer(value) or int(value) <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return int(value)
+
+
+def _rollout_horizon_snapshots(
+    rollout: Mapping[str, Any],
+    horizons: tuple[int, ...],
+) -> dict[str, Any]:
+    metric_records = _required_mapping(rollout, "metrics", parent="rollout")
+    snapshots = {}
+    curve_fields = (
+        "ensemble_error_mean",
+        "mean_member_error_mean",
+        "min_member_error_mean",
+        "max_member_error_mean",
+        "disagreement_mean",
+        "pearson_correlation",
+    )
+    for horizon in horizons:
+        index = horizon - 1
+        snapshots[str(horizon)] = {
+            "episodes": int(rollout["episodes"]),
+            "windows": int(rollout["windows"]),
+            "metrics": {
+                name: {
+                    field: _required_mapping(
+                        metric_records,
+                        name,
+                        parent="rollout.metrics",
+                    )[field][index]
+                    for field in curve_fields
+                }
+                for name in METRIC_NAMES
+            },
+        }
+    return snapshots
+
+
+def write_calibration_csv(
+    metrics: Mapping[str, Any],
+    output_path: Path | str,
+) -> Path:
+    """Write one-step calibration bins in a stable tidy CSV layout."""
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = (
+        "metric",
+        "bin_index",
+        "count",
+        "disagreement_mean",
+        "error_mean",
+    )
+    metric_records = _required_mapping(metrics, "metrics", parent="one-step")
+    with output.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for name in METRIC_NAMES:
+            record = _required_mapping(metric_records, name, parent="one-step.metrics")
+            if "calibration_bins" not in record:
+                raise ValueError(f"{name} is missing calibration_bins")
+            bins = record["calibration_bins"]
+            if not isinstance(bins, (list, tuple)) or not bins:
+                raise ValueError(f"{name}.calibration_bins must be a non-empty list")
+            for index, item in enumerate(bins):
+                if not isinstance(item, Mapping):
+                    raise ValueError(
+                        f"{name}.calibration_bins[{index}] must be a mapping"
+                    )
+                writer.writerow(
+                    {
+                        "metric": name,
+                        "bin_index": index,
+                        "count": item["count"],
+                        "disagreement_mean": item["disagreement_mean"],
+                        "error_mean": item["error_mean"],
+                    }
+                )
+    return output
+
+
+def run_ensemble_diagnostics(
+    *,
+    data_path: Path | str,
+    checkpoint_paths: Iterable[Path | str],
+    output_dir: Path | str,
+    horizons: Iterable[int] = (1, 5, 10, 20, 50),
+    windows_per_episode: int = 8,
+    calibration_bins: int = 10,
+) -> dict[str, Any]:
+    """Evaluate compatible checkpoints and write one atomic artifact bundle."""
+
+    horizon_values = _validate_horizons(horizons)
+    window_count = _validate_positive_integer(
+        "windows_per_episode",
+        windows_per_episode,
+    )
+    bin_count = _validate_positive_integer("calibration_bins", calibration_bins)
+    data = Path(data_path)
+    output = Path(output_dir).resolve()
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise ValueError("output directory must be absent or empty")
+    if not data.is_file():
+        raise FileNotFoundError(f"dataset is not a regular file: {data}")
+    required_arrays = {
+        "states",
+        "actions",
+        "next_states",
+        "episode_ids",
+        "step_ids",
+    }
+    with np.load(data, allow_pickle=False) as loaded:
+        missing = required_arrays - set(loaded.files)
+        if missing:
+            raise ValueError(
+                f"dataset is missing arrays: {', '.join(sorted(missing))}"
+            )
+        arrays = {name: loaded[name] for name in required_arrays}
+
+    ensemble = load_ensemble(tuple(checkpoint_paths))
+    test_ids = np.asarray(ensemble.members[0].split_episode_ids["test"])
+    available_ids = np.unique(np.asarray(arrays["episode_ids"]))
+    missing_test_ids = [
+        int(value)
+        for value in test_ids.tolist()
+        if not np.any(available_ids == value)
+    ]
+    if missing_test_ids:
+        raise ValueError(
+            "checkpoint test episode IDs are missing from the dataset: "
+            + ", ".join(map(str, missing_test_ids))
+        )
+
+    test_mask = np.isin(arrays["episode_ids"], test_ids)
+    one_step = evaluate_one_step_calibration(
+        ensemble,
+        states=arrays["states"][test_mask],
+        actions=arrays["actions"][test_mask],
+        true_next_states=arrays["next_states"][test_mask],
+        calibration_bins=bin_count,
+    )
+    selection = select_rollout_windows(
+        states=arrays["states"],
+        actions=arrays["actions"],
+        next_states=arrays["next_states"],
+        episode_ids=arrays["episode_ids"],
+        step_ids=arrays["step_ids"],
+        selected_episode_ids=test_ids,
+        max_horizon=horizon_values[-1],
+        windows_per_episode=window_count,
+    )
+    rollout = evaluate_ensemble_rollouts(
+        ensemble,
+        windows=selection.windows,
+        eligible_episode_ids=selection.eligible_episode_ids,
+    )
+    rollout["horizons"] = _rollout_horizon_snapshots(rollout, horizon_values)
+    metrics = {
+        "schema_version": 1,
+        "one_step": one_step,
+        "rollout": rollout,
+    }
+
+    reference_config = ensemble.members[0].training_config
+    checkpoints = [
+        {
+            "seed": int(seed),
+            "path": str(path),
+            "sha256": sha256_file(path),
+        }
+        for seed, path in zip(ensemble.seeds, ensemble.checkpoint_paths)
+    ]
+    manifest = {
+        "schema_version": 1,
+        "dataset": {
+            "path": str(data.resolve()),
+            "sha256": sha256_file(data),
+        },
+        "checkpoints": checkpoints,
+        "member_seeds": [int(seed) for seed in ensemble.seeds],
+        "training_config": {
+            "split_seed": int(reference_config["split_seed"]),
+            "rollout_horizon": int(reference_config["rollout_horizon"]),
+            "rollout_loss_weight": float(
+                reference_config["rollout_loss_weight"]
+            ),
+            "hidden_size": int(reference_config["hidden_size"]),
+        },
+        "test_episode_ids": sorted(int(value) for value in test_ids.tolist()),
+        "diagnostics": {
+            "horizons": list(horizon_values),
+            "windows_per_episode": window_count,
+            "calibration_bins": bin_count,
+        },
+    }
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{output.name}.tmp-",
+            dir=output.parent,
+        )
+    )
+    try:
+        metrics_path = staging / "metrics.json"
+        calibration_csv_path = staging / "one_step_calibration.csv"
+        calibration_plot_path = staging / "one_step_calibration.png"
+        rollout_plot_path = staging / "rollout_uncertainty.png"
+        manifest_path = staging / "manifest.json"
+
+        _write_json(metrics_path, metrics)
+        write_calibration_csv(one_step, calibration_csv_path)
+        plot_one_step_calibration(one_step, calibration_plot_path)
+        plot_rollout_uncertainty(rollout, rollout_plot_path)
+        _write_json(manifest_path, manifest)
+
+        if output.exists():
+            output.rmdir()
+        staging.rename(output)
+    except BaseException:
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
+
+    return {
+        "output_dir": str(output),
+        "manifest": str(output / "manifest.json"),
+        "metrics": str(output / "metrics.json"),
+        "calibration_csv": str(output / "one_step_calibration.csv"),
+        "calibration_plot": str(output / "one_step_calibration.png"),
+        "rollout_plot": str(output / "rollout_uncertainty.png"),
+        "member_seeds": [int(seed) for seed in ensemble.seeds],
+        "horizons": list(horizon_values),
+    }
 
 
 def pearson_correlation(left: np.ndarray, right: np.ndarray) -> float | None:
@@ -483,3 +755,39 @@ def plot_rollout_uncertainty(
     finally:
         plt.close(figure)
     return output
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data", type=Path, default=Path("data/transitions.npz"))
+    parser.add_argument("--checkpoints", type=Path, nargs="+", required=True)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("artifacts/diagnostics/h10-ensemble"),
+    )
+    parser.add_argument(
+        "--horizons",
+        type=int,
+        nargs="+",
+        default=[1, 5, 10, 20, 50],
+    )
+    parser.add_argument("--windows-per-episode", type=int, default=8)
+    parser.add_argument("--calibration-bins", type=int, default=10)
+    args = parser.parse_args()
+    try:
+        result = run_ensemble_diagnostics(
+            data_path=args.data,
+            checkpoint_paths=args.checkpoints,
+            output_dir=args.output_dir,
+            horizons=args.horizons,
+            windows_per_episode=args.windows_per_episode,
+            calibration_bins=args.calibration_bins,
+        )
+    except (FileNotFoundError, ValueError) as error:
+        parser.error(str(error))
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

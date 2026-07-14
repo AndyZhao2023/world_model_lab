@@ -1,12 +1,18 @@
+import csv
+import io
+import json
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-from tests.test_ensemble import make_member
+from tests.test_ensemble import make_member, save_member_checkpoint
+from world_model_lab import diagnose_ensemble
 from world_model_lab.diagnose_ensemble import (
     build_calibration_bins,
     evaluate_one_step_calibration,
@@ -14,7 +20,9 @@ from world_model_lab.diagnose_ensemble import (
     pearson_correlation,
     plot_one_step_calibration,
     plot_rollout_uncertainty,
+    run_ensemble_diagnostics,
 )
+from world_model_lab.diagnose_model import sha256_file
 from world_model_lab.diagnostics import RolloutWindow
 from world_model_lab.ensemble import build_ensemble
 
@@ -66,7 +74,366 @@ def make_rollout_metrics():
     }
 
 
+def save_diagnostic_dataset(
+    path: Path,
+    *,
+    episode_steps: dict[int, int] | None = None,
+    missing_array: str | None = None,
+) -> Path:
+    steps_by_episode = episode_steps or {0: 3, 1: 3, 2: 3, 3: 3}
+    states = []
+    actions = []
+    next_states = []
+    episode_ids = []
+    step_ids = []
+    for episode_id, step_count in steps_by_episode.items():
+        state = np.asarray([10.0 * episode_id, 0.0, 0.0, 0.0])
+        for step in range(step_count):
+            next_state = state + np.asarray([1.0, 0.0, 0.0, 0.0])
+            states.append(state)
+            actions.append(np.zeros(2))
+            next_states.append(next_state)
+            episode_ids.append(episode_id)
+            step_ids.append(step)
+            state = next_state
+    arrays = {
+        "states": np.asarray(states),
+        "actions": np.asarray(actions),
+        "next_states": np.asarray(next_states),
+        "episode_ids": np.asarray(episode_ids),
+        "step_ids": np.asarray(step_ids),
+    }
+    if missing_array is not None:
+        del arrays[missing_array]
+    np.savez_compressed(path, **arrays)
+    return path
+
+
+def save_diagnostic_checkpoints(root: Path) -> tuple[Path, Path]:
+    seed_0_path = save_member_checkpoint(
+        root / "seed-0.pt",
+        make_member(0, np.asarray([0.75, 0.0, 0.0, 0.0])),
+    )
+    seed_1_path = save_member_checkpoint(
+        root / "seed-1.pt",
+        make_member(1, np.asarray([1.25, 0.0, 0.0, 0.0])),
+    )
+    return seed_0_path, seed_1_path
+
+
 class DiagnoseEnsembleTest(unittest.TestCase):
+    def test_pyproject_registers_ensemble_diagnostic_command(self):
+        pyproject = (Path(__file__).parents[1] / "pyproject.toml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            'world-model-diagnose-ensemble = "world_model_lab.diagnose_ensemble:main"',
+            pyproject,
+        )
+
+    def test_cli_help_lists_all_protocol_parameters(self):
+        entrypoint = getattr(diagnose_ensemble, "main", None)
+        self.assertTrue(callable(entrypoint))
+        standard_output = io.StringIO()
+        with patch.object(
+            sys,
+            "argv",
+            ["world-model-diagnose-ensemble", "--help"],
+        ):
+            with redirect_stdout(standard_output):
+                with self.assertRaises(SystemExit) as context:
+                    entrypoint()
+
+        self.assertEqual(context.exception.code, 0)
+        help_text = standard_output.getvalue()
+        for flag in (
+            "--data",
+            "--checkpoints",
+            "--output-dir",
+            "--horizons",
+            "--windows-per-episode",
+            "--calibration-bins",
+        ):
+            self.assertIn(flag, help_text)
+
+    def test_cli_reports_missing_data_and_checkpoint_as_argument_errors(self):
+        entrypoint = getattr(diagnose_ensemble, "main", None)
+        self.assertTrue(callable(entrypoint))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            empty_dataset = root / "empty.npz"
+            np.savez_compressed(
+                empty_dataset,
+                states=np.empty((0, 4)),
+                actions=np.empty((0, 2)),
+                next_states=np.empty((0, 4)),
+                episode_ids=np.empty(0, dtype=np.int64),
+                step_ids=np.empty(0, dtype=np.int64),
+            )
+            cases = (
+                (
+                    [
+                        "--data",
+                        str(root / "missing.npz"),
+                        "--checkpoints",
+                        str(root / "missing-0.pt"),
+                        str(root / "missing-1.pt"),
+                    ],
+                    "dataset is not a regular file",
+                ),
+                (
+                    [
+                        "--data",
+                        str(empty_dataset),
+                        "--checkpoints",
+                        str(root / "missing-0.pt"),
+                        str(root / "missing-1.pt"),
+                    ],
+                    "checkpoint is not a regular file",
+                ),
+            )
+            for arguments, message in cases:
+                with self.subTest(message=message):
+                    standard_error = io.StringIO()
+                    with patch.object(
+                        sys,
+                        "argv",
+                        ["world-model-diagnose-ensemble", *arguments],
+                    ):
+                        with redirect_stderr(standard_error):
+                            with self.assertRaises(SystemExit) as context:
+                                entrypoint()
+
+                    self.assertEqual(context.exception.code, 2)
+                    self.assertIn(message, standard_error.getvalue())
+
+    def test_cli_prints_returned_contract_as_sorted_indented_json(self):
+        entrypoint = getattr(diagnose_ensemble, "main", None)
+        self.assertTrue(callable(entrypoint))
+        standard_output = io.StringIO()
+        with patch.object(
+            diagnose_ensemble,
+            "run_ensemble_diagnostics",
+            return_value={"z": 1, "a": 2},
+            create=True,
+        ):
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "world-model-diagnose-ensemble",
+                    "--checkpoints",
+                    "seed-0.pt",
+                    "seed-1.pt",
+                ],
+            ):
+                with redirect_stdout(standard_output):
+                    entrypoint()
+
+        self.assertEqual(
+            standard_output.getvalue(),
+            json.dumps({"z": 1, "a": 2}, indent=2, sort_keys=True) + "\n",
+        )
+
+    def test_run_writes_complete_atomic_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = save_diagnostic_dataset(root / "transitions.npz")
+            seed_0_path, seed_1_path = save_diagnostic_checkpoints(root)
+            output_dir = root / "diagnostics"
+            output_dir.mkdir()
+
+            result = run_ensemble_diagnostics(
+                data_path=data_path,
+                checkpoint_paths=(seed_1_path, seed_0_path),
+                output_dir=output_dir,
+                horizons=(1, 2),
+                windows_per_episode=2,
+                calibration_bins=2,
+            )
+
+            expected_names = {
+                "manifest.json",
+                "metrics.json",
+                "one_step_calibration.csv",
+                "one_step_calibration.png",
+                "rollout_uncertainty.png",
+            }
+            self.assertEqual(
+                {path.name for path in output_dir.iterdir()},
+                expected_names,
+            )
+            for path in output_dir.iterdir():
+                self.assertGreater(path.stat().st_size, 0)
+
+            manifest = json.loads(
+                (output_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            metrics = json.loads(
+                (output_dir / "metrics.json").read_text(encoding="utf-8")
+            )
+            json.dumps(manifest, allow_nan=False)
+            json.dumps(metrics, allow_nan=False)
+            self.assertEqual(manifest["member_seeds"], [0, 1])
+            self.assertEqual(
+                [item["seed"] for item in manifest["checkpoints"]],
+                [0, 1],
+            )
+            self.assertEqual(
+                [item["sha256"] for item in manifest["checkpoints"]],
+                [sha256_file(seed_0_path), sha256_file(seed_1_path)],
+            )
+            self.assertEqual(manifest["dataset"]["sha256"], sha256_file(data_path))
+            self.assertEqual(metrics["one_step"]["samples"], 3)
+            self.assertEqual(metrics["rollout"]["steps"], [1, 2])
+            self.assertEqual(
+                set(metrics["rollout"]["horizons"]),
+                {"1", "2"},
+            )
+
+            with (output_dir / "one_step_calibration.csv").open(
+                encoding="utf-8",
+                newline="",
+            ) as handle:
+                reader = csv.DictReader(handle)
+                rows = list(reader)
+            self.assertEqual(
+                reader.fieldnames,
+                [
+                    "metric",
+                    "bin_index",
+                    "count",
+                    "disagreement_mean",
+                    "error_mean",
+                ],
+            )
+            self.assertEqual(len(rows), 8)
+
+            expected_paths = {
+                "manifest": "manifest.json",
+                "metrics": "metrics.json",
+                "calibration_csv": "one_step_calibration.csv",
+                "calibration_plot": "one_step_calibration.png",
+                "rollout_plot": "rollout_uncertainty.png",
+            }
+            self.assertEqual(Path(result["output_dir"]), output_dir.resolve())
+            for key, filename in expected_paths.items():
+                self.assertEqual(Path(result[key]), output_dir.resolve() / filename)
+
+    def test_run_rejects_nonempty_output_before_reading_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_dir = root / "diagnostics"
+            output_dir.mkdir()
+            (output_dir / "existing.txt").write_text("old", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "absent or empty"):
+                run_ensemble_diagnostics(
+                    data_path=root / "missing.npz",
+                    checkpoint_paths=(),
+                    output_dir=output_dir,
+                )
+
+    def test_run_rejects_missing_dataset_arrays_before_loading_checkpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = save_diagnostic_dataset(
+                root / "transitions.npz",
+                missing_array="step_ids",
+            )
+
+            with self.assertRaisesRegex(ValueError, "missing arrays: step_ids"):
+                run_ensemble_diagnostics(
+                    data_path=data_path,
+                    checkpoint_paths=(root / "missing-0.pt", root / "missing-1.pt"),
+                    output_dir=root / "diagnostics",
+                    horizons=(1,),
+                )
+
+    def test_run_rejects_invalid_horizons_before_reading_inputs(self):
+        invalid_horizons = (
+            ((), "non-empty"),
+            ((0, 1), "positive integers"),
+            ((1, 1), "unique"),
+            ((2, 1), "strictly increasing"),
+            ((1, 2.0), "positive integers"),
+            ((True, 2), "positive integers"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for horizons, message in invalid_horizons:
+                with self.subTest(horizons=horizons):
+                    with self.assertRaisesRegex(ValueError, message):
+                        run_ensemble_diagnostics(
+                            data_path=root / "missing.npz",
+                            checkpoint_paths=(),
+                            output_dir=root / "diagnostics",
+                            horizons=horizons,
+                        )
+
+    def test_run_rejects_dataset_missing_checkpoint_test_episode_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = save_diagnostic_dataset(
+                root / "transitions.npz",
+                episode_steps={0: 2, 1: 2, 2: 2},
+            )
+            seed_0_path, seed_1_path = save_diagnostic_checkpoints(root)
+
+            with self.assertRaisesRegex(ValueError, "test episode IDs.*missing"):
+                run_ensemble_diagnostics(
+                    data_path=data_path,
+                    checkpoint_paths=(seed_0_path, seed_1_path),
+                    output_dir=root / "diagnostics",
+                    horizons=(1,),
+                )
+
+    def test_run_rejects_horizon_longer_than_every_test_episode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = save_diagnostic_dataset(
+                root / "transitions.npz",
+                episode_steps={0: 2, 1: 2, 2: 2, 3: 1},
+            )
+            seed_0_path, seed_1_path = save_diagnostic_checkpoints(root)
+
+            with self.assertRaisesRegex(ValueError, "not long enough"):
+                run_ensemble_diagnostics(
+                    data_path=data_path,
+                    checkpoint_paths=(seed_0_path, seed_1_path),
+                    output_dir=root / "diagnostics",
+                    horizons=(1, 2),
+                )
+
+    def test_run_removes_staging_bundle_when_plotting_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = save_diagnostic_dataset(root / "transitions.npz")
+            seed_0_path, seed_1_path = save_diagnostic_checkpoints(root)
+            output_dir = root / "diagnostics"
+
+            with patch.object(
+                diagnose_ensemble,
+                "plot_rollout_uncertainty",
+                side_effect=RuntimeError("plot failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "plot failed"):
+                    run_ensemble_diagnostics(
+                        data_path=data_path,
+                        checkpoint_paths=(seed_0_path, seed_1_path),
+                        output_dir=output_dir,
+                        horizons=(1, 2),
+                        windows_per_episode=2,
+                        calibration_bins=2,
+                    )
+
+            self.assertFalse(output_dir.exists())
+            self.assertEqual(
+                list(root.glob(f".{output_dir.name}.tmp-*")),
+                [],
+            )
+
     def test_pearson_returns_none_for_constant_values(self):
         self.assertIsNone(
             pearson_correlation(np.ones(3), np.asarray([1.0, 2.0, 3.0]))
