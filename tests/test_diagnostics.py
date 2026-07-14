@@ -7,10 +7,10 @@ import torch
 
 from world_model_lab.dataset import Normalizer
 from world_model_lab.diagnostics import (
-    _compute_normalized_squared_errors,
     build_diagnostic_metrics,
     build_feature_slice,
     build_xy_grid,
+    compute_normalized_squared_errors,
     compute_state_errors,
     linear_bin_edges,
     select_rollout_windows,
@@ -104,6 +104,20 @@ def arrays_from_episodes(
 
 
 class DiagnosticsTest(unittest.TestCase):
+    def test_public_normalized_squared_errors_matches_component_contract(self):
+        result = compute_normalized_squared_errors(
+            np.asarray([[2.0, 4.0, 0.2, 3.0]]),
+            np.asarray([[1.0, 2.0, 0.1, 1.0]]),
+            np.asarray([1.0, 2.0, 0.1, 2.0]),
+        )
+        np.testing.assert_allclose(
+            [
+                result[name][0]
+                for name in ("x", "y", "heading", "velocity", "total")
+            ],
+            [1.0, 1.0, 1.0, 1.0, 1.0],
+        )
+
     def test_state_errors_use_euclidean_position_and_wrapped_heading(self):
         true = np.asarray([[0.0, 0.0, math.radians(-179.0), 1.0]])
         predicted = np.asarray([[3.0, 4.0, math.radians(179.0), 1.25]])
@@ -123,7 +137,7 @@ class DiagnosticsTest(unittest.TestCase):
         predicted = np.asarray([[3.0, 4.0, math.radians(179.0), 1.25]])
         target_std = np.asarray([2.0, 4.0, math.radians(1.0), 0.5])
 
-        errors = _compute_normalized_squared_errors(
+        errors = compute_normalized_squared_errors(
             predicted,
             true,
             target_std,
@@ -149,7 +163,7 @@ class DiagnosticsTest(unittest.TestCase):
                     ValueError,
                     "target_std must have shape.*finite positive",
                 ):
-                    _compute_normalized_squared_errors(
+                    compute_normalized_squared_errors(
                         states,
                         states,
                         target_std,
