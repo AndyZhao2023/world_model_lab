@@ -475,6 +475,7 @@ def run_training(
     batch_size: int = 256,
     learning_rate: float = 1e-3,
     seed: int = 0,
+    split_seed: int | None = None,
     rollout_horizon: int = 1,
     rollout_loss_weight: float = 1.0,
 ) -> dict[str, Any]:
@@ -504,7 +505,8 @@ def run_training(
     inputs, targets = build_model_arrays(states, actions, next_states)
     if episode_ids.ndim != 1 or episode_ids.shape[0] != inputs.shape[0]:
         raise ValueError("episode_ids must have shape [N]")
-    splits = split_episode_ids(episode_ids, seed=seed)
+    effective_split_seed = seed if split_seed is None else split_seed
+    splits = split_episode_ids(episode_ids, seed=effective_split_seed)
     masks = {name: np.isin(episode_ids, ids) for name, ids in splits.items()}
     train_sequences = validation_sequences = None
     if rollout_horizon > 1:
@@ -554,6 +556,7 @@ def run_training(
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "seed": seed,
+        "split_seed": effective_split_seed,
         "rollout_horizon": rollout_horizon,
         "rollout_loss_weight": effective_rollout_weight,
     }
@@ -573,6 +576,7 @@ def run_training(
     best_index = result.best_epoch - 1
     return {
         "transitions": int(inputs.shape[0]),
+        "split_seed": effective_split_seed,
         "rollout_horizon": rollout_horizon,
         "rollout_loss_weight": effective_rollout_weight,
         "train_sequence_windows": (
@@ -618,6 +622,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--split-seed", type=int)
     parser.add_argument("--rollout-horizon", type=int, default=1)
     parser.add_argument("--rollout-loss-weight", type=float, default=1.0)
     args = parser.parse_args()
@@ -631,6 +636,7 @@ def main() -> None:
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
             seed=args.seed,
+            split_seed=args.split_seed,
             rollout_horizon=args.rollout_horizon,
             rollout_loss_weight=args.rollout_loss_weight,
         )
