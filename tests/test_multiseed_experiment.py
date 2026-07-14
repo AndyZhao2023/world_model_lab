@@ -1,3 +1,4 @@
+import csv
 import io
 import json
 import sys
@@ -386,14 +387,81 @@ class MultiseedExperimentTest(unittest.TestCase):
             plot_path = root / "comparison.png"
 
             self.assertEqual(write_summary_csv(summary, csv_path), csv_path)
-            self.assertEqual(len(csv_path.read_text().splitlines()), 17)
+            csv_text = csv_path.read_text(encoding="utf-8")
             self.assertEqual(
-                plot_multiseed_comparison(summary, plot_path),
-                plot_path,
+                csv_text.splitlines()[0],
+                "seed,horizon,metric,h1,h10,delta_h10_minus_h1",
             )
+            rows = list(csv.DictReader(io.StringIO(csv_text)))
+            expected_values = {
+                0: {
+                    "position": ([1.0, 2.0], [0.8, 2.5]),
+                    "heading_degrees": ([1.0, 2.0], [0.5, 2.5]),
+                    "velocity": ([0.4, 0.6], [0.3, 0.5]),
+                    "normalized_total": ([0.8, 1.0], [0.7, 0.9]),
+                },
+                1: {
+                    "position": ([1.2, 2.2], [1.0, 2.3]),
+                    "heading_degrees": ([1.0, 2.0], [0.5, 1.5]),
+                    "velocity": ([0.5, 0.7], [0.4, 0.6]),
+                    "normalized_total": ([0.9, 1.1], [0.8, 1.0]),
+                },
+            }
+            expected_order = [
+                (seed, horizon, metric)
+                for seed in (0, 1)
+                for horizon in (1, 2)
+                for metric in (
+                    "position",
+                    "heading_degrees",
+                    "velocity",
+                    "normalized_total",
+                )
+            ]
+            self.assertEqual(
+                [
+                    (int(row["seed"]), int(row["horizon"]), row["metric"])
+                    for row in rows
+                ],
+                expected_order,
+            )
+            for row, (seed, horizon, metric) in zip(
+                rows, expected_order, strict=True
+            ):
+                h1_values, h10_values = expected_values[seed][metric]
+                h1_value = h1_values[horizon - 1]
+                h10_value = h10_values[horizon - 1]
+                self.assertEqual(float(row["h1"]), h1_value)
+                self.assertEqual(float(row["h10"]), h10_value)
+                self.assertEqual(
+                    float(row["delta_h10_minus_h1"]),
+                    h10_value - h1_value,
+                )
+
+            real_subplots = multiseed_experiment.plt.subplots
+            captured_plot = {}
+
+            def capture_subplots(*args, **kwargs):
+                figure, axes = real_subplots(*args, **kwargs)
+                captured_plot["figure"] = figure
+                captured_plot["axes"] = axes
+                return figure, axes
+
+            with patch.object(
+                multiseed_experiment.plt,
+                "subplots",
+                side_effect=capture_subplots,
+            ) as subplots_spy:
+                self.assertEqual(
+                    plot_multiseed_comparison(summary, plot_path),
+                    plot_path,
+                )
+            subplots_spy.assert_called_once_with(2, 2, figsize=(11, 8))
+            self.assertEqual(captured_plot["axes"].shape, (2, 2))
+            self.assertEqual(len(captured_plot["figure"].axes), 4)
             self.assertEqual(plot_path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
 
-    def test_run_multiseed_experiment_writes_complete_paired_bundle(self):
+    def test_run_multiseed_experiment_sorts_seeds_and_writes_complete_bundle(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             data_path = root / "transitions.npz"
@@ -403,7 +471,7 @@ class MultiseedExperimentTest(unittest.TestCase):
             result = run_multiseed_experiment(
                 data_path=data_path,
                 output_dir=output_dir,
-                seeds=(0, 1),
+                seeds=(1, 0),
                 split_seed=0,
                 rollout_loss_weight=1.0,
                 hidden_size=8,
@@ -462,6 +530,10 @@ class MultiseedExperimentTest(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
+            experiment_summary = json.loads(
+                (output_dir / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(experiment_summary["seeds"], [0, 1])
             self.assertEqual(manifest["schema_version"], 1)
             self.assertEqual(
                 manifest["dataset"],

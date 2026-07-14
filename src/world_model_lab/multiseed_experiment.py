@@ -427,7 +427,7 @@ def run_multiseed_experiment(
     ):
         raise ValueError("output directory must be absent or empty")
 
-    normalized_seeds = [int(seed) for seed in seed_values]
+    normalized_seeds = sorted(int(seed) for seed in seed_values)
     normalized_horizons = [int(horizon) for horizon in horizon_values]
     normalized_split_seed = int(split_seed)
     dataset_hash = sha256_file(data)
