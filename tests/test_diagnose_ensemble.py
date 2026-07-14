@@ -320,6 +320,47 @@ class DiagnoseEnsembleTest(unittest.TestCase):
             for key, filename in expected_paths.items():
                 self.assertEqual(Path(result[key]), output_dir.resolve() / filename)
 
+    def test_run_persists_rollout_eligible_and_skipped_episode_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = save_diagnostic_dataset(
+                root / "transitions.npz",
+                episode_steps={0: 3, 1: 3, 2: 3, 3: 1},
+            )
+            members = (
+                make_member(0, np.asarray([0.75, 0.0, 0.0, 0.0])),
+                make_member(1, np.asarray([1.25, 0.0, 0.0, 0.0])),
+            )
+            checkpoint_paths = []
+            for member in members:
+                member.split_episode_ids = {
+                    "train": np.asarray([0]),
+                    "validation": np.asarray([1]),
+                    "test": np.asarray([2, 3]),
+                }
+                checkpoint_paths.append(
+                    save_member_checkpoint(
+                        root / f"seed-{member.training_config['seed']}.pt",
+                        member,
+                    )
+                )
+
+            output_dir = root / "diagnostics"
+            run_ensemble_diagnostics(
+                data_path=data_path,
+                checkpoint_paths=checkpoint_paths,
+                output_dir=output_dir,
+                horizons=(1, 2),
+                windows_per_episode=2,
+                calibration_bins=2,
+            )
+
+            metrics = json.loads(
+                (output_dir / "metrics.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metrics["rollout"]["eligible_episode_ids"], [2])
+            self.assertEqual(metrics["rollout"]["skipped_episode_ids"], [3])
+
     def test_run_rejects_nonempty_output_before_reading_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

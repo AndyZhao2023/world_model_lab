@@ -275,6 +275,12 @@ def run_ensemble_diagnostics(
         windows=selection.windows,
         eligible_episode_ids=selection.eligible_episode_ids,
     )
+    rollout["eligible_episode_ids"] = sorted(
+        int(value) for value in selection.eligible_episode_ids.tolist()
+    )
+    rollout["skipped_episode_ids"] = sorted(
+        int(value) for value in selection.skipped_episode_ids.tolist()
+    )
     rollout["horizons"] = _rollout_horizon_snapshots(rollout, horizon_values)
     metrics = {
         "schema_version": 1,
