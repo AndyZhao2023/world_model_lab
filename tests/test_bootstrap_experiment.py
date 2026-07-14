@@ -1,6 +1,11 @@
+import copy
 import csv
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
 from pathlib import Path
+import shutil
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -11,8 +16,11 @@ from world_model_lab import bootstrap_experiment
 from world_model_lab.bootstrap_experiment import (
     build_bootstrap_comparison,
     plot_bootstrap_comparison,
+    run_bootstrap_experiment,
     write_comparison_csv,
 )
+from world_model_lab.train_world_model import load_checkpoint, run_training
+from world_model_lab.ensemble import WorldModelEnsemble, load_ensemble
 
 
 METRICS = (
@@ -67,7 +75,443 @@ def make_ensemble_metrics(
     }
 
 
+def save_sequence_dynamics(path: Path) -> None:
+    states = []
+    actions = []
+    next_states = []
+    episode_ids = []
+    step_ids = []
+    for episode_id in range(10):
+        state = np.asarray(
+            [float(episode_id), 0.2 * episode_id, 0.03 * episode_id, 0.2]
+        )
+        for step in range(12):
+            action = np.asarray(
+                [0.03 * episode_id + 0.01 * step, 0.05 + 0.02 * step]
+            )
+            delta = np.asarray(
+                [
+                    0.1 + 0.02 * state[3],
+                    0.01 + 0.005 * state[0],
+                    0.01 * action[0] + 0.002 * state[3],
+                    0.01 + 0.02 * action[1],
+                ]
+            )
+            next_state = state + delta
+            states.append(state)
+            actions.append(action)
+            next_states.append(next_state)
+            episode_ids.append(episode_id)
+            step_ids.append(step)
+            state = next_state
+    np.savez_compressed(
+        path,
+        states=np.asarray(states),
+        actions=np.asarray(actions),
+        next_states=np.asarray(next_states),
+        episode_ids=np.asarray(episode_ids),
+        step_ids=np.asarray(step_ids),
+    )
+
+
 class BootstrapExperimentTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture_directory = tempfile.TemporaryDirectory()
+        cls.fixture_root = Path(cls.fixture_directory.name)
+        cls.data_path = cls.fixture_root / "transitions.npz"
+        save_sequence_dynamics(cls.data_path)
+        cls.baseline_paths = []
+        for seed in (0, 1):
+            checkpoint_path = cls.fixture_root / f"baseline-seed-{seed}.pt"
+            run_training(
+                data_path=cls.data_path,
+                output_path=checkpoint_path,
+                hidden_size=8,
+                epochs=1,
+                batch_size=32,
+                learning_rate=1e-3,
+                seed=seed,
+                split_seed=0,
+                rollout_horizon=10,
+                rollout_loss_weight=1.0,
+            )
+            cls.baseline_paths.append(checkpoint_path)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fixture_directory.cleanup()
+
+    def test_pyproject_registers_bootstrap_ensemble_command(self):
+        pyproject = (Path(__file__).parents[1] / "pyproject.toml").read_text(
+            encoding="utf-8"
+        )
+        _, scripts_and_after = pyproject.split("[project.scripts]", maxsplit=1)
+        scripts = scripts_and_after.split("\n[", maxsplit=1)[0]
+
+        self.assertIn(
+            "world-model-bootstrap-ensemble = "
+            '"world_model_lab.bootstrap_experiment:main"',
+            scripts.splitlines(),
+        )
+
+    def test_cli_help_lists_every_experiment_parameter(self):
+        entrypoint = getattr(bootstrap_experiment, "main", None)
+        self.assertTrue(callable(entrypoint))
+        standard_output = io.StringIO()
+        with patch.object(
+            sys,
+            "argv",
+            ["world-model-bootstrap-ensemble", "--help"],
+        ):
+            with redirect_stdout(standard_output):
+                with self.assertRaises(SystemExit) as context:
+                    entrypoint()
+
+        self.assertEqual(context.exception.code, 0)
+        help_text = standard_output.getvalue()
+        for flag in (
+            "--data",
+            "--baseline-checkpoints",
+            "--output-dir",
+            "--seeds",
+            "--split-seed",
+            "--hidden-size",
+            "--epochs",
+            "--batch-size",
+            "--learning-rate",
+            "--rollout-loss-weight",
+            "--diagnostic-horizons",
+            "--windows-per-episode",
+            "--calibration-bins",
+        ):
+            self.assertIn(flag, help_text)
+
+    def test_cli_reports_missing_dataset_as_argument_error(self):
+        entrypoint = getattr(bootstrap_experiment, "main", None)
+        self.assertTrue(callable(entrypoint))
+        standard_error = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "world-model-bootstrap-ensemble",
+                    "--data",
+                    str(root / "missing.npz"),
+                    "--baseline-checkpoints",
+                    str(root / "missing.pt"),
+                ],
+            ):
+                with redirect_stderr(standard_error):
+                    with self.assertRaises(SystemExit) as context:
+                        entrypoint()
+
+        self.assertEqual(context.exception.code, 2)
+        self.assertIn("dataset is not a regular file", standard_error.getvalue())
+
+    def test_two_member_end_to_end_writes_complete_artifact_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "experiment"
+            result = run_bootstrap_experiment(
+                data_path=self.data_path,
+                baseline_checkpoint_paths=(
+                    self.baseline_paths[1],
+                    self.baseline_paths[0],
+                ),
+                output_dir=output_dir,
+                seeds=(1, 0),
+                split_seed=0,
+                hidden_size=8,
+                epochs=1,
+                batch_size=32,
+                learning_rate=1e-3,
+                rollout_loss_weight=1.0,
+                diagnostic_horizons=(1, 2),
+                windows_per_episode=2,
+                calibration_bins=2,
+            )
+
+            self.assertEqual(
+                set(result),
+                {
+                    "experiment_manifest.json",
+                    "comparison.json",
+                    "comparison.csv",
+                    "comparison.png",
+                    "baseline_diagnostics",
+                    "bootstrap_diagnostics",
+                    "runs",
+                },
+            )
+            for seed in (0, 1):
+                checkpoint_path = (
+                    output_dir / "runs" / f"seed_{seed}" / "world_model.pt"
+                )
+                checkpoint = load_checkpoint(checkpoint_path)
+                self.assertEqual(checkpoint.training_config["seed"], seed)
+                self.assertEqual(
+                    checkpoint.training_config["bootstrap_seed"], seed
+                )
+                self.assertEqual(
+                    result["runs"][str(seed)], str(checkpoint_path.resolve())
+                )
+
+            diagnostic_files = {
+                "manifest.json",
+                "metrics.json",
+                "one_step_calibration.csv",
+                "one_step_calibration.png",
+                "rollout_uncertainty.png",
+            }
+            for name in ("baseline_diagnostics", "bootstrap_diagnostics"):
+                self.assertEqual(
+                    {path.name for path in (output_dir / name).iterdir()},
+                    diagnostic_files,
+                )
+                self.assertEqual(
+                    Path(result[name]["output_dir"]),
+                    (output_dir / name).resolve(),
+                )
+
+            manifest = json.loads(
+                (output_dir / "experiment_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            comparison = json.loads(
+                (output_dir / "comparison.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [record["seed"] for record in manifest["baseline_checkpoints"]],
+                [0, 1],
+            )
+            self.assertEqual(
+                [record["seed"] for record in manifest["bootstrap_checkpoints"]],
+                [0, 1],
+            )
+            json.dumps(manifest, allow_nan=False)
+            json.dumps(comparison, allow_nan=False)
+            for name in (
+                "experiment_manifest.json",
+                "comparison.json",
+                "comparison.csv",
+                "comparison.png",
+            ):
+                self.assertEqual(result[name], str((output_dir / name).resolve()))
+
+    def test_runner_rejects_baseline_protocol_mismatches_before_training(self):
+        mismatched_data = self.fixture_root / "same-data-different-path.npz"
+        shutil.copyfile(self.data_path, mismatched_data)
+        cases = (
+            ("training seeds", {"seeds": (0, 2)}),
+            ("hidden_size", {"hidden_size": 4}),
+            ("split_seed", {"split_seed": 1}),
+            ("data_path", {"data_path": mismatched_data}),
+        )
+        for index, (message, overrides) in enumerate(cases):
+            with self.subTest(message=message):
+                output = self.fixture_root / f"mismatch-output-{index}"
+                arguments = {
+                    "data_path": self.data_path,
+                    "baseline_checkpoint_paths": self.baseline_paths,
+                    "output_dir": output,
+                    "seeds": (0, 1),
+                    "split_seed": 0,
+                    "hidden_size": 8,
+                    "epochs": 1,
+                    "batch_size": 32,
+                    "learning_rate": 1e-3,
+                    "rollout_loss_weight": 1.0,
+                    "diagnostic_horizons": (1, 2),
+                    "windows_per_episode": 2,
+                    "calibration_bins": 2,
+                }
+                arguments.update(overrides)
+                with self.assertRaisesRegex(ValueError, message):
+                    run_bootstrap_experiment(**arguments)
+                self.assertFalse(output.exists())
+
+    def test_cross_ensemble_validation_rejects_data_path_mismatch(self):
+        baseline = load_ensemble(self.baseline_paths)
+        bootstrap_members = copy.deepcopy(baseline.members)
+        for seed, member in zip(baseline.seeds, bootstrap_members, strict=True):
+            member.training_config.update(
+                {
+                    "bootstrap_seed": seed,
+                    "bootstrap_episode_draws": 6,
+                    "bootstrap_unique_episodes": 4,
+                    "bootstrap_episode_counts": {"0": 1},
+                }
+            )
+        bootstrap_members[1].training_config["data_path"] = str(
+            self.fixture_root / "other.npz"
+        )
+        bootstrap = WorldModelEnsemble(
+            members=tuple(bootstrap_members),
+            seeds=baseline.seeds,
+            target_std=baseline.target_std.copy(),
+            checkpoint_paths=baseline.checkpoint_paths,
+        )
+
+        with self.assertRaisesRegex(ValueError, "data_path"):
+            bootstrap_experiment._validate_comparable_ensembles(
+                baseline,
+                bootstrap,
+            )
+
+    def test_dataset_preflight_rejects_missing_training_arrays(self):
+        malformed = self.fixture_root / "missing-training-arrays.npz"
+        np.savez_compressed(malformed, episode_ids=np.arange(10))
+        baseline = load_ensemble(self.baseline_paths)
+
+        with self.assertRaisesRegex(ValueError, "dataset is missing arrays"):
+            bootstrap_experiment._validate_dataset_split_coverage(
+                malformed,
+                baseline,
+            )
+
+    def test_runner_rejects_invalid_protocol_and_nonempty_output(self):
+        invalid_cases = (
+            ("training seeds", {"seeds": (0, 0)}),
+            ("training seeds", {"seeds": (0, -1)}),
+            ("hidden_size", {"hidden_size": 0}),
+            ("learning_rate", {"learning_rate": float("nan")}),
+            ("rollout_loss_weight", {"rollout_loss_weight": float("inf")}),
+            ("diagnostic_horizons", {"diagnostic_horizons": (2, 1)}),
+            ("windows_per_episode", {"windows_per_episode": 0}),
+            ("calibration_bins", {"calibration_bins": 0}),
+        )
+        for index, (message, overrides) in enumerate(invalid_cases):
+            with self.subTest(message=message, overrides=overrides):
+                output = self.fixture_root / f"invalid-output-{index}"
+                arguments = {
+                    "data_path": self.data_path,
+                    "baseline_checkpoint_paths": self.baseline_paths,
+                    "output_dir": output,
+                    "seeds": (0, 1),
+                    "split_seed": 0,
+                    "hidden_size": 8,
+                    "epochs": 1,
+                    "batch_size": 32,
+                    "learning_rate": 1e-3,
+                    "rollout_loss_weight": 1.0,
+                    "diagnostic_horizons": (1, 2),
+                    "windows_per_episode": 2,
+                    "calibration_bins": 2,
+                }
+                arguments.update(overrides)
+                with self.assertRaisesRegex(ValueError, message):
+                    run_bootstrap_experiment(**arguments)
+                self.assertFalse(output.exists())
+
+        nonempty_output = self.fixture_root / "nonempty-output"
+        nonempty_output.mkdir()
+        (nonempty_output / "stale.txt").write_text("stale", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "output directory"):
+            run_bootstrap_experiment(
+                data_path=self.data_path,
+                baseline_checkpoint_paths=self.baseline_paths,
+                output_dir=nonempty_output,
+                seeds=(0, 1),
+                split_seed=0,
+                hidden_size=8,
+                epochs=1,
+                batch_size=32,
+                diagnostic_horizons=(1, 2),
+                windows_per_episode=2,
+                calibration_bins=2,
+            )
+        self.assertEqual(
+            (nonempty_output / "stale.txt").read_text(encoding="utf-8"),
+            "stale",
+        )
+
+    def test_training_failure_preserves_partial_run_without_final_artifacts(self):
+        real_run_training = bootstrap_experiment.run_training
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "experiment"
+
+            def fail_second_seed(**kwargs):
+                if kwargs["seed"] == 1:
+                    raise RuntimeError("second seed failed")
+                return real_run_training(**kwargs)
+
+            with patch.object(
+                bootstrap_experiment,
+                "run_training",
+                side_effect=fail_second_seed,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "second seed failed"):
+                    run_bootstrap_experiment(
+                        data_path=self.data_path,
+                        baseline_checkpoint_paths=self.baseline_paths,
+                        output_dir=output_dir,
+                        seeds=(0, 1),
+                        split_seed=0,
+                        hidden_size=8,
+                        epochs=1,
+                        batch_size=32,
+                        diagnostic_horizons=(1, 2),
+                        windows_per_episode=2,
+                        calibration_bins=2,
+                    )
+
+            self.assertTrue(
+                (output_dir / "runs" / "seed_0" / "world_model.pt").is_file()
+            )
+            self.assertFalse((output_dir / "comparison.json").exists())
+            self.assertFalse((output_dir / "experiment_manifest.json").exists())
+
+    def test_diagnostic_failure_preserves_partial_outputs_without_final_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "experiment"
+            call_count = 0
+
+            def fail_second_diagnostic(**kwargs):
+                nonlocal call_count
+                call_count += 1
+                diagnostic_output = Path(kwargs["output_dir"])
+                diagnostic_output.mkdir(parents=True)
+                (diagnostic_output / "partial.txt").write_text(
+                    f"call {call_count}", encoding="utf-8"
+                )
+                if call_count == 2:
+                    raise RuntimeError("bootstrap diagnostic failed")
+                return {"output_dir": str(diagnostic_output)}
+
+            with patch.object(
+                bootstrap_experiment,
+                "run_ensemble_diagnostics",
+                side_effect=fail_second_diagnostic,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "bootstrap diagnostic failed"
+                ):
+                    run_bootstrap_experiment(
+                        data_path=self.data_path,
+                        baseline_checkpoint_paths=self.baseline_paths,
+                        output_dir=output_dir,
+                        seeds=(0, 1),
+                        split_seed=0,
+                        hidden_size=8,
+                        epochs=1,
+                        batch_size=32,
+                        diagnostic_horizons=(1, 2),
+                        windows_per_episode=2,
+                        calibration_bins=2,
+                    )
+
+            self.assertTrue(
+                (output_dir / "baseline_diagnostics" / "partial.txt").is_file()
+            )
+            self.assertTrue(
+                (output_dir / "bootstrap_diagnostics" / "partial.txt").is_file()
+            )
+            self.assertFalse((output_dir / "comparison.json").exists())
+            self.assertFalse((output_dir / "experiment_manifest.json").exists())
+
     def test_comparison_csv_has_exact_header_and_stable_row_order(self):
         comparison = build_bootstrap_comparison(
             make_ensemble_metrics(error=2.0, correlation=0.1),

@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 world-model-car-demo = "world_model_lab.demo_random_drive:main"
+world-model-bootstrap-ensemble = "world_model_lab.bootstrap_experiment:main"
 world-model-collect-data = "world_model_lab.collect_data:main"
 world-model-diagnose = "world_model_lab.diagnose_model:main"
 world-model-diagnose-ensemble = "world_model_lab.diagnose_ensemble:main"
