@@ -63,6 +63,20 @@ def make_sequence_dynamics(
     )
 
 
+def _save_sequence_dataset(path: Path) -> None:
+    states, actions, next_states, episode_ids, step_ids = (
+        make_sequence_dynamics(episodes=10, steps=12)
+    )
+    np.savez_compressed(
+        path,
+        states=states,
+        actions=actions,
+        next_states=next_states,
+        episode_ids=episode_ids,
+        step_ids=step_ids,
+    )
+
+
 class TrainWorldModelTest(unittest.TestCase):
     def test_multistep_training_records_finite_component_histories(self):
         states, actions, next_states, episode_ids, step_ids = (
@@ -455,6 +469,71 @@ class TrainWorldModelTest(unittest.TestCase):
         self.assertEqual(loaded.training_config["rollout_horizon"], 2)
         self.assertEqual(loaded.training_config["rollout_loss_weight"], 0.5)
         self.assertGreater(summary["final_train_rollout_loss"], 0.0)
+
+    def test_explicit_split_seed_keeps_episode_split_fixed_across_training_seeds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = root / "transitions.npz"
+            _save_sequence_dataset(data_path)
+            checkpoints = []
+            for seed in (3, 9):
+                checkpoint = root / f"seed-{seed}.pt"
+                run_training(
+                    data_path=data_path,
+                    output_path=checkpoint,
+                    hidden_size=8,
+                    epochs=1,
+                    batch_size=32,
+                    seed=seed,
+                    split_seed=5,
+                )
+                checkpoints.append(load_checkpoint(checkpoint))
+
+        for name in ("train", "validation", "test"):
+            np.testing.assert_array_equal(
+                checkpoints[0].split_episode_ids[name],
+                checkpoints[1].split_episode_ids[name],
+            )
+        self.assertEqual(checkpoints[0].training_config["split_seed"], 5)
+        self.assertEqual(checkpoints[1].training_config["split_seed"], 5)
+
+    def test_omitted_split_seed_preserves_seed_based_split(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = root / "transitions.npz"
+            _save_sequence_dataset(data_path)
+            seed = 7
+            omitted_path = root / "omitted.pt"
+            explicit_path = root / "explicit.pt"
+            omitted_summary = run_training(
+                data_path=data_path,
+                output_path=omitted_path,
+                hidden_size=8,
+                epochs=1,
+                batch_size=32,
+                seed=seed,
+            )
+            explicit_summary = run_training(
+                data_path=data_path,
+                output_path=explicit_path,
+                hidden_size=8,
+                epochs=1,
+                batch_size=32,
+                seed=seed,
+                split_seed=seed,
+            )
+            checkpoints = (
+                load_checkpoint(omitted_path),
+                load_checkpoint(explicit_path),
+            )
+
+        for name in ("train", "validation", "test"):
+            np.testing.assert_array_equal(
+                checkpoints[0].split_episode_ids[name],
+                checkpoints[1].split_episode_ids[name],
+            )
+        self.assertEqual(omitted_summary["split_seed"], seed)
+        self.assertEqual(explicit_summary["split_seed"], seed)
 
 
 if __name__ == "__main__":

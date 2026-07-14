@@ -334,3 +334,44 @@ MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
 当两条曲线随 horizon 分离时，差值主要来自 compounding error。样本数小于
 `min_bin_count` 的空间或特征区间会在误差图中被遮罩；其样本数量仍保留在 JSON
 和覆盖图中，不能把低覆盖区域误判成模型表现良好。
+
+## Multi-seed stability experiment
+
+该实验使用五个训练 seed 比较相同 episode 划分下的 H1 与 H10，判断多步训练的
+效果是否跨随机初始化保持稳定。H1 是单步训练，rollout horizon 为 `1`，实际使用的
+rollout loss weight 为 `0.0`；H10 的 rollout horizon 为 `10`，rollout loss weight
+为 `1.0`。两组训练都固定 `split_seed=0`，并分别使用训练 seed `0` 到 `4`，因此
+每个 seed 的 H1/H10 结果构成一组配对比较。
+
+汇总中的 paired delta 定义为 `H10 - H1`。这些指标都是误差，所以负值表示 H10
+更好，正值表示 H10 更差。输出目录必须不存在，或已经存在但为空；命令会拒绝覆盖
+非空目录。
+
+从项目根目录运行完整实验：
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
+  .venv/bin/world-model-multiseed \
+  --data data/transitions.npz \
+  --output-dir artifacts/experiments/h1-vs-h10-seeds-0-4 \
+  --seeds 0 1 2 3 4 \
+  --split-seed 0 \
+  --epochs 100 \
+  --diagnostic-horizons 1 5 10 20 50
+```
+
+顶层输出包括：
+
+| 文件 | 内容 |
+|---|---|
+| `experiment_manifest.json` | 数据集哈希、训练与诊断参数，以及十个 run 的相对路径 |
+| `summary.json` | H1、H10 和 paired delta 的逐步均值、样本标准差、seed 计数与稀疏 horizon 汇总 |
+| `summary.csv` | 每个 seed、horizon 和指标的 H1、H10 与 paired delta 明细 |
+| `multiseed_comparison.png` | position、heading、velocity、normalized total 的 2×2 均值与样本标准差图 |
+
+这里的 `mean ± sample standard deviation` 只作为五个训练 seed 之间变异性的描述性证据，不是正式的统计显著性检验。
+
+每个 `runs/seed_<seed>/{h1,h10}/` 目录包含 `world_model.pt` checkpoint 和一个
+`diagnostics/` bundle。bundle 内含 `metrics.json`、`manifest.json`、`overview.png`、
+`rollout_errors.png` 与 `rollout_loss_components.png`，可追溯并检查单次训练的完整
+诊断结果。
