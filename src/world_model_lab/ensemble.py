@@ -147,6 +147,16 @@ def _validate_member(member: LoadedWorldModel) -> None:
             )
 
 
+def _validate_rollout_horizon(member: LoadedWorldModel) -> None:
+    horizon = _config_value(member, "rollout_horizon")
+    if (
+        isinstance(horizon, bool)
+        or not isinstance(horizon, (int, np.integer))
+        or horizon != 10
+    ):
+        raise ValueError("rollout_horizon must equal 10")
+
+
 def build_ensemble(
     members: Iterable[LoadedWorldModel],
     *,
@@ -162,6 +172,7 @@ def build_ensemble(
     paired = []
     for index, member in enumerate(loaded):
         _validate_member(member)
+        _validate_rollout_horizon(member)
         seed = _config_value(member, "seed")
         if (
             isinstance(seed, bool)
@@ -178,8 +189,6 @@ def build_ensemble(
         raise ValueError("checkpoint training seeds must be unique")
 
     reference = paired[0][1]
-    if int(_config_value(reference, "rollout_horizon")) != 10:
-        raise ValueError("rollout_horizon must equal 10")
     for _, member, _ in paired[1:]:
         for name in (
             "split_seed",
@@ -189,8 +198,6 @@ def build_ensemble(
         ):
             if _config_value(member, name) != _config_value(reference, name):
                 raise ValueError(f"checkpoint {name} values differ")
-        if int(_config_value(member, "rollout_horizon")) != 10:
-            raise ValueError("rollout_horizon must equal 10")
         for split_name in ("train", "validation", "test"):
             if not np.array_equal(
                 member.split_episode_ids.get(split_name),

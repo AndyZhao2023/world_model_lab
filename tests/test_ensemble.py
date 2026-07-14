@@ -160,6 +160,25 @@ class EnsembleTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "hidden_size"):
             build_ensemble((valid, inconsistent_model))
 
+    def test_build_requires_rollout_horizon_to_be_exact_integer_ten(self):
+        for invalid_horizon in (10.5, 10.0, "10", True, 9, 11):
+            first = make_member(0, np.zeros(4))
+            second = make_member(1, np.ones(4))
+            first.training_config["rollout_horizon"] = invalid_horizon
+            second.training_config["rollout_horizon"] = invalid_horizon
+            with self.subTest(invalid_horizon=invalid_horizon):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "rollout_horizon must equal 10",
+                ):
+                    build_ensemble((first, second))
+
+        first = make_member(0, np.zeros(4))
+        second = make_member(1, np.ones(4))
+        first.training_config["rollout_horizon"] = np.int64(10)
+        second.training_config["rollout_horizon"] = np.int64(10)
+        self.assertEqual(build_ensemble((first, second)).seeds, (0, 1))
+
     def test_build_rejects_normalizer_and_split_mismatches(self):
         valid = make_member(0, np.zeros(4))
 
