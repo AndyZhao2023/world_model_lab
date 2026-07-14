@@ -375,3 +375,44 @@ MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
 `diagnostics/` bundle。bundle 内含 `metrics.json`、`manifest.json`、`overview.png`、
 `rollout_errors.png` 与 `rollout_loss_components.png`，可追溯并检查单次训练的完整
 诊断结果。
+
+## Ensemble uncertainty diagnostics
+
+该诊断把 multi-seed 实验中的五个 H10 checkpoint 组成 ensemble，在共同的测试
+episode 上回答两个问题：ensemble 均值是否优于典型单成员，以及成员分歧是否能给
+预测风险排序。它只做 held-out 诊断，不重新训练模型，也不实现 MPC penalty。
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
+  .venv/bin/world-model-diagnose-ensemble \
+  --data data/transitions.npz \
+  --checkpoints \
+    artifacts/experiments/h1-vs-h10-seeds-0-4/runs/seed_0/h10/world_model.pt \
+    artifacts/experiments/h1-vs-h10-seeds-0-4/runs/seed_1/h10/world_model.pt \
+    artifacts/experiments/h1-vs-h10-seeds-0-4/runs/seed_2/h10/world_model.pt \
+    artifacts/experiments/h1-vs-h10-seeds-0-4/runs/seed_3/h10/world_model.pt \
+    artifacts/experiments/h1-vs-h10-seeds-0-4/runs/seed_4/h10/world_model.pt \
+  --output-dir artifacts/diagnostics/h10-ensemble-seeds-0-4
+```
+
+输出目录必须不存在或为空。成功后会原子地生成五个文件：
+
+| 文件 | 内容 |
+|---|---|
+| `manifest.json` | 数据集与按 seed 排序的 checkpoint 路径、SHA-256、共同 H10 配置、测试 episode 和诊断协议 |
+| `metrics.json` | schema v1 的单步 calibration、逐步 rollout 稠密曲线和指定 horizon 快照 |
+| `one_step_calibration.csv` | 按分歧排序的等样本数 calibration bin，便于进一步分析 |
+| `one_step_calibration.png` | position、heading、velocity 和 normalized total 的观测误差对分歧图 |
+| `rollout_uncertainty.png` | ensemble 误差、平均成员误差和 rollout 分歧随步数变化的曲线 |
+
+ensemble 均值对 `x`、`y` 和 velocity 使用算术平均，对 heading 使用圆周平均，避免
+`-pi/pi` 边界错误。position disagreement 是成员 XY 预测到 ensemble 均值的 RMS
+欧氏距离；heading disagreement 是 wrapped 角差的 RMS（度）；velocity
+disagreement 是速度差的 RMS（m/s）。normalized total disagreement 先用共同的
+target-delta 标准差缩放四个分量，再计算整体 RMS。
+
+`ensemble_gain_mean > 0` 表示 ensemble 均值的平均误差低于典型成员。正的
+disagreement/error correlation 表示分歧倾向于把高风险预测排在前面；相关性接近
+零则表示该分歧目前还不足以作为 MPC penalty。这里不同训练 seed 的分歧只刻画训练
+随机性带来的 epistemic variation，不包含环境本身的 aleatoric noise。按 episode
+bootstrap 成员和把 uncertainty 接入 MPC 都是后续阶段，不属于当前诊断。

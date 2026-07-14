@@ -83,7 +83,7 @@ def _validate_target_std(target_std: np.ndarray) -> np.ndarray:
     return array
 
 
-def _compute_normalized_squared_errors(
+def compute_normalized_squared_errors(
     predicted_states: np.ndarray,
     true_states: np.ndarray,
     target_std: np.ndarray,
@@ -501,7 +501,7 @@ def _build_step_curves(
                     "cached rollout predictions must have shape [max_horizon, 4]"
                 )
             physical_errors = compute_state_errors(predictions, true_states)
-            normalized_errors = _compute_normalized_squared_errors(
+            normalized_errors = compute_normalized_squared_errors(
                 predictions,
                 true_states,
                 target_std,
