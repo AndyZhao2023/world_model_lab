@@ -1,10 +1,15 @@
+import io
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
+from world_model_lab import train_world_model
 from world_model_lab.dataset import (
     Normalizer,
     build_model_arrays,
@@ -83,6 +88,203 @@ def _save_sequence_dataset(path: Path) -> None:
 
 
 class TrainWorldModelTest(unittest.TestCase):
+    def test_cli_help_lists_bootstrap_seed(self):
+        standard_output = io.StringIO()
+        with patch.object(sys, "argv", ["world-model-train", "--help"]):
+            with redirect_stdout(standard_output):
+                with self.assertRaises(SystemExit) as context:
+                    train_world_model.main()
+
+        self.assertEqual(context.exception.code, 0)
+        self.assertIn("--bootstrap-seed", standard_output.getvalue())
+
+    def test_bootstrap_training_rejects_negative_seed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = root / "transitions.npz"
+            _save_sequence_dataset(data_path)
+
+            with self.assertRaisesRegex(ValueError, "bootstrap seed"):
+                run_training(
+                    data_path=data_path,
+                    output_path=root / "world_model.pt",
+                    hidden_size=8,
+                    epochs=1,
+                    batch_size=32,
+                    seed=3,
+                    split_seed=0,
+                    rollout_horizon=10,
+                    rollout_loss_weight=1.0,
+                    bootstrap_seed=-1,
+                )
+
+    def test_bootstrap_training_preserves_split_and_shared_normalizers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = root / "transitions.npz"
+            _save_sequence_dataset(data_path)
+            baseline_path = root / "baseline.pt"
+            bootstrap_path = root / "bootstrap.pt"
+
+            baseline_summary = run_training(
+                data_path=data_path,
+                output_path=baseline_path,
+                hidden_size=8,
+                epochs=1,
+                batch_size=32,
+                seed=3,
+                split_seed=0,
+                rollout_horizon=10,
+                rollout_loss_weight=1.0,
+            )
+            bootstrap_summary = run_training(
+                data_path=data_path,
+                output_path=bootstrap_path,
+                hidden_size=8,
+                epochs=1,
+                batch_size=32,
+                seed=3,
+                split_seed=0,
+                rollout_horizon=10,
+                rollout_loss_weight=1.0,
+                bootstrap_seed=3,
+            )
+            baseline = load_checkpoint(baseline_path)
+            bootstrap = load_checkpoint(bootstrap_path)
+
+        for name in ("train", "validation", "test"):
+            np.testing.assert_array_equal(
+                baseline.split_episode_ids[name],
+                bootstrap.split_episode_ids[name],
+            )
+        np.testing.assert_array_equal(
+            baseline.input_normalizer.mean,
+            bootstrap.input_normalizer.mean,
+        )
+        np.testing.assert_array_equal(
+            baseline.input_normalizer.std,
+            bootstrap.input_normalizer.std,
+        )
+        np.testing.assert_array_equal(
+            baseline.target_normalizer.mean,
+            bootstrap.target_normalizer.mean,
+        )
+        np.testing.assert_array_equal(
+            baseline.target_normalizer.std,
+            bootstrap.target_normalizer.std,
+        )
+        config = bootstrap.training_config
+        self.assertEqual(config["bootstrap_seed"], 3)
+        self.assertEqual(
+            sum(config["bootstrap_episode_counts"].values()),
+            config["bootstrap_episode_draws"],
+        )
+        self.assertEqual(
+            sum(
+                value > 0
+                for value in config["bootstrap_episode_counts"].values()
+            ),
+            config["bootstrap_unique_episodes"],
+        )
+        self.assertNotIn("bootstrap_seed", baseline.training_config)
+        self.assertEqual(
+            bootstrap_summary["split_transitions"]["validation"],
+            baseline_summary["split_transitions"]["validation"],
+        )
+        self.assertEqual(
+            bootstrap_summary["split_transitions"]["test"],
+            baseline_summary["split_transitions"]["test"],
+        )
+        self.assertEqual(
+            bootstrap_summary["bootstrap_train_transitions"],
+            12 * config["bootstrap_episode_draws"],
+        )
+        self.assertEqual(
+            bootstrap_summary["train_sequence_windows"],
+            3 * config["bootstrap_episode_draws"],
+        )
+
+    def test_bootstrap_training_is_deterministic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = root / "transitions.npz"
+            _save_sequence_dataset(data_path)
+            checkpoints = []
+            summaries = []
+            for repeat in range(2):
+                checkpoint_path = root / f"bootstrap-{repeat}.pt"
+                summaries.append(
+                    run_training(
+                        data_path=data_path,
+                        output_path=checkpoint_path,
+                        hidden_size=8,
+                        epochs=2,
+                        batch_size=32,
+                        learning_rate=1e-3,
+                        seed=3,
+                        split_seed=0,
+                        rollout_horizon=10,
+                        rollout_loss_weight=1.0,
+                        bootstrap_seed=7,
+                    )
+                )
+                checkpoints.append(load_checkpoint(checkpoint_path))
+
+        first, second = checkpoints
+        self.assertEqual(
+            first.training_config["bootstrap_seed"],
+            second.training_config["bootstrap_seed"],
+        )
+        self.assertEqual(
+            first.training_config["bootstrap_episode_counts"],
+            second.training_config["bootstrap_episode_counts"],
+        )
+        self.assertEqual(first.train_losses, second.train_losses)
+        self.assertEqual(first.validation_losses, second.validation_losses)
+        self.assertEqual(
+            first.train_one_step_losses,
+            second.train_one_step_losses,
+        )
+        self.assertEqual(
+            first.train_rollout_losses,
+            second.train_rollout_losses,
+        )
+        self.assertEqual(
+            first.validation_one_step_losses,
+            second.validation_one_step_losses,
+        )
+        self.assertEqual(
+            first.validation_rollout_losses,
+            second.validation_rollout_losses,
+        )
+        np.testing.assert_array_equal(
+            first.input_normalizer.mean,
+            second.input_normalizer.mean,
+        )
+        np.testing.assert_array_equal(
+            first.input_normalizer.std,
+            second.input_normalizer.std,
+        )
+        np.testing.assert_array_equal(
+            first.target_normalizer.mean,
+            second.target_normalizer.mean,
+        )
+        np.testing.assert_array_equal(
+            first.target_normalizer.std,
+            second.target_normalizer.std,
+        )
+        self.assertEqual(
+            summaries[0]["bootstrap_train_transitions"],
+            summaries[1]["bootstrap_train_transitions"],
+        )
+        for name, first_tensor in first.model.state_dict().items():
+            torch.testing.assert_close(
+                first_tensor,
+                second.model.state_dict()[name],
+                rtol=0.0,
+                atol=0.0,
+            )
+
     def test_train_model_uses_explicit_shared_normalizers(self):
         inputs, targets = make_linear_dynamics(count=80)
         shared_input = fit_normalizer(inputs[:64])
