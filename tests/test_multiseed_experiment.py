@@ -3,7 +3,6 @@ import io
 import json
 import sys
 import tempfile
-import tomllib
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -124,15 +123,15 @@ def save_sequence_dynamics(path: Path) -> None:
 
 class MultiseedExperimentTest(unittest.TestCase):
     def test_pyproject_registers_multiseed_command(self):
-        pyproject = tomllib.loads(
-            (Path(__file__).parents[1] / "pyproject.toml").read_text(
-                encoding="utf-8"
-            )
+        pyproject = (Path(__file__).parents[1] / "pyproject.toml").read_text(
+            encoding="utf-8"
         )
+        _, scripts_and_after = pyproject.split("[project.scripts]", maxsplit=1)
+        scripts = scripts_and_after.split("\n[", maxsplit=1)[0]
 
-        self.assertEqual(
-            pyproject["project"]["scripts"].get("world-model-multiseed"),
-            "world_model_lab.multiseed_experiment:main",
+        self.assertIn(
+            'world-model-multiseed = "world_model_lab.multiseed_experiment:main"',
+            scripts.splitlines(),
         )
 
     def test_cli_help_lists_every_experiment_parameter(self):
