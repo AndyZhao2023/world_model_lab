@@ -86,7 +86,7 @@ same:
 
 - `split_episode_ids` arrays for train, validation, and test;
 - `training_config["split_seed"]`;
-- `training_config["rollout_horizon"]`, which must be greater than one;
+- `training_config["rollout_horizon"]`, which must equal `10`;
 - effective `training_config["rollout_loss_weight"]`;
 - model input/output contract and hidden size;
 - input and target normalizer means and standard deviations.
@@ -189,7 +189,9 @@ The ensemble mean is computed across member states separately at every rollout
 step. The mean is not fed back into each member because that would collapse
 member trajectories and underestimate future disagreement.
 
-For every requested horizon, the output records:
+The diagnostic computes dense curves for every step from `1` through the
+largest requested horizon and stores the requested horizons as named snapshots.
+At every dense step, the output records:
 
 - ensemble mean position, heading, velocity, and normalized-total error;
 - mean, minimum, and maximum individual-member error;
