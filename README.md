@@ -147,6 +147,61 @@ MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
 
 固定相同的 `--seed` 和采集参数会得到完全相同的数据，便于后续训练与实验复现。`data/` 是生成产物目录，默认不会进入 Git。
 
+## 生成视觉 Episode 数据
+
+当前状态数据仍然是 ground truth。下面的命令把每条状态轨迹渲染为
+`64 × 64 × 3` 的 RGB episode，同时保留实际执行的动作：
+
+```bash
+.venv/bin/python -m world_model_lab.build_visual_data \
+  --data data/transitions.npz \
+  --output data/visual_episodes.npz \
+  --preview artifacts/visual_episode_preview.gif
+```
+
+重新执行 `.venv/bin/python -m pip install -e .` 后，也可以使用：
+
+```bash
+.venv/bin/world-model-build-visual-data
+```
+
+单帧只显示边界、障碍物、目标、小车位置和朝向，不显示速度条或运动轨迹。
+因此只改变 `velocity` 不会改变当前图像；后续视觉模型需要从连续画面推断运动。
+
+视觉 NPZ 使用 schema version 1：
+
+| 数组 | 形状 | 含义 |
+|---|---|---|
+| `frames` | `[F, 64, 64, 3]` | 每个 episode 的连续 `uint8` RGB 帧 |
+| `states` | `[F, 4]` | 只用于诊断的帧对应物理状态 |
+| `actions` | `[N, 2]` | 相邻帧之间实际执行的 steering 和 acceleration |
+| `rewards` / `dones` / `terminal_reasons` | `[N]` | transition 元数据 |
+| `episode_ids` | `[E]` | 按数值升序排列的 episode ID |
+| `frame_offsets` | `[E + 1]` | 每个 episode 的帧切片边界 |
+| `transition_offsets` | `[E + 1]` | 每个 episode 的动作切片边界 |
+
+总帧数满足 `F = N + E`。episode 内的因果关系固定为：
+
+```text
+frames[k] --actions[k]--> frames[k + 1]
+```
+
+schema 同时记录 `renderer_version`、`pillow_version`、默认场景几何、
+`image_size=64` 和 `context_frames=4`。短于 4 个 transition 的 episode
+仍然保留，但不会被计为可生成“四帧历史 + 下一帧目标”的 episode。
+
+未来视觉动力学样本不会只使用“当前帧 + 当前动作”。因为 acceleration
+先改变隐藏速度，下一帧的位置仍使用旧速度，所以模型输入需要最近四帧和
+对齐的历史动作：
+
+```text
+(frames[t-3:t], actions[t-3:t-1]), action[t] -> frame[t+1]
+```
+
+这一步只生成和验证视觉观测数据，不训练 autoencoder、VAE 或 latent
+dynamics。`artifacts/visual_episode_preview.gif` 用于人工检查连续运动，
+不会进入训练。
+
 ## 训练第一个 Learned World Model
 
 安装新增的 PyTorch 依赖：
