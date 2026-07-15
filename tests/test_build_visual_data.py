@@ -12,8 +12,14 @@ from PIL import Image, ImageSequence
 
 from tests.visual_fixtures import make_transition_source
 from world_model_lab import build_visual_data
-from world_model_lab.build_visual_data import run_visual_data_build
-from world_model_lab.visual_dataset import load_visual_dataset
+from world_model_lab.build_visual_data import (
+    run_visual_data_build,
+    write_preview_gif,
+)
+from world_model_lab.visual_dataset import (
+    build_visual_dataset,
+    load_visual_dataset,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -174,6 +180,36 @@ class BuildVisualDataTest(unittest.TestCase):
                     preview_path=preview_directory,
                 )
 
+    def test_output_and_preview_must_not_be_ancestors_before_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.npz"
+            save_source(source)
+            cases = (
+                (
+                    root / "output-parent",
+                    root / "output-parent" / "preview.gif",
+                ),
+                (
+                    root / "preview-parent" / "visual.npz",
+                    root / "preview-parent",
+                ),
+            )
+
+            for output, preview in cases:
+                with self.subTest(output=output, preview=preview):
+                    with self.assertRaises(Exception) as context:
+                        run_visual_data_build(
+                            data_path=source,
+                            output_path=output,
+                            preview_path=preview,
+                        )
+
+                    self.assertFalse(output.exists())
+                    self.assertFalse(preview.exists())
+                    self.assertIsInstance(context.exception, ValueError)
+                    self.assertRegex(str(context.exception), "ancestor")
+
     def test_tiny_end_to_end_build_writes_valid_npz_and_full_gif(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -251,6 +287,32 @@ class BuildVisualDataTest(unittest.TestCase):
                 first_preview.read_bytes(),
                 second_preview.read_bytes(),
             )
+
+    def test_gif_preserves_identical_logical_frames_without_pixel_changes(self):
+        dataset = build_visual_dataset(make_transition_source())
+        episode_index = int(np.flatnonzero(dataset["episode_ids"] == 7)[0])
+        frame_start = int(dataset["frame_offsets"][episode_index])
+        frame_stop = int(dataset["frame_offsets"][episode_index + 1])
+        stationary_frame = dataset["frames"][frame_start].copy()
+        dataset["frames"][frame_start:frame_stop] = stationary_frame
+
+        with tempfile.TemporaryDirectory() as directory:
+            preview = Path(directory) / "stationary.gif"
+            write_preview_gif(dataset, preview, episode_id=7)
+            with Image.open(preview) as image:
+                decoded_frames = [
+                    np.asarray(frame.convert("RGB")).copy()
+                    for frame in ImageSequence.Iterator(image)
+                ]
+                durations = [
+                    int(frame.info["duration"])
+                    for frame in ImageSequence.Iterator(image)
+                ]
+
+        self.assertEqual(len(decoded_frames), frame_stop - frame_start)
+        self.assertEqual(durations, [100] * (frame_stop - frame_start))
+        for decoded_frame in decoded_frames:
+            np.testing.assert_array_equal(decoded_frame, stationary_frame)
 
     def test_unavailable_preview_episode_fails_before_writing(self):
         with tempfile.TemporaryDirectory() as directory:

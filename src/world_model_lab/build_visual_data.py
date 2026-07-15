@@ -33,6 +33,10 @@ def _resolved_paths(
         raise ValueError(
             "data, output, and preview paths must be pairwise distinct"
         )
+    if output in preview.parents or preview in output.parents:
+        raise ValueError(
+            "output and preview paths must not be ancestors of one another"
+        )
     if not source.is_file():
         raise FileNotFoundError(
             f"transition dataset is not a regular file: {source}"
@@ -65,6 +69,27 @@ def _preview_episode_index(
     return int(matches[0])
 
 
+def _gif_frame(frame: np.ndarray, *, mark_boundary: bool) -> Image.Image:
+    """Add an RGB-invisible palette marker for one logical frame boundary."""
+
+    image = Image.fromarray(frame).convert(
+        "P",
+        palette=Image.Palette.ADAPTIVE,
+        colors=255,
+    )
+    marker_color_index = int(image.getpixel((0, 0)))
+    palette = image.getpalette()
+    if palette is None:
+        raise ValueError("GIF frame must have a palette")
+    palette.extend([0] * (256 * 3 - len(palette)))
+    color_start = marker_color_index * 3
+    palette[255 * 3 : 256 * 3] = palette[color_start : color_start + 3]
+    image.putpalette(palette)
+    if mark_boundary:
+        image.putpixel((0, 0), 255)
+    return image
+
+
 def write_preview_gif(
     dataset: Mapping[str, np.ndarray],
     output_path: Path | str,
@@ -93,12 +118,8 @@ def write_preview_gif(
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     images = [
-        Image.fromarray(frame).convert(
-            "P",
-            palette=Image.Palette.ADAPTIVE,
-            colors=256,
-        )
-        for frame in frames
+        _gif_frame(frame, mark_boundary=bool(index % 2))
+        for index, frame in enumerate(frames)
     ]
     with path.open("xb") as handle:
         images[0].save(
