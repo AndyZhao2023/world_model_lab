@@ -12,7 +12,11 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image, ImageSequence
 
-from tests.visual_fixtures import clone_arrays, make_transition_source
+from tests.visual_fixtures import (
+    clone_arrays,
+    corrupt_compressed_npz_member,
+    make_transition_source,
+)
 from world_model_lab import build_visual_data
 from world_model_lab.build_visual_data import (
     run_visual_data_build,
@@ -127,6 +131,77 @@ class BuildVisualDataTest(unittest.TestCase):
             output = root / "visual.npz"
             preview = root / "preview.gif"
             source.write_bytes(b"PK\x03\x04garbage")
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "world-model-build-visual-data",
+                    "--data",
+                    str(source),
+                    "--output",
+                    str(output),
+                    "--preview",
+                    str(preview),
+                ],
+            ):
+                with redirect_stderr(standard_error):
+                    with self.assertRaises(SystemExit) as context:
+                        build_visual_data.main()
+
+            self.assertFalse(output.exists())
+            self.assertFalse(preview.exists())
+
+        self.assertEqual(context.exception.code, 2)
+        self.assertIn(
+            "malformed transition dataset NPZ",
+            standard_error.getvalue(),
+        )
+        self.assertNotIn("Traceback", standard_error.getvalue())
+
+    def test_numeric_npy_becomes_argument_error_without_traceback(self):
+        standard_error = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "numeric.npy"
+            output = root / "visual.npz"
+            preview = root / "preview.gif"
+            np.save(source, np.arange(4, dtype=np.int64))
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "world-model-build-visual-data",
+                    "--data",
+                    str(source),
+                    "--output",
+                    str(output),
+                    "--preview",
+                    str(preview),
+                ],
+            ):
+                with redirect_stderr(standard_error):
+                    with self.assertRaises(SystemExit) as context:
+                        build_visual_data.main()
+
+            self.assertFalse(output.exists())
+            self.assertFalse(preview.exists())
+
+        self.assertEqual(context.exception.code, 2)
+        self.assertIn(
+            "transition dataset must be an NPZ archive",
+            standard_error.getvalue(),
+        )
+        self.assertNotIn("Traceback", standard_error.getvalue())
+
+    def test_corrupted_member_becomes_argument_error_without_traceback(self):
+        standard_error = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "corrupted.npz"
+            output = root / "visual.npz"
+            preview = root / "preview.gif"
+            save_source(source)
+            corrupt_compressed_npz_member(source, "states")
             with patch.object(
                 sys,
                 "argv",

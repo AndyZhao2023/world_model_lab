@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
 
 import numpy as np
+from numpy.lib.npyio import NpzFile
 
 from ._artifact_io import write_new_file_atomically
 from .car_env import CarEnv
@@ -90,8 +92,16 @@ def load_transition_dataset(path: Path | str) -> TransitionDataset:
         )
     try:
         with source_path.open("rb") as handle:
-            with np.load(handle, allow_pickle=False) as loaded:
-                missing = set(REQUIRED_SOURCE_ARRAYS) - set(loaded.files)
+            loaded = np.load(handle, allow_pickle=False)
+            if not isinstance(loaded, NpzFile):
+                raise ValueError(
+                    "transition dataset must be an NPZ archive: "
+                    f"{source_path}"
+                )
+            with loaded:
+                names = tuple(loaded.files)
+                _require_unique_npz_array_names(names, "transition dataset")
+                missing = set(REQUIRED_SOURCE_ARRAYS) - set(names)
                 if missing:
                     names = ", ".join(sorted(missing))
                     raise ValueError(
@@ -101,7 +111,7 @@ def load_transition_dataset(path: Path | str) -> TransitionDataset:
                     name: np.asarray(loaded[name])
                     for name in REQUIRED_SOURCE_ARRAYS
                 }
-    except (EOFError, zipfile.BadZipFile):
+    except (EOFError, zipfile.BadZipFile, zlib.error):
         raise ValueError(
             f"malformed transition dataset NPZ: {source_path}"
         ) from None
@@ -288,6 +298,22 @@ def _require_exact_visual_array_names(names: Iterable[str]) -> None:
     if missing:
         listed = ", ".join(sorted(missing))
         raise ValueError(f"visual dataset is missing arrays: {listed}")
+
+
+def _require_unique_npz_array_names(
+    names: tuple[str, ...],
+    label: str,
+) -> None:
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for name in names:
+        if name in seen:
+            duplicates.add(name)
+        else:
+            seen.add(name)
+    if duplicates:
+        listed = ", ".join(sorted(duplicates))
+        raise ValueError(f"{label} has duplicate arrays: {listed}")
 
 
 def _require_exact_offsets(
@@ -635,13 +661,20 @@ def load_visual_dataset(path: Path | str) -> VisualDataset:
         )
     try:
         with input_path.open("rb") as handle:
-            with np.load(handle, allow_pickle=False) as loaded:
-                _require_exact_visual_array_names(loaded.files)
+            loaded = np.load(handle, allow_pickle=False)
+            if not isinstance(loaded, NpzFile):
+                raise ValueError(
+                    f"visual dataset must be an NPZ archive: {input_path}"
+                )
+            with loaded:
+                names = tuple(loaded.files)
+                _require_unique_npz_array_names(names, "visual dataset")
+                _require_exact_visual_array_names(names)
                 dataset = {
                     name: np.asarray(loaded[name])
                     for name in REQUIRED_VISUAL_ARRAYS
                 }
-    except (EOFError, zipfile.BadZipFile):
+    except (EOFError, zipfile.BadZipFile, zlib.error):
         raise ValueError(
             f"malformed visual dataset NPZ: {input_path}"
         ) from None

@@ -5,7 +5,12 @@ from unittest.mock import patch
 
 import numpy as np
 
-from tests.visual_fixtures import clone_arrays, make_transition_source
+from tests.visual_fixtures import (
+    append_duplicate_npz_array,
+    clone_arrays,
+    corrupt_compressed_npz_member,
+    make_transition_source,
+)
 from world_model_lab.car_env import CarEnv
 from world_model_lab.visual_dataset import (
     REQUIRED_VISUAL_ARRAYS,
@@ -82,6 +87,45 @@ class VisualSourceValidationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "missing.npz"
             with self.assertRaisesRegex(FileNotFoundError, "regular file"):
+                load_transition_dataset(path)
+
+    def test_numeric_npy_is_rejected_as_non_npz_transition_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "numeric.npy"
+            np.save(path, np.arange(4, dtype=np.int64))
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "transition dataset must be an NPZ archive",
+            ):
+                load_transition_dataset(path)
+
+    def test_duplicate_transition_member_is_rejected_before_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "duplicate-source.npz"
+            np.savez_compressed(path, **self.source)
+            append_duplicate_npz_array(
+                path,
+                "actions",
+                np.full_like(self.source["actions"], 99.0),
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "transition dataset has duplicate arrays: actions",
+            ):
+                load_transition_dataset(path)
+
+    def test_corrupted_transition_member_is_reported_as_malformed_npz(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "corrupted-source.npz"
+            np.savez_compressed(path, **self.source)
+            corrupt_compressed_npz_member(path, "states")
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "malformed transition dataset NPZ",
+            ):
                 load_transition_dataset(path)
 
     def test_loader_normalizes_valid_integer_ids_to_int64(self):
@@ -494,6 +538,45 @@ class VisualArtifactTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "malformed-visual.npz"
             path.write_bytes(b"PK\x03\x04garbage")
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "malformed visual dataset NPZ",
+            ):
+                load_visual_dataset(path)
+
+    def test_numeric_npy_is_rejected_as_non_npz_visual_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "numeric.npy"
+            np.save(path, np.arange(4, dtype=np.int64))
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "visual dataset must be an NPZ archive",
+            ):
+                load_visual_dataset(path)
+
+    def test_duplicate_visual_member_is_rejected_before_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "duplicate-visual.npz"
+            np.savez_compressed(path, **self.dataset)
+            append_duplicate_npz_array(
+                path,
+                "states",
+                self.dataset["states"],
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "visual dataset has duplicate arrays: states",
+            ):
+                load_visual_dataset(path)
+
+    def test_corrupted_visual_member_is_reported_as_malformed_npz(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "corrupted-visual.npz"
+            np.savez_compressed(path, **self.dataset)
+            corrupt_compressed_npz_member(path, "states")
 
             with self.assertRaisesRegex(
                 ValueError,

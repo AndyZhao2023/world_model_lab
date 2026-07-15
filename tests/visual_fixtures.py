@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import io
+from pathlib import Path
+import warnings
+import zipfile
+
 import numpy as np
 
 from world_model_lab.car_env import CarEnv
@@ -74,3 +79,39 @@ def clone_arrays(
     arrays: dict[str, np.ndarray],
 ) -> dict[str, np.ndarray]:
     return {name: values.copy() for name, values in arrays.items()}
+
+
+def append_duplicate_npz_array(
+    path: Path,
+    name: str,
+    values: np.ndarray,
+) -> None:
+    payload = io.BytesIO()
+    np.save(payload, values, allow_pickle=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(path, mode="a") as archive:
+            archive.writestr(f"{name}.npy", payload.getvalue())
+
+
+def corrupt_compressed_npz_member(path: Path, name: str) -> None:
+    with zipfile.ZipFile(path) as archive:
+        member = archive.getinfo(f"{name}.npy")
+    if member.compress_type != zipfile.ZIP_DEFLATED:
+        raise AssertionError(f"{name} is not DEFLATE-compressed")
+    with path.open("r+b") as handle:
+        handle.seek(member.header_offset)
+        header = handle.read(30)
+        if header[:4] != b"PK\x03\x04":
+            raise AssertionError(f"{name} has an invalid local ZIP header")
+        filename_length = int.from_bytes(header[26:28], "little")
+        extra_length = int.from_bytes(header[28:30], "little")
+        data_offset = (
+            member.header_offset + 30 + filename_length + extra_length
+        )
+        handle.seek(data_offset)
+        first_byte = handle.read(1)
+        if not first_byte:
+            raise AssertionError(f"{name} has no compressed payload")
+        handle.seek(data_offset)
+        handle.write(bytes([first_byte[0] ^ 0xFF]))
