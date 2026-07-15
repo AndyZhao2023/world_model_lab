@@ -1,8 +1,10 @@
+import gc
 import io
 import json
 import sys
 import tempfile
 import unittest
+import weakref
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -10,7 +12,7 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image, ImageSequence
 
-from tests.visual_fixtures import make_transition_source
+from tests.visual_fixtures import clone_arrays, make_transition_source
 from world_model_lab import build_visual_data
 from world_model_lab.build_visual_data import (
     run_visual_data_build,
@@ -59,6 +61,17 @@ class BuildVisualDataTest(unittest.TestCase):
         ):
             self.assertIn(flag, help_text)
 
+    def test_readme_documents_schema_v1_source_provenance_boundary(self):
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("`CarEnv` 和 `collect_transitions`", readme)
+        self.assertIn(
+            "`transitions.npz` 不保存场景或 `dt` provenance",
+            readme,
+        )
+        self.assertIn("`world_bounds`、障碍物/目标、各类半径或 `dt`", readme)
+        self.assertIn("不得转换为 schema version 1", readme)
+
     def test_cli_prints_sorted_indented_json_without_nan(self):
         standard_output = io.StringIO()
         returned = {"z": 1, "a": 2}
@@ -106,6 +119,74 @@ class BuildVisualDataTest(unittest.TestCase):
         self.assertEqual(context.exception.code, 2)
         self.assertIn("not a regular file", standard_error.getvalue())
 
+    def test_malformed_source_becomes_argument_error_without_traceback(self):
+        standard_error = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "malformed.npz"
+            output = root / "visual.npz"
+            preview = root / "preview.gif"
+            source.write_bytes(b"PK\x03\x04garbage")
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "world-model-build-visual-data",
+                    "--data",
+                    str(source),
+                    "--output",
+                    str(output),
+                    "--preview",
+                    str(preview),
+                ],
+            ):
+                with redirect_stderr(standard_error):
+                    with self.assertRaises(SystemExit) as context:
+                        build_visual_data.main()
+
+            self.assertFalse(output.exists())
+            self.assertFalse(preview.exists())
+
+        self.assertEqual(context.exception.code, 2)
+        self.assertIn(
+            "malformed transition dataset NPZ",
+            standard_error.getvalue(),
+        )
+        self.assertNotIn("Traceback", standard_error.getvalue())
+
+    def test_unrepresentable_episode_id_is_clean_argument_error(self):
+        standard_error = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.npz"
+            arrays = clone_arrays(make_transition_source())
+            arrays["episode_ids"] = arrays["episode_ids"].astype(np.uint64)
+            arrays["episode_ids"][0] = np.uint64(2**63)
+            np.savez_compressed(source, **arrays)
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "world-model-build-visual-data",
+                    "--data",
+                    str(source),
+                    "--output",
+                    str(root / "visual.npz"),
+                    "--preview",
+                    str(root / "preview.gif"),
+                ],
+            ):
+                with redirect_stderr(standard_error):
+                    with self.assertRaises(SystemExit) as context:
+                        build_visual_data.main()
+
+        self.assertEqual(context.exception.code, 2)
+        self.assertIn(
+            "episode_ids values must fit in int64",
+            standard_error.getvalue(),
+        )
+        self.assertNotIn("Traceback", standard_error.getvalue())
+
     def test_resolved_paths_must_be_pairwise_distinct(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -126,6 +207,60 @@ class BuildVisualDataTest(unittest.TestCase):
                     output_path=same_artifact,
                     preview_path=same_artifact,
                 )
+
+    def test_case_only_prospective_targets_are_rejected_before_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.npz"
+            output = root / "Artifact.bin"
+            preview = root / "artifact.BIN"
+            save_source(source)
+
+            with self.assertRaisesRegex(ValueError, "pairwise distinct"):
+                run_visual_data_build(
+                    data_path=source,
+                    output_path=output,
+                    preview_path=preview,
+                )
+
+            self.assertFalse(output.exists())
+            self.assertFalse(preview.exists())
+
+    def test_nfc_nfd_prospective_targets_are_rejected_before_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.npz"
+            output = root / "artifact-\u00e9.bin"
+            preview = root / "artifact-e\u0301.bin"
+            save_source(source)
+
+            with self.assertRaisesRegex(ValueError, "pairwise distinct"):
+                run_visual_data_build(
+                    data_path=source,
+                    output_path=output,
+                    preview_path=preview,
+                )
+
+            self.assertFalse(output.exists())
+            self.assertFalse(preview.exists())
+
+    def test_normalized_prospective_ancestor_is_rejected_before_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.npz"
+            output = root / "Caf\u00e9"
+            preview = root / "cafe\u0301" / "preview.gif"
+            save_source(source)
+
+            with self.assertRaisesRegex(ValueError, "ancestor"):
+                run_visual_data_build(
+                    data_path=source,
+                    output_path=output,
+                    preview_path=preview,
+                )
+
+            self.assertFalse(output.exists())
+            self.assertFalse(preview.exists())
 
     def test_existing_output_or_preview_fails_before_any_write(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -288,6 +423,67 @@ class BuildVisualDataTest(unittest.TestCase):
                 second_preview.read_bytes(),
             )
 
+    def test_gif_encoder_failure_leaves_no_final_or_temporary_file(self):
+        dataset = build_visual_dataset(make_transition_source())
+
+        def fail_after_partial_write(image, handle, *args, **kwargs):
+            del image, args, kwargs
+            handle.write(b"partial-gif")
+            handle.flush()
+            raise OSError("injected GIF encoder failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            preview = root / "preview.gif"
+            with patch.object(
+                Image.Image,
+                "save",
+                new=fail_after_partial_write,
+            ):
+                with self.assertRaisesRegex(OSError, "injected GIF"):
+                    write_preview_gif(dataset, preview, episode_id=7)
+
+            self.assertFalse(preview.exists())
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_atomic_gif_preserves_normal_file_creation_mode(self):
+        dataset = build_visual_dataset(make_transition_source())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reference = root / "reference.bin"
+            reference.open("xb").close()
+            preview = root / "preview.gif"
+
+            write_preview_gif(dataset, preview, episode_id=7)
+
+            self.assertEqual(
+                preview.stat().st_mode & 0o777,
+                reference.stat().st_mode & 0o777,
+            )
+
+    def test_gif_publish_race_preserves_existing_final_file(self):
+        dataset = build_visual_dataset(make_transition_source())
+        original_save = Image.Image.save
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            preview = root / "preview.gif"
+
+            def create_racing_final(image, handle, *args, **kwargs):
+                preview.write_bytes(b"racing-writer")
+                return original_save(image, handle, *args, **kwargs)
+
+            with patch.object(
+                Image.Image,
+                "save",
+                new=create_racing_final,
+            ):
+                with self.assertRaises(FileExistsError):
+                    write_preview_gif(dataset, preview, episode_id=7)
+
+            self.assertEqual(preview.read_bytes(), b"racing-writer")
+            self.assertEqual(set(root.iterdir()), {preview})
+
     def test_gif_preserves_identical_logical_frames_without_pixel_changes(self):
         dataset = build_visual_dataset(make_transition_source())
         episode_index = int(np.flatnonzero(dataset["episode_ids"] == 7)[0])
@@ -366,3 +562,85 @@ class BuildVisualDataTest(unittest.TestCase):
             "preview episode is unavailable: 999",
             standard_error.getvalue(),
         )
+
+    def test_releases_source_and_built_arrays_before_persisted_reload(self):
+        references: dict[str, weakref.ReferenceType[np.ndarray]] = {}
+
+        def fake_load_transitions(path):
+            del path
+            sentinel = np.empty((1,), dtype=np.uint8)
+            references["transitions"] = weakref.ref(sentinel)
+            return {"sentinel": sentinel}
+
+        def fake_build_visual(transitions):
+            self.assertIsNotNone(references["transitions"]())
+            self.assertIn("sentinel", transitions)
+            sentinel = np.empty((1,), dtype=np.uint8)
+            references["visual"] = weakref.ref(sentinel)
+            return {
+                "episode_ids": np.asarray([7], dtype=np.int64),
+                "transition_offsets": np.asarray([0, 1], dtype=np.int64),
+                "sentinel": sentinel,
+            }
+
+        def fake_save_visual(dataset, path):
+            self.assertIsNotNone(references["visual"]())
+            self.assertIn("sentinel", dataset)
+            Path(path).write_bytes(b"npz")
+
+        def fake_write_preview(dataset, path, *, episode_id):
+            self.assertIsNotNone(references["visual"]())
+            self.assertIn("sentinel", dataset)
+            Path(path).write_bytes(b"gif")
+            return episode_id
+
+        def fake_load_persisted(path):
+            del path
+            gc.collect()
+            self.assertIsNone(references["transitions"]())
+            self.assertIsNone(references["visual"]())
+            return {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.npz"
+            source.write_bytes(b"source")
+            with (
+                patch.object(
+                    build_visual_data,
+                    "load_transition_dataset",
+                    new=fake_load_transitions,
+                ),
+                patch.object(
+                    build_visual_data,
+                    "build_visual_dataset",
+                    new=fake_build_visual,
+                ),
+                patch.object(
+                    build_visual_data,
+                    "save_visual_dataset",
+                    new=fake_save_visual,
+                ),
+                patch.object(
+                    build_visual_data,
+                    "write_preview_gif",
+                    new=fake_write_preview,
+                ),
+                patch.object(
+                    build_visual_data,
+                    "load_visual_dataset",
+                    new=fake_load_persisted,
+                ),
+                patch.object(
+                    build_visual_data,
+                    "summarize_visual_dataset",
+                    new=lambda dataset: {"released": dataset == {}},
+                ),
+            ):
+                summary = run_visual_data_build(
+                    data_path=source,
+                    output_path=root / "visual.npz",
+                    preview_path=root / "preview.gif",
+                )
+
+        self.assertTrue(summary["released"])

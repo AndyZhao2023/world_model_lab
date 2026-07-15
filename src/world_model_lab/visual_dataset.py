@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable, Mapping
 
 import numpy as np
 
+from ._artifact_io import write_new_file_atomically
 from .car_env import CarEnv
 from .visual_observation import (
     IMAGE_SIZE,
@@ -86,16 +88,29 @@ def load_transition_dataset(path: Path | str) -> TransitionDataset:
         raise FileNotFoundError(
             f"transition dataset is not a regular file: {source_path}"
         )
-    with np.load(source_path, allow_pickle=False) as loaded:
-        missing = set(REQUIRED_SOURCE_ARRAYS) - set(loaded.files)
-        if missing:
-            names = ", ".join(sorted(missing))
-            raise ValueError(f"transition dataset is missing arrays: {names}")
-        source = {
-            name: np.asarray(loaded[name])
-            for name in REQUIRED_SOURCE_ARRAYS
-        }
+    try:
+        with source_path.open("rb") as handle:
+            with np.load(handle, allow_pickle=False) as loaded:
+                missing = set(REQUIRED_SOURCE_ARRAYS) - set(loaded.files)
+                if missing:
+                    names = ", ".join(sorted(missing))
+                    raise ValueError(
+                        f"transition dataset is missing arrays: {names}"
+                    )
+                source = {
+                    name: np.asarray(loaded[name])
+                    for name in REQUIRED_SOURCE_ARRAYS
+                }
+    except (EOFError, zipfile.BadZipFile):
+        raise ValueError(
+            f"malformed transition dataset NPZ: {source_path}"
+        ) from None
     reconstruct_episodes(source)
+    source["episode_ids"] = np.asarray(
+        source["episode_ids"],
+        dtype=np.int64,
+    )
+    source["step_ids"] = np.asarray(source["step_ids"], dtype=np.int64)
     return source
 
 
@@ -113,6 +128,23 @@ def _require_numeric_shape(
     if not np.all(np.isfinite(numeric)):
         raise ValueError(f"{name} must contain only finite values")
     return numeric
+
+
+def _require_int64_vector(
+    source: Mapping[str, np.ndarray],
+    name: str,
+    count: int,
+) -> np.ndarray:
+    values = np.asarray(source[name])
+    if values.shape != (count,) or values.dtype.kind not in "iu":
+        raise ValueError(f"{name} must be an integer array with shape [N]")
+    int64_info = np.iinfo(np.int64)
+    if (
+        int(values.min()) < int64_info.min
+        or int(values.max()) > int64_info.max
+    ):
+        raise ValueError(f"{name} values must fit in int64")
+    return np.asarray(values, dtype=np.int64)
 
 
 def reconstruct_episodes(
@@ -141,11 +173,8 @@ def reconstruct_episodes(
     if dones.shape != (count,) or dones.dtype.kind != "b":
         raise ValueError("dones must be a boolean array with shape [N]")
 
-    episode_ids = np.asarray(source["episode_ids"])
-    step_ids = np.asarray(source["step_ids"])
-    for name, values in (("episode_ids", episode_ids), ("step_ids", step_ids)):
-        if values.shape != (count,) or values.dtype.kind not in "iu":
-            raise ValueError(f"{name} must be an integer array with shape [N]")
+    episode_ids = _require_int64_vector(source, "episode_ids", count)
+    step_ids = _require_int64_vector(source, "step_ids", count)
 
     terminal_reasons = np.asarray(source["terminal_reasons"])
     if terminal_reasons.shape != (count,) or terminal_reasons.dtype.kind != "U":
@@ -248,13 +277,38 @@ def _require_dtype(
     return values
 
 
+def _require_exact_visual_array_names(names: Iterable[str]) -> None:
+    actual = set(names)
+    required = set(REQUIRED_VISUAL_ARRAYS)
+    unknown = actual - required
+    if unknown:
+        listed = ", ".join(sorted(unknown))
+        raise ValueError(f"visual dataset has unknown arrays: {listed}")
+    missing = required - actual
+    if missing:
+        listed = ", ".join(sorted(missing))
+        raise ValueError(f"visual dataset is missing arrays: {listed}")
+
+
+def _require_exact_offsets(
+    values: np.ndarray,
+    count: int,
+    message: str,
+) -> None:
+    if (
+        values[0] != 0
+        or values[-1] != count
+        or np.any(values < 0)
+        or np.any(values > count)
+        or not np.all(values[1:] > values[:-1])
+    ):
+        raise ValueError(message)
+
+
 def validate_visual_dataset(dataset: Mapping[str, np.ndarray]) -> None:
     """Reject unsupported, malformed, or misaligned visual artifacts."""
 
-    missing = set(REQUIRED_VISUAL_ARRAYS) - set(dataset)
-    if missing:
-        names = ", ".join(sorted(missing))
-        raise ValueError(f"visual dataset is missing arrays: {names}")
+    _require_exact_visual_array_names(dataset)
 
     schema_values = _require_dtype(dataset, "schema_version", np.int64)
     image_size_values = _require_dtype(dataset, "image_size", np.int64)
@@ -335,20 +389,16 @@ def validate_visual_dataset(dataset: Mapping[str, np.ndarray]) -> None:
         if not np.all(np.isfinite(values)):
             raise ValueError(f"{name} must contain only finite values")
 
-    if (
-        frame_offsets[0] != 0
-        or frame_offsets[-1] != frame_count
-        or np.any(np.diff(frame_offsets) <= 0)
-    ):
-        raise ValueError("frame_offsets must cover every frame exactly once")
-    if (
-        transition_offsets[0] != 0
-        or transition_offsets[-1] != transition_count
-        or np.any(np.diff(transition_offsets) <= 0)
-    ):
-        raise ValueError(
-            "transition_offsets must cover every transition exactly once"
-        )
+    _require_exact_offsets(
+        frame_offsets,
+        frame_count,
+        "frame_offsets must cover every frame exactly once",
+    )
+    _require_exact_offsets(
+        transition_offsets,
+        transition_count,
+        "transition_offsets must cover every transition exactly once",
+    )
 
     frame_lengths = np.diff(frame_offsets)
     transition_lengths = np.diff(transition_offsets)
@@ -557,15 +607,22 @@ def save_visual_dataset(
             f"visual dataset parent is not a directory: {path.parent}"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("xb") as handle:
+    arrays = {
+        name: np.asarray(dataset[name])
+        for name in REQUIRED_VISUAL_ARRAYS
+    }
+
+    def write_npz(handle) -> None:
         np.savez_compressed(
             handle,
-            **{
-                name: np.asarray(values)
-                for name, values in dataset.items()
-            },
+            **arrays,
         )
-    return path
+
+    return write_new_file_atomically(
+        path,
+        writer=write_npz,
+        exists_message=f"visual dataset already exists: {path}",
+    )
 
 
 def load_visual_dataset(path: Path | str) -> VisualDataset:
@@ -576,14 +633,17 @@ def load_visual_dataset(path: Path | str) -> VisualDataset:
         raise FileNotFoundError(
             f"visual dataset is not a regular file: {input_path}"
         )
-    with np.load(input_path, allow_pickle=False) as loaded:
-        missing = set(REQUIRED_VISUAL_ARRAYS) - set(loaded.files)
-        if missing:
-            names = ", ".join(sorted(missing))
-            raise ValueError(f"visual dataset is missing arrays: {names}")
-        dataset = {
-            name: np.asarray(loaded[name])
-            for name in loaded.files
-        }
+    try:
+        with input_path.open("rb") as handle:
+            with np.load(handle, allow_pickle=False) as loaded:
+                _require_exact_visual_array_names(loaded.files)
+                dataset = {
+                    name: np.asarray(loaded[name])
+                    for name in REQUIRED_VISUAL_ARRAYS
+                }
+    except (EOFError, zipfile.BadZipFile):
+        raise ValueError(
+            f"malformed visual dataset NPZ: {input_path}"
+        ) from None
     validate_visual_dataset(dataset)
     return dataset

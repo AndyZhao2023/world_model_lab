@@ -1,12 +1,14 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
 from tests.visual_fixtures import clone_arrays, make_transition_source
 from world_model_lab.car_env import CarEnv
 from world_model_lab.visual_dataset import (
+    REQUIRED_VISUAL_ARRAYS,
     build_visual_dataset,
     load_transition_dataset,
     load_visual_dataset,
@@ -82,6 +84,30 @@ class VisualSourceValidationTest(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "regular file"):
                 load_transition_dataset(path)
 
+    def test_loader_normalizes_valid_integer_ids_to_int64(self):
+        source = clone_arrays(self.source)
+        source["episode_ids"] = source["episode_ids"].astype(np.uint16)
+        source["step_ids"] = source["step_ids"].astype(np.uint16)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.npz"
+            np.savez_compressed(path, **source)
+
+            loaded = load_transition_dataset(path)
+
+        self.assertEqual(loaded["episode_ids"].dtype, np.dtype(np.int64))
+        self.assertEqual(loaded["step_ids"].dtype, np.dtype(np.int64))
+
+    def test_malformed_transition_npz_is_reported_as_value_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "malformed-source.npz"
+            path.write_bytes(b"PK\x03\x04garbage")
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "malformed transition dataset NPZ",
+            ):
+                load_transition_dataset(path)
+
     def test_missing_required_array_names_the_array(self):
         source = clone_arrays(self.source)
         source.pop("actions")
@@ -108,6 +134,28 @@ class VisualSourceValidationTest(unittest.TestCase):
         source["step_ids"] = source["step_ids"].astype(np.float64)
 
         with self.assertRaisesRegex(ValueError, "step_ids.*integer"):
+            reconstruct_episodes(source)
+
+    def test_episode_ids_must_fit_int64_before_canonicalization(self):
+        source = clone_arrays(self.source)
+        source["episode_ids"] = source["episode_ids"].astype(np.uint64)
+        source["episode_ids"][0] = np.uint64(2**63)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "episode_ids values must fit in int64",
+        ):
+            reconstruct_episodes(source)
+
+    def test_step_ids_must_fit_int64_before_canonicalization(self):
+        source = clone_arrays(self.source)
+        source["step_ids"] = source["step_ids"].astype(np.uint64)
+        source["step_ids"][0] = np.uint64(2**63)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "step_ids values must fit in int64",
+        ):
             reconstruct_episodes(source)
 
     def test_duplicate_missing_or_negative_steps_are_rejected(self):
@@ -315,6 +363,123 @@ class VisualArtifactTest(unittest.TestCase):
 
             self.assertEqual(path.read_bytes(), before)
 
+    def test_atomic_npz_preserves_normal_file_creation_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reference = root / "reference.bin"
+            reference.open("xb").close()
+            path = root / "visual-episodes.npz"
+
+            save_visual_dataset(self.dataset, path)
+
+            self.assertEqual(
+                path.stat().st_mode & 0o777,
+                reference.stat().st_mode & 0o777,
+            )
+
+    def test_validator_rejects_unknown_fields_in_stable_order(self):
+        broken = clone_arrays(self.dataset)
+        broken["z_extra"] = np.asarray(1, dtype=np.int64)
+        broken["a_extra"] = np.asarray(object(), dtype=object)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "visual dataset has unknown arrays: a_extra, z_extra",
+        ):
+            validate_visual_dataset(broken)
+
+    def test_loader_rejects_unknown_archive_arrays_before_loading_values(self):
+        extras = (
+            ("numeric_extra", np.asarray(1, dtype=np.int64)),
+            ("object_extra", np.asarray(object(), dtype=object)),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, values in extras:
+                with self.subTest(name=name):
+                    path = root / f"{name}.npz"
+                    archive = clone_arrays(self.dataset)
+                    archive[name] = values
+                    np.savez_compressed(path, **archive)
+
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        f"visual dataset has unknown arrays: {name}",
+                    ):
+                        load_visual_dataset(path)
+
+    def test_save_rejects_object_extra_without_creating_artifact(self):
+        broken = clone_arrays(self.dataset)
+        broken["object_extra"] = np.asarray(object(), dtype=object)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "visual-episodes.npz"
+            with self.assertRaisesRegex(
+                ValueError,
+                "visual dataset has unknown arrays: object_extra",
+            ):
+                save_visual_dataset(broken, path)
+
+            self.assertFalse(path.exists())
+
+    def test_save_uses_required_archive_order_for_identical_bytes(self):
+        reversed_dataset = {
+            name: self.dataset[name]
+            for name in reversed(REQUIRED_VISUAL_ARRAYS)
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.npz"
+            second = root / "second.npz"
+            save_visual_dataset(self.dataset, first)
+            save_visual_dataset(reversed_dataset, second)
+
+            with np.load(second, allow_pickle=False) as loaded:
+                self.assertEqual(loaded.files, list(REQUIRED_VISUAL_ARRAYS))
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def test_npz_encoder_failure_leaves_no_final_or_temporary_file(self):
+        def fail_after_partial_write(handle, *args, **kwargs):
+            del args, kwargs
+            handle.write(b"partial-npz")
+            handle.flush()
+            raise OSError("injected NPZ encoder failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "visual-episodes.npz"
+            with patch(
+                "world_model_lab.visual_dataset.np.savez_compressed",
+                side_effect=fail_after_partial_write,
+            ):
+                with self.assertRaisesRegex(OSError, "injected NPZ"):
+                    save_visual_dataset(self.dataset, path)
+
+            self.assertFalse(path.exists())
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_npz_publish_race_preserves_existing_final_file(self):
+        original_save = np.savez_compressed
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "visual-episodes.npz"
+
+            def create_racing_final(handle, *args, **kwargs):
+                path.write_bytes(b"racing-writer")
+                return original_save(handle, *args, **kwargs)
+
+            with patch(
+                "world_model_lab.visual_dataset.np.savez_compressed",
+                side_effect=create_racing_final,
+            ):
+                with self.assertRaises(FileExistsError):
+                    save_visual_dataset(self.dataset, path)
+
+            self.assertEqual(path.read_bytes(), b"racing-writer")
+            self.assertEqual(set(root.iterdir()), {path})
+
     def test_loader_uses_allow_pickle_false(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "unsafe-visual.npz"
@@ -323,6 +488,17 @@ class VisualArtifactTest(unittest.TestCase):
             np.savez_compressed(path, **unsafe)
 
             with self.assertRaisesRegex(ValueError, "Object arrays"):
+                load_visual_dataset(path)
+
+    def test_malformed_visual_npz_is_reported_as_value_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "malformed-visual.npz"
+            path.write_bytes(b"PK\x03\x04garbage")
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "malformed visual dataset NPZ",
+            ):
                 load_visual_dataset(path)
 
     def test_missing_visual_field_is_rejected(self):
@@ -384,6 +560,31 @@ class VisualArtifactTest(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError,
             "episode 3 must own T plus one frames",
+        ):
+            validate_visual_dataset(broken)
+
+    def test_offset_checks_reject_modular_overflow_before_slicing(self):
+        broken = clone_arrays(self.dataset)
+        broken["actions"] = broken["actions"][:4]
+        broken["rewards"] = broken["rewards"][:4]
+        broken["dones"] = np.zeros((4,), dtype=np.bool_)
+        broken["terminal_reasons"] = np.asarray(
+            ["", "", "", ""],
+            dtype=broken["terminal_reasons"].dtype,
+        )
+        broken["episode_ids"] = np.arange(4, dtype=np.int64)
+        broken["frame_offsets"] = np.asarray(
+            [0, 2**62 + 2, -(2**63) + 4, -(2**62) + 6, 8],
+            dtype=np.int64,
+        )
+        broken["transition_offsets"] = np.asarray(
+            [0, 2**62 + 1, -(2**63) + 2, -(2**62) + 3, 4],
+            dtype=np.int64,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "frame_offsets must cover every frame exactly once",
         ):
             validate_visual_dataset(broken)
 
