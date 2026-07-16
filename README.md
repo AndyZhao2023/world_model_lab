@@ -238,6 +238,31 @@ print(sample["target_frame"].shape)     # (64, 64, 3)
 dynamics。`artifacts/visual_episode_preview.gif` 用于人工检查连续运动，
 不会进入训练。
 
+### 训练视觉潜变量基线
+
+第一个视觉 world model 分成两个可独立诊断的阶段：
+
+1. `ConvAutoencoder` 只从单帧学习低维 latent，并重建同一帧。
+2. 冻结 encoder 后，`LatentDynamicsMLP` 使用四个历史 latent、三条历史动作
+   和当前动作，预测下一帧的 latent；冻结 decoder 再把它还原成 RGB。
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
+  .venv/bin/python -m world_model_lab.train_visual_latent_model \
+  --data data/visual_episodes.npz \
+  --output artifacts/visual_latent_world_model.pt \
+  --preview artifacts/visual_latent_predictions.png
+```
+
+重新执行 editable install 后，也可以使用
+`.venv/bin/world-model-train-visual-latent`。checkpoint 同时保存两阶段权重、
+train-only latent/action normalizer、episode split、训练历史和 held-out
+指标；命令拒绝覆盖已有 checkpoint 或 preview。
+
+测试指标包含模型像素 MSE/MAE、`copy-last` 基线，以及只在真实发生变化的像素上
+计算的 MAE。preview 每行依次显示最后一帧、真实下一帧、预测下一帧和绝对误差。
+训练路径不读取 `states`，也不使用 reward/done；这一阶段暂不接入 MPC。
+
 ## 训练第一个 Learned World Model
 
 安装新增的 PyTorch 依赖：

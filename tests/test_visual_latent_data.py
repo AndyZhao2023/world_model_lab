@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+import unittest
+
+import numpy as np
+import torch
+
+from tests.test_visual_windows import make_visual_dataset
+from world_model_lab.visual_latent_data import (
+    LatentWindowArrays,
+    VisualFrameDataset,
+    build_latent_window_arrays,
+    encode_all_frames,
+    fit_safe_normalizer,
+    frame_indices_for_episode_ids,
+    frames_to_tensor,
+    transition_indices_for_episode_ids,
+)
+from world_model_lab.visual_latent_model import ConvAutoencoder
+from world_model_lab.visual_windows import build_visual_window_index
+
+
+class VisualFrameAdapterTest(unittest.TestCase):
+    def setUp(self):
+        self.visual = make_visual_dataset((5, 4, 2))
+
+    def test_frames_to_tensor_preserves_values_and_reorders_channels(self):
+        frames = np.zeros((2, 64, 64, 3), dtype=np.uint8)
+        frames[0, 1, 2] = [0, 127, 255]
+
+        tensor = frames_to_tensor(frames)
+        single = frames_to_tensor(frames[0])
+
+        self.assertEqual(tuple(tensor.shape), (2, 3, 64, 64))
+        self.assertEqual(tuple(single.shape), (3, 64, 64))
+        self.assertEqual(tensor.dtype, torch.float32)
+        torch.testing.assert_close(
+            tensor[0, :, 1, 2],
+            torch.tensor([0.0, 127.0 / 255.0, 1.0]),
+        )
+        self.assertGreaterEqual(float(tensor.min()), 0.0)
+        self.assertLessEqual(float(tensor.max()), 1.0)
+
+    def test_frames_to_tensor_rejects_wrong_dtype_or_shape(self):
+        invalid = (
+            np.zeros((2, 64, 64, 3), dtype=np.float32),
+            np.zeros((2, 32, 32, 3), dtype=np.uint8),
+            np.zeros((2, 64, 64, 1), dtype=np.uint8),
+            np.zeros((64, 64), dtype=np.uint8),
+        )
+        for values in invalid:
+            with self.subTest(shape=values.shape, dtype=values.dtype):
+                with self.assertRaises(ValueError):
+                    frames_to_tensor(values)
+
+    def test_frame_and_transition_indices_follow_selected_episode_order(self):
+        frame_indices = frame_indices_for_episode_ids(
+            self.visual,
+            np.asarray([11, 10], dtype=np.int64),
+        )
+        transition_indices = transition_indices_for_episode_ids(
+            self.visual,
+            np.asarray([11, 10], dtype=np.int64),
+        )
+
+        np.testing.assert_array_equal(
+            frame_indices,
+            np.concatenate((np.arange(6, 11), np.arange(0, 6))),
+        )
+        np.testing.assert_array_equal(
+            transition_indices,
+            np.concatenate((np.arange(5, 9), np.arange(0, 5))),
+        )
+
+    def test_selected_episode_ids_are_validated(self):
+        cases = (
+            np.asarray([], dtype=np.int64),
+            np.asarray([[10]], dtype=np.int64),
+            np.asarray([True]),
+            np.asarray([10.0]),
+            np.asarray([10, 10]),
+            np.asarray([99]),
+        )
+        for selected in cases:
+            with self.subTest(selected=selected):
+                with self.assertRaises(ValueError):
+                    frame_indices_for_episode_ids(self.visual, selected)
+
+    def test_frame_dataset_returns_owned_float_tensor_and_python_indexing(self):
+        dataset = VisualFrameDataset(
+            self.visual,
+            np.asarray([11, 10], dtype=np.int64),
+        )
+
+        first = dataset[0]
+        last = dataset[-1]
+
+        self.assertEqual(len(dataset), 11)
+        self.assertEqual(tuple(first.shape), (3, 64, 64))
+        self.assertEqual(first.dtype, torch.float32)
+        torch.testing.assert_close(
+            first,
+            frames_to_tensor(self.visual["frames"][6]),
+        )
+        torch.testing.assert_close(
+            last,
+            frames_to_tensor(self.visual["frames"][5]),
+        )
+        before = int(self.visual["frames"][6, 0, 0, 0])
+        first[0, 0, 0] = 1.0
+        self.assertEqual(int(self.visual["frames"][6, 0, 0, 0]), before)
+        for invalid in (slice(None), np.asarray([0]), 0.5, True):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(TypeError):
+                    dataset[invalid]
+
+
+class VisualLatentArrayTest(unittest.TestCase):
+    def setUp(self):
+        self.visual = make_visual_dataset((5, 4, 2))
+
+    def test_safe_normalizer_round_trips_and_handles_constant_features(self):
+        values = np.asarray([[1.0, 2.0], [1.0, 4.0]], dtype=np.float64)
+
+        normalizer = fit_safe_normalizer(values)
+        normalized = normalizer.normalize(values)
+
+        np.testing.assert_array_equal(normalizer.mean, [1.0, 3.0])
+        np.testing.assert_array_equal(normalizer.std, [1.0, 1.0])
+        self.assertTrue(np.all(np.isfinite(normalized)))
+        np.testing.assert_allclose(normalizer.denormalize(normalized), values)
+
+    def test_safe_normalizer_rejects_invalid_values(self):
+        cases = (
+            np.empty((0, 2)),
+            np.zeros((2, 2, 1)),
+            np.asarray([[np.nan, 1.0]]),
+        )
+        for values in cases:
+            with self.subTest(shape=values.shape):
+                with self.assertRaises(ValueError):
+                    fit_safe_normalizer(values)
+        with self.assertRaises(ValueError):
+            fit_safe_normalizer(np.zeros((2, 2)), minimum_std=0.0)
+
+    def test_latent_windows_follow_exact_frame_and_action_offsets(self):
+        latent_frames = np.arange(
+            self.visual["frames"].shape[0] * 3,
+            dtype=np.float32,
+        ).reshape(-1, 3)
+        index = build_visual_window_index(
+            self.visual,
+            np.asarray([10, 11], dtype=np.int64),
+        )
+
+        arrays = build_latent_window_arrays(
+            self.visual,
+            index,
+            latent_frames,
+        )
+
+        self.assertIsInstance(arrays, LatentWindowArrays)
+        self.assertEqual(arrays.count, 3)
+        np.testing.assert_array_equal(
+            arrays.context_latents[0],
+            latent_frames[0:4],
+        )
+        np.testing.assert_array_equal(
+            arrays.target_latents[0],
+            latent_frames[4],
+        )
+        np.testing.assert_array_equal(
+            arrays.history_actions[0],
+            self.visual["actions"][0:3],
+        )
+        np.testing.assert_array_equal(
+            arrays.current_actions[0],
+            self.visual["actions"][3],
+        )
+        self.assertEqual(
+            (
+                int(arrays.last_frame_indices[0]),
+                int(arrays.target_frame_indices[0]),
+                int(arrays.episode_ids[0]),
+                int(arrays.step_ids[0]),
+            ),
+            (3, 4, 10, 3),
+        )
+
+        second_episode = arrays.count - 1
+        frame_start = int(self.visual["frame_offsets"][1])
+        action_start = int(self.visual["transition_offsets"][1])
+        np.testing.assert_array_equal(
+            arrays.context_latents[second_episode],
+            latent_frames[frame_start : frame_start + 4],
+        )
+        np.testing.assert_array_equal(
+            arrays.history_actions[second_episode],
+            self.visual["actions"][action_start : action_start + 3],
+        )
+        self.assertEqual(int(arrays.episode_ids[second_episode]), 11)
+
+    def test_latent_windows_reject_wrong_or_non_finite_latents(self):
+        index = build_visual_window_index(
+            self.visual,
+            np.asarray([10, 11], dtype=np.int64),
+        )
+        count = self.visual["frames"].shape[0]
+        invalid = (
+            np.zeros((count - 1, 3), dtype=np.float32),
+            np.zeros((count, 3, 1), dtype=np.float32),
+            np.full((count, 3), np.nan, dtype=np.float32),
+        )
+        for latent_frames in invalid:
+            with self.subTest(shape=latent_frames.shape):
+                with self.assertRaises(ValueError):
+                    build_latent_window_arrays(
+                        self.visual,
+                        index,
+                        latent_frames,
+                    )
+
+    def test_encode_all_frames_returns_one_finite_latent_per_frame(self):
+        model = ConvAutoencoder(latent_dim=5, base_channels=2)
+
+        latents = encode_all_frames(
+            model,
+            self.visual["frames"],
+            batch_size=4,
+        )
+
+        self.assertEqual(
+            latents.shape,
+            (self.visual["frames"].shape[0], 5),
+        )
+        self.assertEqual(latents.dtype, np.dtype(np.float32))
+        self.assertTrue(np.all(np.isfinite(latents)))
+        self.assertFalse(model.training)
+
+
+if __name__ == "__main__":
+    unittest.main()
