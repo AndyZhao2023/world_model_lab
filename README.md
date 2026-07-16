@@ -207,6 +207,33 @@ schema version 1 只适用于由未修改的默认 `CarEnv` 和 `collect_transit
 `actions[t-3:t]` 包含三条历史动作；切片不可跨越 `frame_offsets` /
 `transition_offsets` 定义的 episode 边界。
 
+### 构造视觉训练窗口
+
+训练前先按完整 episode 划分数据，再在每个 split 内构造窗口：
+
+```python
+from world_model_lab.visual_dataset import load_visual_dataset
+from world_model_lab.visual_windows import build_visual_window_splits
+
+visual = load_visual_dataset("data/visual_episodes.npz")
+splits = build_visual_window_splits(visual, seed=42)
+train = splits["train"]
+sample = train[0]
+
+print(sample["context_frames"].shape)   # (4, 64, 64, 3)
+print(sample["history_actions"].shape)  # (3, 2)
+print(sample["current_action"].shape)   # (2,)
+print(sample["target_frame"].shape)     # (64, 64, 3)
+```
+
+窗口层只保存 episode 和时间索引，读取样本时才复制对应图像，因此不会把
+四帧历史预先复制数千次。图像保持 `uint8 NHWC`，动作保持 `float64`；除以
+255、转换为 `float32` 和变换到 PyTorch 的 `NCHW` 都属于后续模型适配层。
+
+`train.index.selected_episode_ids` 记录实际训练 episode；validation 和 test
+拥有互斥的 ID 集合。短于四个 transition 的 episode 会记录在
+`skipped_episode_ids` 中，不会进行填充，也不会跨 episode 拼接窗口。
+
 这一步只生成和验证视觉观测数据，不训练 autoencoder、VAE 或 latent
 dynamics。`artifacts/visual_episode_preview.gif` 用于人工检查连续运动，
 不会进入训练。
