@@ -259,9 +259,11 @@ MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
 train-only latent/action normalizer、episode split、训练历史和 held-out
 指标；命令拒绝覆盖已有 checkpoint 或 preview。
 
-测试指标包含模型像素 MSE/MAE、`copy-last` 基线，以及只在真实发生变化的像素上
-计算的 MAE。preview 每行依次显示最后一帧、真实下一帧、预测下一帧和绝对误差。
-训练路径不读取 `states`，也不使用 reward/done；这一阶段暂不接入 MPC。
+测试指标包含模型像素 MSE/MAE、`copy-last` 基线、把真实目标 latent 直接送入
+decoder 的 `oracle reconstruction`，以及只在真实发生变化的像素上计算的 MAE。
+Oracle 用来区分 autoencoder 重建误差和 latent dynamics 预测误差。preview 每行
+依次显示最后一帧、真实下一帧、Oracle 重建及其误差、模型预测及其误差。训练路径
+不读取 `states`，也不使用 reward/done；这一阶段暂不接入 MPC。
 
 ## 训练第一个 Learned World Model
 

@@ -438,10 +438,13 @@ def evaluate_latent_dynamics(
     latent_value_count = 0
     pixel_squared_error_sum = 0.0
     pixel_absolute_error_sum = 0.0
+    oracle_squared_error_sum = 0.0
+    oracle_absolute_error_sum = 0.0
     copy_squared_error_sum = 0.0
     copy_absolute_error_sum = 0.0
     pixel_value_count = 0
     changed_absolute_error_sum = 0.0
+    oracle_changed_absolute_error_sum = 0.0
     copy_changed_absolute_error_sum = 0.0
     changed_pixel_count = 0
 
@@ -471,6 +474,11 @@ def evaluate_latent_dynamics(
                 predicted_normalized,
                 latent_normalizer,
             )
+            oracle_reconstructions = _decode_normalized_latents(
+                autoencoder,
+                target_normalized,
+                latent_normalizer,
+            )
             target_frames = frames_to_tensor(
                 frames[arrays.target_frame_indices[start:stop]]
             )
@@ -478,9 +486,16 @@ def evaluate_latent_dynamics(
                 frames[arrays.last_frame_indices[start:stop]]
             )
             errors = predictions - target_frames
+            oracle_errors = oracle_reconstructions - target_frames
             copy_errors = last_frames - target_frames
             pixel_squared_error_sum += float(torch.sum(torch.square(errors)))
             pixel_absolute_error_sum += float(torch.sum(torch.abs(errors)))
+            oracle_squared_error_sum += float(
+                torch.sum(torch.square(oracle_errors))
+            )
+            oracle_absolute_error_sum += float(
+                torch.sum(torch.abs(oracle_errors))
+            )
             copy_squared_error_sum += float(
                 torch.sum(torch.square(copy_errors))
             )
@@ -498,6 +513,9 @@ def evaluate_latent_dynamics(
                 changed_absolute_error_sum += float(
                     torch.sum(torch.abs(errors)[changed_values])
                 )
+                oracle_changed_absolute_error_sum += float(
+                    torch.sum(torch.abs(oracle_errors)[changed_values])
+                )
                 copy_changed_absolute_error_sum += float(
                     torch.sum(torch.abs(copy_errors)[changed_values])
                 )
@@ -508,6 +526,11 @@ def evaluate_latent_dynamics(
     changed_value_count = changed_pixel_count * 3
     changed_pixel_mae = (
         changed_absolute_error_sum / changed_value_count
+        if changed_value_count
+        else 0.0
+    )
+    oracle_changed_pixel_mae = (
+        oracle_changed_absolute_error_sum / changed_value_count
         if changed_value_count
         else 0.0
     )
@@ -526,6 +549,15 @@ def evaluate_latent_dynamics(
         "psnr_db": 10.0 * math.log10(1.0 / max(pixel_mse, 1e-12)),
         "changed_pixel_mae": changed_pixel_mae,
         "changed_pixel_count": changed_pixel_count,
+        "oracle_reconstruction_pixel_mse": (
+            oracle_squared_error_sum / pixel_value_count
+        ),
+        "oracle_reconstruction_pixel_mae": (
+            oracle_absolute_error_sum / pixel_value_count
+        ),
+        "oracle_reconstruction_changed_pixel_mae": (
+            oracle_changed_pixel_mae
+        ),
         "copy_last_pixel_mse": copy_squared_error_sum / pixel_value_count,
         "copy_last_pixel_mae": copy_absolute_error_sum / pixel_value_count,
         "copy_last_changed_pixel_mae": copy_changed_pixel_mae,
@@ -825,7 +857,7 @@ def plot_visual_latent_predictions(
     dynamics.eval()
     autoencoder.eval()
     with torch.no_grad():
-        predicted_normalized, _ = _predict_normalized_latents(
+        predicted_normalized, target_normalized = _predict_normalized_latents(
             dynamics,
             arrays,
             latent_normalizer=latent_normalizer,
@@ -843,21 +875,39 @@ def plot_visual_latent_predictions(
             .cpu()
             .numpy()
         )
+        oracle = (
+            _decode_normalized_latents(
+                autoencoder,
+                target_normalized,
+                latent_normalizer,
+            )
+            .permute(0, 2, 3, 1)
+            .cpu()
+            .numpy()
+        )
     last = frames[arrays.last_frame_indices[:row_count]].astype(np.float32) / 255.0
     target = (
         frames[arrays.target_frame_indices[:row_count]].astype(np.float32)
         / 255.0
     )
+    oracle_errors = np.abs(oracle - target)
     errors = np.abs(predicted - target)
 
     figure, axes = plt.subplots(
         row_count,
-        4,
-        figsize=(10, 2.4 * row_count),
+        6,
+        figsize=(15, 2.4 * row_count),
         squeeze=False,
     )
-    titles = ("Last context", "Target", "Predicted", "Absolute error")
-    columns = (last, target, predicted, errors)
+    titles = (
+        "Last context",
+        "Target",
+        "Oracle reconstruction",
+        "Oracle error",
+        "Predicted",
+        "Prediction error",
+    )
+    columns = (last, target, oracle, oracle_errors, predicted, errors)
     for row in range(row_count):
         for column, values in enumerate(columns):
             axis = axes[row, column]

@@ -206,9 +206,64 @@ class VisualLatentDynamicsTrainingTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["pixel_mse"], 0.25)
         self.assertAlmostEqual(metrics["pixel_mae"], 0.5)
         self.assertAlmostEqual(metrics["changed_pixel_mae"], 0.5)
+        self.assertAlmostEqual(
+            metrics["oracle_reconstruction_pixel_mse"],
+            0.25,
+        )
+        self.assertAlmostEqual(
+            metrics["oracle_reconstruction_pixel_mae"],
+            0.5,
+        )
+        self.assertAlmostEqual(
+            metrics["oracle_reconstruction_changed_pixel_mae"],
+            0.5,
+        )
         self.assertAlmostEqual(metrics["copy_last_pixel_mse"], 1.0)
         self.assertAlmostEqual(metrics["copy_last_pixel_mae"], 1.0)
         self.assertAlmostEqual(metrics["copy_last_changed_pixel_mae"], 1.0)
+
+    def test_oracle_reconstruction_decodes_the_target_latent(self):
+        class ScalarDecoder(torch.nn.Module):
+            def decode(self, latents: torch.Tensor) -> torch.Tensor:
+                return latents[:, :1, None, None].expand(
+                    -1,
+                    3,
+                    64,
+                    64,
+                )
+
+        visual = make_tiny_visual_dataset()
+        visual["frames"][3].fill(0)
+        visual["frames"][4].fill(255)
+        arrays = LatentWindowArrays(
+            context_latents=np.zeros((1, 4, 1), dtype=np.float32),
+            history_actions=np.zeros((1, 3, 2), dtype=np.float64),
+            current_actions=np.zeros((1, 2), dtype=np.float64),
+            target_latents=np.ones((1, 1), dtype=np.float32),
+            last_frame_indices=np.asarray([3], dtype=np.int64),
+            target_frame_indices=np.asarray([4], dtype=np.int64),
+            episode_ids=np.asarray([10], dtype=np.int64),
+            step_ids=np.asarray([3], dtype=np.int64),
+        )
+        dynamics = LatentDynamicsMLP(latent_dim=1, hidden_size=4)
+        for parameter in dynamics.parameters():
+            torch.nn.init.zeros_(parameter)
+
+        metrics = evaluate_latent_dynamics(
+            dynamics,
+            ScalarDecoder(),
+            visual,
+            arrays,
+            latent_normalizer=Normalizer(np.zeros(1), np.ones(1)),
+            action_normalizer=Normalizer(np.zeros(2), np.ones(2)),
+            batch_size=1,
+        )
+
+        self.assertAlmostEqual(metrics["pixel_mse"], 1.0)
+        self.assertAlmostEqual(
+            metrics["oracle_reconstruction_pixel_mse"],
+            0.0,
+        )
 
 
 class VisualLatentCheckpointTest(unittest.TestCase):
@@ -494,6 +549,7 @@ class VisualLatentEndToEndTest(unittest.TestCase):
             "ConvAutoencoder",
             "LatentDynamicsMLP",
             "copy-last",
+            "oracle reconstruction",
             "不读取 `states`",
             "暂不接入 MPC",
         ):
