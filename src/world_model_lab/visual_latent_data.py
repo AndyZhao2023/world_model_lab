@@ -143,6 +143,69 @@ class VisualFrameDataset(Dataset):
         return frames_to_tensor(self._frames[int(self.frame_indices[position])])
 
 
+class VisualMotionFrameDataset(Dataset):
+    """Return selected frames with episode-local binary motion masks."""
+
+    def __init__(
+        self,
+        dataset: Mapping[str, np.ndarray],
+        selected_episode_ids: np.ndarray,
+    ) -> None:
+        validate_visual_dataset(dataset)
+        _, positions = _selected_episode_positions(
+            dataset,
+            selected_episode_ids,
+        )
+        offsets = np.asarray(dataset["frame_offsets"], dtype=np.int64)
+        current_indexes: list[np.ndarray] = []
+        previous_indexes: list[np.ndarray] = []
+        for position in positions.tolist():
+            start = int(offsets[position])
+            stop = int(offsets[position + 1])
+            current_indexes.append(
+                np.arange(start, stop, dtype=np.int64)
+            )
+            previous_indexes.append(
+                np.concatenate(
+                    (
+                        np.asarray([start], dtype=np.int64),
+                        np.arange(start, stop - 1, dtype=np.int64),
+                    )
+                )
+            )
+        self.frame_indices = np.concatenate(current_indexes)
+        self.previous_frame_indices = np.concatenate(previous_indexes)
+        self.frame_indices.setflags(write=False)
+        self.previous_frame_indices.setflags(write=False)
+        self._frames = np.asarray(dataset["frames"])
+
+    def __len__(self) -> int:
+        return int(self.frame_indices.size)
+
+    def __getitem__(self, item: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(item, (bool, np.bool_)):
+            raise TypeError("motion frame dataset index must be an integer")
+        try:
+            position = operator.index(item)
+        except TypeError:
+            raise TypeError(
+                "motion frame dataset index must be an integer"
+            ) from None
+        if position < 0:
+            position += len(self)
+        if position < 0 or position >= len(self):
+            raise IndexError("motion frame dataset index out of range")
+        frame_index = int(self.frame_indices[position])
+        previous_index = int(self.previous_frame_indices[position])
+        frame = self._frames[frame_index]
+        previous_frame = self._frames[previous_index]
+        changed = np.any(frame != previous_frame, axis=2)
+        motion_mask = torch.from_numpy(changed.copy()).unsqueeze(0).to(
+            dtype=torch.float32
+        )
+        return frames_to_tensor(frame), motion_mask
+
+
 def fit_safe_normalizer(
     values: np.ndarray,
     *,

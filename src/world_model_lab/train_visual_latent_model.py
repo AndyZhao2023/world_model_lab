@@ -27,6 +27,7 @@ from .visual_dataset import (
 from .visual_latent_data import (
     LatentWindowArrays,
     VisualFrameDataset,
+    VisualMotionFrameDataset,
     build_latent_window_arrays,
     encode_all_frames,
     fit_safe_normalizer,
@@ -90,22 +91,69 @@ def _validate_training_parameters(
 def _mean_autoencoder_loss(
     model: ConvAutoencoder,
     loader: DataLoader,
+    *,
+    motion_loss_weight: float,
 ) -> float:
     model.eval()
     loss_sum = 0.0
     sample_count = 0
     with torch.no_grad():
-        for images in loader:
+        for images, motion_masks in loader:
             reconstructions = model(images)
             if not torch.all(torch.isfinite(reconstructions)):
                 raise ValueError("autoencoder produced non-finite pixels")
-            batch_loss = torch.mean(torch.square(reconstructions - images))
+            batch_loss = _motion_weighted_mse(
+                reconstructions,
+                images,
+                motion_masks,
+                motion_loss_weight=motion_loss_weight,
+            )
             batch_count = int(images.shape[0])
             loss_sum += float(batch_loss) * batch_count
             sample_count += batch_count
     if sample_count == 0:
         raise ValueError("autoencoder evaluation data must not be empty")
     return loss_sum / sample_count
+
+
+def _motion_weighted_mse(
+    reconstructions: torch.Tensor,
+    images: torch.Tensor,
+    motion_masks: torch.Tensor,
+    *,
+    motion_loss_weight: float,
+) -> torch.Tensor:
+    """Return pixel MSE with optional episode-local motion emphasis."""
+
+    if (
+        reconstructions.ndim != 4
+        or reconstructions.shape != images.shape
+        or reconstructions.shape[1] != 3
+    ):
+        raise ValueError(
+            "reconstructions and images must share shape [B, 3, H, W]"
+        )
+    expected_mask_shape = (
+        images.shape[0],
+        1,
+        images.shape[2],
+        images.shape[3],
+    )
+    if tuple(motion_masks.shape) != expected_mask_shape:
+        raise ValueError("motion_masks must have shape [B, 1, H, W]")
+    if not math.isfinite(motion_loss_weight) or motion_loss_weight < 0.0:
+        raise ValueError("motion_loss_weight must be finite and non-negative")
+    if not torch.all(torch.isfinite(motion_masks)):
+        raise ValueError("motion_masks must be finite")
+    if torch.any(motion_masks < 0.0) or torch.any(motion_masks > 1.0):
+        raise ValueError("motion_masks must contain values in [0, 1]")
+    squared_errors = torch.square(reconstructions - images)
+    if motion_loss_weight == 0.0:
+        return torch.mean(squared_errors)
+    weights = 1.0 + motion_loss_weight * motion_masks
+    return torch.sum(squared_errors * weights) / (
+        torch.sum(weights) * images.shape[1]
+    )
 
 
 def train_autoencoder(
@@ -117,6 +165,7 @@ def train_autoencoder(
     epochs: int = 20,
     batch_size: int = 128,
     learning_rate: float = 1e-3,
+    motion_loss_weight: float = 0.0,
     seed: int = 0,
 ) -> PhaseTrainingResult:
     """Train the frame autoencoder and restore its best validation weights."""
@@ -127,8 +176,13 @@ def train_autoencoder(
         learning_rate=learning_rate,
         seed=seed,
     )
-    train_data = VisualFrameDataset(dataset, split_episode_ids["train"])
-    validation_data = VisualFrameDataset(
+    if not math.isfinite(motion_loss_weight) or motion_loss_weight < 0.0:
+        raise ValueError("motion_loss_weight must be finite and non-negative")
+    train_data = VisualMotionFrameDataset(
+        dataset,
+        split_episode_ids["train"],
+    )
+    validation_data = VisualMotionFrameDataset(
         dataset,
         split_episode_ids["validation"],
     )
@@ -165,10 +219,15 @@ def train_autoencoder(
         model.train()
         epoch_loss = 0.0
         sample_count = 0
-        for images in train_loader:
+        for images, motion_masks in train_loader:
             optimizer.zero_grad()
             reconstructions = model(images)
-            loss = torch.mean(torch.square(reconstructions - images))
+            loss = _motion_weighted_mse(
+                reconstructions,
+                images,
+                motion_masks,
+                motion_loss_weight=motion_loss_weight,
+            )
             if not torch.isfinite(loss):
                 raise ValueError("autoencoder training loss is non-finite")
             loss.backward()
@@ -177,7 +236,11 @@ def train_autoencoder(
             epoch_loss += float(loss.detach()) * batch_count
             sample_count += batch_count
         train_loss = epoch_loss / sample_count
-        validation_loss = _mean_autoencoder_loss(model, validation_loader)
+        validation_loss = _mean_autoencoder_loss(
+            model,
+            validation_loader,
+            motion_loss_weight=motion_loss_weight,
+        )
         train_losses.append(train_loss)
         validation_losses.append(validation_loss)
         if validation_loss < best_validation_loss:
@@ -955,6 +1018,7 @@ def run_visual_latent_training(
     dynamics_batch_size: int = 256,
     autoencoder_learning_rate: float = 1e-3,
     dynamics_learning_rate: float = 1e-3,
+    motion_loss_weight: float = 0.0,
     seed: int = 0,
     split_seed: int = 42,
 ) -> dict[str, Any]:
@@ -979,6 +1043,7 @@ def run_visual_latent_training(
         epochs=autoencoder_epochs,
         batch_size=autoencoder_batch_size,
         learning_rate=autoencoder_learning_rate,
+        motion_loss_weight=motion_loss_weight,
         seed=seed,
     )
     autoencoder = autoencoder_result.model
@@ -1058,6 +1123,7 @@ def run_visual_latent_training(
         "dynamics_batch_size": dynamics_batch_size,
         "autoencoder_learning_rate": autoencoder_learning_rate,
         "dynamics_learning_rate": dynamics_learning_rate,
+        "motion_loss_weight": motion_loss_weight,
         "seed": seed,
         "split_seed": split_seed,
     }
@@ -1157,6 +1223,15 @@ def main() -> None:
         type=float,
         default=1e-3,
     )
+    parser.add_argument(
+        "--motion-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "extra reconstruction weight for pixels changed from the "
+            "preceding frame"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--split-seed", type=int, default=42)
     args = parser.parse_args()
@@ -1174,6 +1249,7 @@ def main() -> None:
             dynamics_batch_size=args.dynamics_batch_size,
             autoencoder_learning_rate=args.autoencoder_learning_rate,
             dynamics_learning_rate=args.dynamics_learning_rate,
+            motion_loss_weight=args.motion_loss_weight,
             seed=args.seed,
             split_seed=args.split_seed,
         )

@@ -265,6 +265,11 @@ Oracle 用来区分 autoencoder 重建误差和 latent dynamics 预测误差。p
 依次显示最后一帧、真实下一帧、Oracle 重建及其误差、模型预测及其误差。训练路径
 不读取 `states`，也不使用 reward/done；这一阶段暂不接入 MPC。
 
+Autoencoder 默认使用普通像素 MSE，即 `--motion-loss-weight 0`。设置正数后，
+当前帧相对同一 episode 前一帧发生变化的空间像素会获得
+`1 + motion-loss-weight` 的重建权重；每个 episode 的初始帧与自身比较，因此
+motion mask 全零。mask 完全由相邻 RGB 图像生成，不读取 `states` 或小车标注。
+
 ## 训练第一个 Learned World Model
 
 安装新增的 PyTorch 依赖：

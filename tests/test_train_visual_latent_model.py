@@ -17,6 +17,7 @@ from tests.test_visual_windows import make_visual_dataset
 from world_model_lab.dataset import Normalizer, split_episode_ids
 from world_model_lab.train_visual_latent_model import (
     PhaseTrainingResult,
+    _motion_weighted_mse,
     evaluate_autoencoder,
     evaluate_latent_dynamics,
     load_visual_latent_checkpoint,
@@ -65,6 +66,53 @@ def make_latent_arrays(
 
 
 class VisualAutoencoderTrainingTest(unittest.TestCase):
+    def test_motion_weighted_mse_matches_plain_mse_and_weighted_formula(self):
+        target = torch.zeros((1, 3, 1, 2), dtype=torch.float32)
+        prediction = torch.tensor(
+            [[[[1.0, 0.5]], [[1.0, 0.5]], [[1.0, 0.5]]]],
+            dtype=torch.float32,
+        )
+        mask = torch.tensor([[[[1.0, 0.0]]]], dtype=torch.float32)
+
+        plain = _motion_weighted_mse(
+            prediction,
+            target,
+            mask,
+            motion_loss_weight=0.0,
+        )
+        weighted = _motion_weighted_mse(
+            prediction,
+            target,
+            mask,
+            motion_loss_weight=3.0,
+        )
+
+        torch.testing.assert_close(
+            plain,
+            torch.mean(torch.square(prediction - target)),
+        )
+        torch.testing.assert_close(weighted, torch.tensor(12.75 / 15.0))
+
+    def test_motion_weighted_mse_rejects_invalid_inputs(self):
+        images = torch.zeros((1, 3, 2, 2))
+        masks = torch.zeros((1, 1, 2, 2))
+        cases = (
+            (images[:, :2], images, masks, 1.0),
+            (images, images, masks[:, :, :1], 1.0),
+            (images, images, masks, -1.0),
+            (images, images, masks, float("nan")),
+            (images, images, masks, float("inf")),
+        )
+        for prediction, target, mask, weight in cases:
+            with self.subTest(weight=weight):
+                with self.assertRaises(ValueError):
+                    _motion_weighted_mse(
+                        prediction,
+                        target,
+                        mask,
+                        motion_loss_weight=weight,
+                    )
+
     def test_autoencoder_training_records_histories_and_test_metrics(self):
         visual = make_tiny_visual_dataset()
         splits = split_episode_ids(visual["episode_ids"], seed=19)
@@ -105,6 +153,9 @@ class VisualAutoencoderTrainingTest(unittest.TestCase):
             {"epochs": 0},
             {"batch_size": 0},
             {"learning_rate": 0.0},
+            {"motion_loss_weight": -1.0},
+            {"motion_loss_weight": float("nan")},
+            {"motion_loss_weight": float("inf")},
             {"seed": -1},
         )
         for values in invalid:
@@ -457,6 +508,7 @@ class VisualLatentEndToEndTest(unittest.TestCase):
                 dynamics_batch_size=8,
                 autoencoder_learning_rate=1e-3,
                 dynamics_learning_rate=1e-3,
+                motion_loss_weight=3.0,
                 seed=3,
                 split_seed=19,
             )
@@ -478,6 +530,10 @@ class VisualLatentEndToEndTest(unittest.TestCase):
                 summary["dynamics"]["test"],
             )
             self.assertEqual(loaded.training_config["split_seed"], 19)
+            self.assertEqual(
+                loaded.training_config["motion_loss_weight"],
+                3.0,
+            )
 
     def test_output_collisions_fail_before_training(self):
         visual = make_tiny_visual_dataset()
@@ -533,6 +589,7 @@ class VisualLatentEndToEndTest(unittest.TestCase):
             "--autoencoder-epochs",
             "--dynamics-epochs",
             "--latent-dim",
+            "--motion-loss-weight",
             "--split-seed",
         ):
             self.assertIn(option, help_text)

@@ -9,6 +9,7 @@ from tests.test_visual_windows import make_visual_dataset
 from world_model_lab.visual_latent_data import (
     LatentWindowArrays,
     VisualFrameDataset,
+    VisualMotionFrameDataset,
     build_latent_window_arrays,
     encode_all_frames,
     fit_safe_normalizer,
@@ -109,6 +110,49 @@ class VisualFrameAdapterTest(unittest.TestCase):
         before = int(self.visual["frames"][6, 0, 0, 0])
         first[0, 0, 0] = 1.0
         self.assertEqual(int(self.visual["frames"][6, 0, 0, 0]), before)
+        for invalid in (slice(None), np.asarray([0]), 0.5, True):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(TypeError):
+                    dataset[invalid]
+
+    def test_motion_frame_dataset_is_episode_local_and_spatial(self):
+        second_episode_start = int(self.visual["frame_offsets"][1])
+        self.visual["frames"][second_episode_start + 1] = self.visual[
+            "frames"
+        ][second_episode_start]
+        self.visual["frames"][second_episode_start + 1, 2, 3, 1] += 1
+        dataset = VisualMotionFrameDataset(
+            self.visual,
+            np.asarray([11, 10], dtype=np.int64),
+        )
+
+        first_image, first_mask = dataset[0]
+        second_image, second_mask = dataset[1]
+        first_of_next_episode = dataset[5]
+
+        self.assertEqual(len(dataset), 11)
+        self.assertEqual(tuple(first_image.shape), (3, 64, 64))
+        self.assertEqual(tuple(first_mask.shape), (1, 64, 64))
+        self.assertEqual(first_mask.dtype, torch.float32)
+        self.assertEqual(int(torch.count_nonzero(first_mask)), 0)
+        self.assertEqual(int(torch.count_nonzero(second_mask)), 1)
+        self.assertEqual(float(second_mask[0, 2, 3]), 1.0)
+        self.assertEqual(
+            int(torch.count_nonzero(first_of_next_episode[1])),
+            0,
+        )
+        torch.testing.assert_close(
+            second_image,
+            frames_to_tensor(
+                self.visual["frames"][second_episode_start + 1]
+            ),
+        )
+
+        second_mask[0, 2, 3] = 0.0
+        self.assertEqual(
+            int(self.visual["frames"][second_episode_start + 1, 2, 3, 1]),
+            int(self.visual["frames"][second_episode_start, 2, 3, 1]) + 1,
+        )
         for invalid in (slice(None), np.asarray([0]), 0.5, True):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(TypeError):
