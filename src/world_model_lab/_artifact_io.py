@@ -4,9 +4,34 @@ from __future__ import annotations
 
 import os
 import secrets
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO
+
+
+def prospective_path_key(path: Path) -> tuple[str, ...]:
+    """Return a conservative key for unresolved case/Unicode aliases."""
+
+    return tuple(
+        unicodedata.normalize(
+            "NFC",
+            unicodedata.normalize("NFC", component).casefold(),
+        )
+        for component in path.parts
+    )
+
+
+def is_prospective_ancestor(
+    ancestor: tuple[str, ...],
+    descendant: tuple[str, ...],
+) -> bool:
+    """Return whether one normalized prospective path contains another."""
+
+    return (
+        len(ancestor) < len(descendant)
+        and descendant[: len(ancestor)] == ancestor
+    )
 
 
 def _create_temporary_file(path: Path) -> tuple[int, Path]:

@@ -207,9 +207,108 @@ schema version 1 只适用于由未修改的默认 `CarEnv` 和 `collect_transit
 `actions[t-3:t]` 包含三条历史动作；切片不可跨越 `frame_offsets` /
 `transition_offsets` 定义的 episode 边界。
 
+### 构造视觉训练窗口
+
+训练前先按完整 episode 划分数据，再在每个 split 内构造窗口：
+
+```python
+from world_model_lab.visual_dataset import load_visual_dataset
+from world_model_lab.visual_windows import build_visual_window_splits
+
+visual = load_visual_dataset("data/visual_episodes.npz")
+splits = build_visual_window_splits(visual, seed=42)
+train = splits["train"]
+sample = train[0]
+
+print(sample["context_frames"].shape)   # (4, 64, 64, 3)
+print(sample["history_actions"].shape)  # (3, 2)
+print(sample["current_action"].shape)   # (2,)
+print(sample["target_frame"].shape)     # (64, 64, 3)
+```
+
+窗口层只保存 episode 和时间索引，读取样本时才复制对应图像，因此不会把
+四帧历史预先复制数千次。图像保持 `uint8 NHWC`，动作保持 `float64`；除以
+255、转换为 `float32` 和变换到 PyTorch 的 `NCHW` 都属于后续模型适配层。
+
+`train.index.selected_episode_ids` 记录实际训练 episode；validation 和 test
+拥有互斥的 ID 集合。短于四个 transition 的 episode 会记录在
+`skipped_episode_ids` 中，不会进行填充，也不会跨 episode 拼接窗口。
+
 这一步只生成和验证视觉观测数据，不训练 autoencoder、VAE 或 latent
 dynamics。`artifacts/visual_episode_preview.gif` 用于人工检查连续运动，
 不会进入训练。
+
+### 训练视觉潜变量基线
+
+第一个视觉 world model 分成两个可独立诊断的阶段：
+
+1. `ConvAutoencoder` 只从单帧学习低维 latent，并重建同一帧。
+2. 冻结 encoder 后，`LatentDynamicsMLP` 使用四个历史 latent、三条历史动作
+   和当前动作，预测下一帧的 latent；冻结 decoder 再把它还原成 RGB。
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
+  .venv/bin/python -m world_model_lab.train_visual_latent_model \
+  --data data/visual_episodes.npz \
+  --output artifacts/visual_latent_world_model.pt \
+  --preview artifacts/visual_latent_predictions.png
+```
+
+重新执行 editable install 后，也可以使用
+`.venv/bin/world-model-train-visual-latent`。checkpoint 同时保存两阶段权重、
+train-only latent/action normalizer、episode split、训练历史和 held-out
+指标；命令拒绝覆盖已有 checkpoint 或 preview。
+
+测试指标包含模型像素 MSE/MAE、`copy-last` 基线、把真实目标 latent 直接送入
+decoder 的 `oracle reconstruction`，以及只在真实发生变化的像素上计算的 MAE。
+Oracle 用来区分 autoencoder 重建误差和 latent dynamics 预测误差。preview 每行
+依次显示最后一帧、真实下一帧、Oracle 重建及其误差、模型预测及其误差。训练路径
+不读取 `states`，也不使用 reward/done；这一阶段暂不接入 MPC。
+
+动力学评估还包含两类诊断。`decoded_last_latent` 把最后一帧的 latent 直接送入
+decoder，作为经过同一视觉表示但不运行 dynamics 的基线；它与直接复制原始 RGB 的
+`copy-last` 含义不同。动作 ablation 分别把动作替换成训练集均值，或用固定 seed 在
+测试窗口之间整体打乱四条对齐动作，用来判断冻结模型是否依赖动作信息。
+
+视觉历史 ablation 保持最后一帧 latent 和动作不变：`repeat_last_context` 用最后
+一帧替换全部四帧，`reverse_history_context` 只反转前三帧。前者测试模型是否需要
+观察运动，后者测试历史顺序是否重要；反转同时会破坏视觉帧与原动作历史的对应关系，
+因此不能把全部退化单独归因于帧顺序。
+
+Autoencoder 默认使用普通像素 MSE，即 `--motion-loss-weight 0`。设置正数后，
+当前帧相对同一 episode 前一帧发生变化的空间像素会获得
+`1 + motion-loss-weight` 的重建权重；每个 episode 的初始帧与自身比较，因此
+motion mask 全零。mask 完全由相邻 RGB 图像生成，不读取 `states` 或小车标注。
+
+空间 latent 对照实验保留相同的数据划分、训练目标和评估指标，只替换模型表示：
+`SpatialConvAutoencoder` 用三次 stride-2 卷积把输入编码成
+`[B, spatial_latent_channels, 8, 8]`，不使用全连接层压成单个全局向量；
+`SpatialLatentDynamicsCNN` 将四帧空间 latent 与四条对齐动作组成特征图，并预测
+相对最后一帧 latent 的局部卷积残差。为了继续复用紧凑窗口数组，空间 latent
+会按固定的 channel-row-column 顺序暂时展平成 `[B, C*8*8]`；动力学计算和解码前
+会按同一顺序恢复网格，因此展平不会丢失位置或混合不同 cell。
+
+空间 dynamics 还可以通过 `--spatial-dynamics-architecture convgru` 切换为
+`SpatialLatentDynamicsConvGRU`。它不把四帧一次性堆到 channel 维，而是按时间顺序
+逐帧更新一个 `[B, hidden_channels, 8, 8]` 隐状态；每帧都与对应动作图一起输入，
+最后同样预测相对末帧 latent 的局部残差。默认值仍是 `cnn`，以兼容已有实验和
+未记录该字段的旧 spatial checkpoint。
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
+  .venv/bin/python -m world_model_lab.train_visual_latent_model \
+  --data data/visual_episodes.npz \
+  --output artifacts/visual_latent_spatial8.pt \
+  --preview artifacts/visual_latent_spatial8_predictions.png \
+  --latent-layout spatial \
+  --spatial-latent-channels 8 \
+  --spatial-dynamics-architecture cnn \
+  --dynamics-hidden-size 64 \
+  --motion-loss-weight 0
+```
+
+默认的 `--latent-layout global` 仍使用原来的 `ConvAutoencoder` 和
+`LatentDynamicsMLP`，所以旧命令和旧 checkpoint 保持兼容。
 
 ## 训练第一个 Learned World Model
 
