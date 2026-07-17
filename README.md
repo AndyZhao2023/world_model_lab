@@ -265,10 +265,50 @@ Oracle 用来区分 autoencoder 重建误差和 latent dynamics 预测误差。p
 依次显示最后一帧、真实下一帧、Oracle 重建及其误差、模型预测及其误差。训练路径
 不读取 `states`，也不使用 reward/done；这一阶段暂不接入 MPC。
 
+动力学评估还包含两类诊断。`decoded_last_latent` 把最后一帧的 latent 直接送入
+decoder，作为经过同一视觉表示但不运行 dynamics 的基线；它与直接复制原始 RGB 的
+`copy-last` 含义不同。动作 ablation 分别把动作替换成训练集均值，或用固定 seed 在
+测试窗口之间整体打乱四条对齐动作，用来判断冻结模型是否依赖动作信息。
+
+视觉历史 ablation 保持最后一帧 latent 和动作不变：`repeat_last_context` 用最后
+一帧替换全部四帧，`reverse_history_context` 只反转前三帧。前者测试模型是否需要
+观察运动，后者测试历史顺序是否重要；反转同时会破坏视觉帧与原动作历史的对应关系，
+因此不能把全部退化单独归因于帧顺序。
+
 Autoencoder 默认使用普通像素 MSE，即 `--motion-loss-weight 0`。设置正数后，
 当前帧相对同一 episode 前一帧发生变化的空间像素会获得
 `1 + motion-loss-weight` 的重建权重；每个 episode 的初始帧与自身比较，因此
 motion mask 全零。mask 完全由相邻 RGB 图像生成，不读取 `states` 或小车标注。
+
+空间 latent 对照实验保留相同的数据划分、训练目标和评估指标，只替换模型表示：
+`SpatialConvAutoencoder` 用三次 stride-2 卷积把输入编码成
+`[B, spatial_latent_channels, 8, 8]`，不使用全连接层压成单个全局向量；
+`SpatialLatentDynamicsCNN` 将四帧空间 latent 与四条对齐动作组成特征图，并预测
+相对最后一帧 latent 的局部卷积残差。为了继续复用紧凑窗口数组，空间 latent
+会按固定的 channel-row-column 顺序暂时展平成 `[B, C*8*8]`；动力学计算和解码前
+会按同一顺序恢复网格，因此展平不会丢失位置或混合不同 cell。
+
+空间 dynamics 还可以通过 `--spatial-dynamics-architecture convgru` 切换为
+`SpatialLatentDynamicsConvGRU`。它不把四帧一次性堆到 channel 维，而是按时间顺序
+逐帧更新一个 `[B, hidden_channels, 8, 8]` 隐状态；每帧都与对应动作图一起输入，
+最后同样预测相对末帧 latent 的局部残差。默认值仍是 `cnn`，以兼容已有实验和
+未记录该字段的旧 spatial checkpoint。
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
+  .venv/bin/python -m world_model_lab.train_visual_latent_model \
+  --data data/visual_episodes.npz \
+  --output artifacts/visual_latent_spatial8.pt \
+  --preview artifacts/visual_latent_spatial8_predictions.png \
+  --latent-layout spatial \
+  --spatial-latent-channels 8 \
+  --spatial-dynamics-architecture cnn \
+  --dynamics-hidden-size 64 \
+  --motion-loss-weight 0
+```
+
+默认的 `--latent-layout global` 仍使用原来的 `ConvAutoencoder` 和
+`LatentDynamicsMLP`，所以旧命令和旧 checkpoint 保持兼容。
 
 ## 训练第一个 Learned World Model
 

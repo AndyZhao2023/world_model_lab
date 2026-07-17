@@ -38,12 +38,24 @@ from .visual_latent_data import (
 from .visual_latent_model import (
     ConvAutoencoder,
     LatentDynamicsMLP,
+    SpatialConvAutoencoder,
+    SpatialLatentDynamicsCNN,
+    SpatialLatentDynamicsConvGRU,
 )
 from .visual_windows import build_visual_window_index
 
 
 CHECKPOINT_FORMAT_VERSION = 1
 CHECKPOINT_KIND = "visual_latent_world_model"
+LATENT_LAYOUTS = frozenset(("global", "spatial"))
+SPATIAL_DYNAMICS_ARCHITECTURES = frozenset(("cnn", "convgru"))
+
+VisualAutoencoder = ConvAutoencoder | SpatialConvAutoencoder
+VisualLatentDynamics = (
+    LatentDynamicsMLP
+    | SpatialLatentDynamicsCNN
+    | SpatialLatentDynamicsConvGRU
+)
 
 
 @dataclass
@@ -60,8 +72,8 @@ class PhaseTrainingResult:
 class LoadedVisualLatentModel:
     """Loaded visual latent models plus their reproducibility metadata."""
 
-    autoencoder: ConvAutoencoder
-    dynamics: LatentDynamicsMLP
+    autoencoder: VisualAutoencoder
+    dynamics: VisualLatentDynamics
     latent_normalizer: Normalizer
     action_normalizer: Normalizer
     split_episode_ids: dict[str, np.ndarray]
@@ -88,8 +100,86 @@ def _validate_training_parameters(
         raise ValueError("seed must be non-negative")
 
 
+def _validate_latent_layout(latent_layout: str) -> str:
+    layout = str(latent_layout)
+    if layout not in LATENT_LAYOUTS:
+        raise ValueError("latent_layout must be 'global' or 'spatial'")
+    return layout
+
+
+def _validate_spatial_dynamics_architecture(
+    architecture: str,
+) -> str:
+    value = str(architecture)
+    if value not in SPATIAL_DYNAMICS_ARCHITECTURES:
+        raise ValueError(
+            "spatial_dynamics_architecture must be 'cnn' or 'convgru'"
+        )
+    return value
+
+
+def _make_autoencoder(
+    *,
+    latent_layout: str,
+    latent_dim: int,
+    spatial_latent_channels: int,
+    base_channels: int,
+) -> VisualAutoencoder:
+    layout = _validate_latent_layout(latent_layout)
+    if layout == "global":
+        return ConvAutoencoder(
+            latent_dim=latent_dim,
+            base_channels=base_channels,
+        )
+    return SpatialConvAutoencoder(
+        latent_channels=spatial_latent_channels,
+        base_channels=base_channels,
+    )
+
+
+def _make_dynamics(
+    *,
+    latent_layout: str,
+    latent_dim: int,
+    spatial_latent_channels: int,
+    hidden_size: int,
+    context_frames: int,
+    spatial_dynamics_architecture: str = "cnn",
+) -> VisualLatentDynamics:
+    layout = _validate_latent_layout(latent_layout)
+    architecture = _validate_spatial_dynamics_architecture(
+        spatial_dynamics_architecture
+    )
+    if layout == "global":
+        return LatentDynamicsMLP(
+            latent_dim=latent_dim,
+            hidden_size=hidden_size,
+            context_frames=context_frames,
+        )
+    expected_dim = (
+        spatial_latent_channels
+        * SpatialLatentDynamicsCNN.latent_size
+        * SpatialLatentDynamicsCNN.latent_size
+    )
+    if latent_dim != expected_dim:
+        raise ValueError(
+            "flattened spatial latent dimension does not match "
+            "spatial_latent_channels"
+        )
+    dynamics_type = (
+        SpatialLatentDynamicsCNN
+        if architecture == "cnn"
+        else SpatialLatentDynamicsConvGRU
+    )
+    return dynamics_type(
+        latent_channels=spatial_latent_channels,
+        hidden_channels=hidden_size,
+        context_frames=context_frames,
+    )
+
+
 def _mean_autoencoder_loss(
-    model: ConvAutoencoder,
+    model: VisualAutoencoder,
     loader: DataLoader,
     *,
     motion_loss_weight: float,
@@ -160,7 +250,9 @@ def train_autoencoder(
     dataset: dict[str, np.ndarray],
     *,
     split_episode_ids: dict[str, np.ndarray],
+    latent_layout: str = "global",
     latent_dim: int = 32,
+    spatial_latent_channels: int = 8,
     base_channels: int = 16,
     epochs: int = 20,
     batch_size: int = 128,
@@ -178,6 +270,9 @@ def train_autoencoder(
     )
     if not math.isfinite(motion_loss_weight) or motion_loss_weight < 0.0:
         raise ValueError("motion_loss_weight must be finite and non-negative")
+    layout = _validate_latent_layout(latent_layout)
+    if spatial_latent_channels <= 0:
+        raise ValueError("spatial_latent_channels must be positive")
     train_data = VisualMotionFrameDataset(
         dataset,
         split_episode_ids["train"],
@@ -190,8 +285,10 @@ def train_autoencoder(
         raise ValueError("autoencoder train and validation data must not be empty")
 
     torch.manual_seed(seed)
-    model = ConvAutoencoder(
+    model = _make_autoencoder(
+        latent_layout=layout,
         latent_dim=latent_dim,
+        spatial_latent_channels=spatial_latent_channels,
         base_channels=base_channels,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -261,7 +358,7 @@ def train_autoencoder(
 
 
 def evaluate_autoencoder(
-    model: ConvAutoencoder,
+    model: VisualAutoencoder,
     dataset: dict[str, np.ndarray],
     *,
     selected_episode_ids: np.ndarray,
@@ -323,7 +420,7 @@ def _normalized_window_tensors(
 
 
 def _mean_dynamics_loss(
-    model: LatentDynamicsMLP,
+    model: VisualLatentDynamics,
     loader: DataLoader,
 ) -> float:
     model.eval()
@@ -349,6 +446,9 @@ def train_latent_dynamics(
     *,
     latent_normalizer: Normalizer,
     action_normalizer: Normalizer,
+    latent_layout: str = "global",
+    spatial_latent_channels: int = 8,
+    spatial_dynamics_architecture: str = "cnn",
     hidden_size: int = 256,
     epochs: int = 50,
     batch_size: int = 256,
@@ -365,6 +465,12 @@ def train_latent_dynamics(
     )
     if train_arrays.count == 0 or validation_arrays.count == 0:
         raise ValueError("latent dynamics train and validation data must not be empty")
+    layout = _validate_latent_layout(latent_layout)
+    architecture = _validate_spatial_dynamics_architecture(
+        spatial_dynamics_architecture
+    )
+    if spatial_latent_channels <= 0:
+        raise ValueError("spatial_latent_channels must be positive")
     train_tensors = _normalized_window_tensors(
         train_arrays,
         latent_normalizer=latent_normalizer,
@@ -376,10 +482,13 @@ def train_latent_dynamics(
         action_normalizer=action_normalizer,
     )
     torch.manual_seed(seed)
-    model = LatentDynamicsMLP(
+    model = _make_dynamics(
+        latent_layout=layout,
         latent_dim=int(train_arrays.context_latents.shape[2]),
+        spatial_latent_channels=spatial_latent_channels,
         hidden_size=hidden_size,
         context_frames=CONTEXT_FRAMES,
+        spatial_dynamics_architecture=architecture,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     generator = torch.Generator().manual_seed(seed)
@@ -439,7 +548,7 @@ def train_latent_dynamics(
 
 
 def _predict_normalized_latents(
-    model: LatentDynamicsMLP,
+    model: VisualLatentDynamics,
     arrays: LatentWindowArrays,
     *,
     latent_normalizer: Normalizer,
@@ -467,7 +576,7 @@ def _predict_normalized_latents(
 
 
 def _decode_normalized_latents(
-    autoencoder: ConvAutoencoder,
+    autoencoder: VisualAutoencoder,
     normalized_latents: torch.Tensor,
     latent_normalizer: Normalizer,
 ) -> torch.Tensor:
@@ -478,15 +587,57 @@ def _decode_normalized_latents(
     return autoencoder.decode(latent_tensor).clamp(0.0, 1.0)
 
 
+def _arrays_with_replaced_actions(
+    arrays: LatentWindowArrays,
+    *,
+    history_actions: np.ndarray,
+    current_actions: np.ndarray,
+) -> LatentWindowArrays:
+    """Return the same latent windows with one aligned action variant."""
+
+    return LatentWindowArrays(
+        context_latents=arrays.context_latents,
+        history_actions=history_actions,
+        current_actions=current_actions,
+        target_latents=arrays.target_latents,
+        last_frame_indices=arrays.last_frame_indices,
+        target_frame_indices=arrays.target_frame_indices,
+        episode_ids=arrays.episode_ids,
+        step_ids=arrays.step_ids,
+    )
+
+
+def _arrays_with_replaced_context(
+    arrays: LatentWindowArrays,
+    *,
+    context_latents: np.ndarray,
+) -> LatentWindowArrays:
+    """Return the same latent windows with one visual-context variant."""
+
+    return LatentWindowArrays(
+        context_latents=context_latents,
+        history_actions=arrays.history_actions,
+        current_actions=arrays.current_actions,
+        target_latents=arrays.target_latents,
+        last_frame_indices=arrays.last_frame_indices,
+        target_frame_indices=arrays.target_frame_indices,
+        episode_ids=arrays.episode_ids,
+        step_ids=arrays.step_ids,
+    )
+
+
 def evaluate_latent_dynamics(
-    model: LatentDynamicsMLP,
-    autoencoder: ConvAutoencoder,
+    model: VisualLatentDynamics,
+    autoencoder: VisualAutoencoder,
     dataset: dict[str, np.ndarray],
     arrays: LatentWindowArrays,
     *,
     latent_normalizer: Normalizer,
     action_normalizer: Normalizer,
     batch_size: int,
+    action_shuffle_seed: int = 0,
+    include_action_ablations: bool = True,
+    include_context_ablations: bool = True,
 ) -> dict[str, float | int]:
     """Measure held-out latent and decoded one-step prediction errors."""
 
@@ -494,6 +645,12 @@ def evaluate_latent_dynamics(
         raise ValueError("latent dynamics evaluation data must not be empty")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    if (
+        isinstance(action_shuffle_seed, (bool, np.bool_))
+        or not isinstance(action_shuffle_seed, (int, np.integer))
+        or int(action_shuffle_seed) < 0
+    ):
+        raise ValueError("action_shuffle_seed must be a non-negative integer")
     frames = np.asarray(dataset["frames"])
     model.eval()
     autoencoder.eval()
@@ -505,10 +662,13 @@ def evaluate_latent_dynamics(
     oracle_absolute_error_sum = 0.0
     copy_squared_error_sum = 0.0
     copy_absolute_error_sum = 0.0
+    decoded_last_squared_error_sum = 0.0
+    decoded_last_absolute_error_sum = 0.0
     pixel_value_count = 0
     changed_absolute_error_sum = 0.0
     oracle_changed_absolute_error_sum = 0.0
     copy_changed_absolute_error_sum = 0.0
+    decoded_last_changed_absolute_error_sum = 0.0
     changed_pixel_count = 0
 
     with torch.no_grad():
@@ -542,6 +702,17 @@ def evaluate_latent_dynamics(
                 target_normalized,
                 latent_normalizer,
             )
+            last_context_normalized = torch.as_tensor(
+                latent_normalizer.normalize(
+                    arrays.context_latents[start:stop, -1]
+                ),
+                dtype=torch.float32,
+            )
+            decoded_last_latents = _decode_normalized_latents(
+                autoencoder,
+                last_context_normalized,
+                latent_normalizer,
+            )
             target_frames = frames_to_tensor(
                 frames[arrays.target_frame_indices[start:stop]]
             )
@@ -551,6 +722,7 @@ def evaluate_latent_dynamics(
             errors = predictions - target_frames
             oracle_errors = oracle_reconstructions - target_frames
             copy_errors = last_frames - target_frames
+            decoded_last_errors = decoded_last_latents - target_frames
             pixel_squared_error_sum += float(torch.sum(torch.square(errors)))
             pixel_absolute_error_sum += float(torch.sum(torch.abs(errors)))
             oracle_squared_error_sum += float(
@@ -563,6 +735,12 @@ def evaluate_latent_dynamics(
                 torch.sum(torch.square(copy_errors))
             )
             copy_absolute_error_sum += float(torch.sum(torch.abs(copy_errors)))
+            decoded_last_squared_error_sum += float(
+                torch.sum(torch.square(decoded_last_errors))
+            )
+            decoded_last_absolute_error_sum += float(
+                torch.sum(torch.abs(decoded_last_errors))
+            )
             pixel_value_count += target_frames.numel()
 
             changed = torch.any(
@@ -582,6 +760,11 @@ def evaluate_latent_dynamics(
                 copy_changed_absolute_error_sum += float(
                     torch.sum(torch.abs(copy_errors)[changed_values])
                 )
+                decoded_last_changed_absolute_error_sum += float(
+                    torch.sum(
+                        torch.abs(decoded_last_errors)[changed_values]
+                    )
+                )
                 changed_pixel_count += batch_changed_pixels
 
     pixel_mse = pixel_squared_error_sum / pixel_value_count
@@ -599,6 +782,11 @@ def evaluate_latent_dynamics(
     )
     copy_changed_pixel_mae = (
         copy_changed_absolute_error_sum / changed_value_count
+        if changed_value_count
+        else 0.0
+    )
+    decoded_last_changed_pixel_mae = (
+        decoded_last_changed_absolute_error_sum / changed_value_count
         if changed_value_count
         else 0.0
     )
@@ -624,7 +812,119 @@ def evaluate_latent_dynamics(
         "copy_last_pixel_mse": copy_squared_error_sum / pixel_value_count,
         "copy_last_pixel_mae": copy_absolute_error_sum / pixel_value_count,
         "copy_last_changed_pixel_mae": copy_changed_pixel_mae,
+        "decoded_last_latent_pixel_mse": (
+            decoded_last_squared_error_sum / pixel_value_count
+        ),
+        "decoded_last_latent_pixel_mae": (
+            decoded_last_absolute_error_sum / pixel_value_count
+        ),
+        "decoded_last_latent_changed_pixel_mae": (
+            decoded_last_changed_pixel_mae
+        ),
     }
+    if include_action_ablations:
+        action_mean = np.asarray(action_normalizer.mean, dtype=np.float64)
+        mean_action_arrays = _arrays_with_replaced_actions(
+            arrays,
+            history_actions=np.broadcast_to(
+                action_mean,
+                arrays.history_actions.shape,
+            ).copy(),
+            current_actions=np.broadcast_to(
+                action_mean,
+                arrays.current_actions.shape,
+            ).copy(),
+        )
+        permutation = np.random.default_rng(
+            int(action_shuffle_seed)
+        ).permutation(arrays.count)
+        shuffled_action_arrays = _arrays_with_replaced_actions(
+            arrays,
+            history_actions=arrays.history_actions[permutation],
+            current_actions=arrays.current_actions[permutation],
+        )
+        ablation_metrics = {
+            "mean_action_ablation": evaluate_latent_dynamics(
+                model,
+                autoencoder,
+                dataset,
+                mean_action_arrays,
+                latent_normalizer=latent_normalizer,
+                action_normalizer=action_normalizer,
+                batch_size=batch_size,
+                action_shuffle_seed=action_shuffle_seed,
+                include_action_ablations=False,
+                include_context_ablations=False,
+            ),
+            "shuffled_action_ablation": evaluate_latent_dynamics(
+                model,
+                autoencoder,
+                dataset,
+                shuffled_action_arrays,
+                latent_normalizer=latent_normalizer,
+                action_normalizer=action_normalizer,
+                batch_size=batch_size,
+                action_shuffle_seed=action_shuffle_seed,
+                include_action_ablations=False,
+                include_context_ablations=False,
+            ),
+        }
+        for prefix, values in ablation_metrics.items():
+            for name in (
+                "normalized_latent_mse",
+                "pixel_mse",
+                "changed_pixel_mae",
+            ):
+                metrics[f"{prefix}_{name}"] = values[name]
+    if include_context_ablations:
+        repeat_last_context = np.repeat(
+            arrays.context_latents[:, -1:, :],
+            arrays.context_latents.shape[1],
+            axis=1,
+        )
+        reverse_history_context = arrays.context_latents.copy()
+        reverse_history_context[:, :-1] = arrays.context_latents[
+            :, :-1
+        ][:, ::-1, :]
+        context_metrics = {
+            "repeat_last_context": evaluate_latent_dynamics(
+                model,
+                autoencoder,
+                dataset,
+                _arrays_with_replaced_context(
+                    arrays,
+                    context_latents=repeat_last_context,
+                ),
+                latent_normalizer=latent_normalizer,
+                action_normalizer=action_normalizer,
+                batch_size=batch_size,
+                action_shuffle_seed=action_shuffle_seed,
+                include_action_ablations=False,
+                include_context_ablations=False,
+            ),
+            "reverse_history_context": evaluate_latent_dynamics(
+                model,
+                autoencoder,
+                dataset,
+                _arrays_with_replaced_context(
+                    arrays,
+                    context_latents=reverse_history_context,
+                ),
+                latent_normalizer=latent_normalizer,
+                action_normalizer=action_normalizer,
+                batch_size=batch_size,
+                action_shuffle_seed=action_shuffle_seed,
+                include_action_ablations=False,
+                include_context_ablations=False,
+            ),
+        }
+        for prefix, values in context_metrics.items():
+            for name in (
+                "normalized_latent_mse",
+                "pixel_mse",
+                "changed_pixel_mae",
+            ):
+                metrics[f"{prefix}_{name}"] = values[name]
     if not all(
         math.isfinite(float(value))
         for value in metrics.values()
@@ -675,10 +975,36 @@ def save_visual_latent_checkpoint(
 
     autoencoder = autoencoder_result.model
     dynamics = dynamics_result.model
-    if not isinstance(autoencoder, ConvAutoencoder):
-        raise ValueError("autoencoder_result must contain ConvAutoencoder")
-    if not isinstance(dynamics, LatentDynamicsMLP):
-        raise ValueError("dynamics_result must contain LatentDynamicsMLP")
+    if not isinstance(
+        autoencoder,
+        (ConvAutoencoder, SpatialConvAutoencoder),
+    ):
+        raise ValueError("autoencoder_result contains an unsupported model")
+    if not isinstance(
+        dynamics,
+        (
+            LatentDynamicsMLP,
+            SpatialLatentDynamicsCNN,
+            SpatialLatentDynamicsConvGRU,
+        ),
+    ):
+        raise ValueError("dynamics_result contains an unsupported model")
+    is_spatial = isinstance(autoencoder, SpatialConvAutoencoder)
+    is_spatial_dynamics = isinstance(
+        dynamics,
+        (SpatialLatentDynamicsCNN, SpatialLatentDynamicsConvGRU),
+    )
+    if is_spatial != is_spatial_dynamics:
+        raise ValueError("autoencoder and dynamics latent layouts must match")
+    latent_layout = "spatial" if is_spatial else "global"
+    spatial_dynamics_architecture = (
+        "convgru"
+        if isinstance(dynamics, SpatialLatentDynamicsConvGRU)
+        else "cnn"
+    )
+    spatial_latent_channels = (
+        autoencoder.latent_channels if is_spatial else 0
+    )
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -686,7 +1012,12 @@ def save_visual_latent_checkpoint(
         "kind": CHECKPOINT_KIND,
         "dataset": dict(dataset_metadata),
         "model_config": {
+            "latent_layout": latent_layout,
             "latent_dim": autoencoder.latent_dim,
+            "spatial_latent_channels": spatial_latent_channels,
+            "spatial_dynamics_architecture": (
+                spatial_dynamics_architecture
+            ),
             "base_channels": autoencoder.base_channels,
             "dynamics_hidden_size": dynamics.hidden_size,
             "context_frames": dynamics.context_frames,
@@ -816,18 +1147,41 @@ def load_visual_latent_checkpoint(
     model_config = payload.get("model_config")
     if not isinstance(model_config, dict):
         raise ValueError("model_config is missing")
+    latent_layout = _validate_latent_layout(
+        str(model_config.get("latent_layout", "global"))
+    )
     latent_dim = int(model_config.get("latent_dim", 0))
+    spatial_latent_channels = int(
+        model_config.get("spatial_latent_channels", 0)
+    )
     base_channels = int(model_config.get("base_channels", 0))
     hidden_size = int(model_config.get("dynamics_hidden_size", 0))
     context_frames = int(model_config.get("context_frames", 0))
-    autoencoder = ConvAutoencoder(
+    spatial_dynamics_architecture = (
+        _validate_spatial_dynamics_architecture(
+            str(
+                model_config.get(
+                    "spatial_dynamics_architecture",
+                    "cnn",
+                )
+            )
+        )
+    )
+    if latent_layout == "global":
+        spatial_latent_channels = 1
+    autoencoder = _make_autoencoder(
+        latent_layout=latent_layout,
         latent_dim=latent_dim,
+        spatial_latent_channels=spatial_latent_channels,
         base_channels=base_channels,
     )
-    dynamics = LatentDynamicsMLP(
+    dynamics = _make_dynamics(
+        latent_layout=latent_layout,
         latent_dim=latent_dim,
+        spatial_latent_channels=spatial_latent_channels,
         hidden_size=hidden_size,
         context_frames=context_frames,
+        spatial_dynamics_architecture=spatial_dynamics_architecture,
     )
     try:
         autoencoder.load_state_dict(payload["autoencoder_state_dict"])
@@ -901,8 +1255,8 @@ def load_visual_latent_checkpoint(
 def plot_visual_latent_predictions(
     output_path: Path | str,
     *,
-    autoencoder: ConvAutoencoder,
-    dynamics: LatentDynamicsMLP,
+    autoencoder: VisualAutoencoder,
+    dynamics: VisualLatentDynamics,
     dataset: dict[str, np.ndarray],
     arrays: LatentWindowArrays,
     latent_normalizer: Normalizer,
@@ -1009,7 +1363,10 @@ def run_visual_latent_training(
     data_path: Path | str,
     output_path: Path | str,
     preview_path: Path | str,
+    latent_layout: str = "global",
     latent_dim: int = 32,
+    spatial_latent_channels: int = 8,
+    spatial_dynamics_architecture: str = "cnn",
     base_channels: int = 16,
     dynamics_hidden_size: int = 256,
     autoencoder_epochs: int = 20,
@@ -1027,7 +1384,16 @@ def run_visual_latent_training(
     output = Path(output_path)
     preview = Path(preview_path)
     _preflight_output_paths(output, preview)
-    if latent_dim <= 0 or base_channels <= 0 or dynamics_hidden_size <= 0:
+    layout = _validate_latent_layout(latent_layout)
+    architecture = _validate_spatial_dynamics_architecture(
+        spatial_dynamics_architecture
+    )
+    if (
+        latent_dim <= 0
+        or spatial_latent_channels <= 0
+        or base_channels <= 0
+        or dynamics_hidden_size <= 0
+    ):
         raise ValueError("model dimensions must be positive")
     if split_seed < 0:
         raise ValueError("split_seed must be non-negative")
@@ -1038,7 +1404,9 @@ def run_visual_latent_training(
     autoencoder_result = train_autoencoder(
         dataset,
         split_episode_ids=splits,
+        latent_layout=layout,
         latent_dim=latent_dim,
+        spatial_latent_channels=spatial_latent_channels,
         base_channels=base_channels,
         epochs=autoencoder_epochs,
         batch_size=autoencoder_batch_size,
@@ -1047,7 +1415,10 @@ def run_visual_latent_training(
         seed=seed,
     )
     autoencoder = autoencoder_result.model
-    assert isinstance(autoencoder, ConvAutoencoder)
+    assert isinstance(
+        autoencoder,
+        (ConvAutoencoder, SpatialConvAutoencoder),
+    )
     autoencoder_test_metrics = evaluate_autoencoder(
         autoencoder,
         dataset,
@@ -1094,6 +1465,9 @@ def run_visual_latent_training(
         window_arrays["validation"],
         latent_normalizer=latent_normalizer,
         action_normalizer=action_normalizer,
+        latent_layout=layout,
+        spatial_latent_channels=spatial_latent_channels,
+        spatial_dynamics_architecture=architecture,
         hidden_size=dynamics_hidden_size,
         epochs=dynamics_epochs,
         batch_size=dynamics_batch_size,
@@ -1101,7 +1475,14 @@ def run_visual_latent_training(
         seed=seed,
     )
     dynamics = dynamics_result.model
-    assert isinstance(dynamics, LatentDynamicsMLP)
+    assert isinstance(
+        dynamics,
+        (
+            LatentDynamicsMLP,
+            SpatialLatentDynamicsCNN,
+            SpatialLatentDynamicsConvGRU,
+        ),
+    )
     dynamics_test_metrics = evaluate_latent_dynamics(
         dynamics,
         autoencoder,
@@ -1114,7 +1495,10 @@ def run_visual_latent_training(
     training_config = {
         "data_path": str(data),
         "device": "cpu",
-        "latent_dim": latent_dim,
+        "latent_layout": layout,
+        "latent_dim": autoencoder.latent_dim,
+        "spatial_latent_channels": spatial_latent_channels,
+        "spatial_dynamics_architecture": architecture,
         "base_channels": base_channels,
         "dynamics_hidden_size": dynamics_hidden_size,
         "autoencoder_epochs": autoencoder_epochs,
@@ -1206,7 +1590,20 @@ def main() -> None:
         type=Path,
         default=Path("artifacts/visual_latent_predictions.png"),
     )
+    parser.add_argument(
+        "--latent-layout",
+        choices=sorted(LATENT_LAYOUTS),
+        default="global",
+        help="global vector baseline or spatial 8x8 latent grid",
+    )
     parser.add_argument("--latent-dim", type=int, default=32)
+    parser.add_argument("--spatial-latent-channels", type=int, default=8)
+    parser.add_argument(
+        "--spatial-dynamics-architecture",
+        choices=sorted(SPATIAL_DYNAMICS_ARCHITECTURES),
+        default="cnn",
+        help="spatial dynamics model: stacked-frame CNN or recurrent ConvGRU",
+    )
     parser.add_argument("--base-channels", type=int, default=16)
     parser.add_argument("--dynamics-hidden-size", type=int, default=256)
     parser.add_argument("--autoencoder-epochs", type=int, default=20)
@@ -1240,7 +1637,12 @@ def main() -> None:
             data_path=args.data,
             output_path=args.output,
             preview_path=args.preview,
+            latent_layout=args.latent_layout,
             latent_dim=args.latent_dim,
+            spatial_latent_channels=args.spatial_latent_channels,
+            spatial_dynamics_architecture=(
+                args.spatial_dynamics_architecture
+            ),
             base_channels=args.base_channels,
             dynamics_hidden_size=args.dynamics_hidden_size,
             autoencoder_epochs=args.autoencoder_epochs,

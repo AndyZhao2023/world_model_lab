@@ -17,7 +17,10 @@ from world_model_lab.visual_latent_data import (
     frames_to_tensor,
     transition_indices_for_episode_ids,
 )
-from world_model_lab.visual_latent_model import ConvAutoencoder
+from world_model_lab.visual_latent_model import (
+    ConvAutoencoder,
+    SpatialConvAutoencoder,
+)
 from world_model_lab.visual_windows import build_visual_window_index
 
 
@@ -280,6 +283,22 @@ class VisualLatentArrayTest(unittest.TestCase):
         self.assertEqual(latents.dtype, np.dtype(np.float32))
         self.assertTrue(np.all(np.isfinite(latents)))
         self.assertFalse(model.training)
+
+    def test_encode_all_frames_reversibly_flattens_a_spatial_grid(self):
+        model = SpatialConvAutoencoder(
+            latent_channels=3,
+            base_channels=2,
+        )
+        frames = self.visual["frames"][:2]
+
+        latents = encode_all_frames(model, frames, batch_size=2)
+        with torch.no_grad():
+            expected = model.encode(frames_to_tensor(frames)).flatten(
+                start_dim=1
+            )
+
+        self.assertEqual(latents.shape, (2, 3 * 8 * 8))
+        np.testing.assert_allclose(latents, expected.cpu().numpy())
 
 
 if __name__ == "__main__":

@@ -16,7 +16,10 @@ from .visual_dataset import (
     IMAGE_SIZE,
     validate_visual_dataset,
 )
-from .visual_latent_model import ConvAutoencoder
+from .visual_latent_model import (
+    ConvAutoencoder,
+    SpatialConvAutoencoder,
+)
 from .visual_windows import VisualWindowIndex
 
 
@@ -229,7 +232,7 @@ def fit_safe_normalizer(
 
 
 def encode_all_frames(
-    model: ConvAutoencoder,
+    model: ConvAutoencoder | SpatialConvAutoencoder,
     frames: np.ndarray,
     *,
     batch_size: int,
@@ -251,7 +254,12 @@ def encode_all_frames(
     with torch.no_grad():
         for start in range(0, values.shape[0], batch_size):
             images = frames_to_tensor(values[start : start + batch_size])
-            latents = model.encode(images)
+            encoded = model.encode(images)
+            if encoded.ndim < 2 or encoded.shape[0] != images.shape[0]:
+                raise ValueError(
+                    "encoder must preserve the input batch dimension"
+                )
+            latents = encoded.flatten(start_dim=1)
             if not torch.all(torch.isfinite(latents)):
                 raise ValueError("encoder produced non-finite latents")
             batches.append(latents.cpu().numpy().astype(np.float32, copy=False))

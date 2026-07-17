@@ -32,6 +32,9 @@ from world_model_lab.visual_latent_data import LatentWindowArrays
 from world_model_lab.visual_latent_model import (
     ConvAutoencoder,
     LatentDynamicsMLP,
+    SpatialConvAutoencoder,
+    SpatialLatentDynamicsCNN,
+    SpatialLatentDynamicsConvGRU,
 )
 
 
@@ -220,6 +223,42 @@ class VisualLatentDynamicsTrainingTest(unittest.TestCase):
         self.assertLessEqual(result.best_epoch, 60)
         self.assertFalse(result.model.training)
 
+    def test_convgru_dynamics_training_uses_requested_architecture(self):
+        arrays = make_latent_arrays(count=12, latent_dim=2 * 8 * 8)
+        train = LatentWindowArrays(
+            **{
+                name: np.asarray(getattr(arrays, name))[:8]
+                for name in arrays.__dataclass_fields__
+            }
+        )
+        validation = LatentWindowArrays(
+            **{
+                name: np.asarray(getattr(arrays, name))[8:]
+                for name in arrays.__dataclass_fields__
+            }
+        )
+
+        result = train_latent_dynamics(
+            train,
+            validation,
+            latent_normalizer=Normalizer(
+                np.zeros(2 * 8 * 8),
+                np.ones(2 * 8 * 8),
+            ),
+            action_normalizer=Normalizer(np.zeros(2), np.ones(2)),
+            latent_layout="spatial",
+            spatial_latent_channels=2,
+            spatial_dynamics_architecture="convgru",
+            hidden_size=4,
+            epochs=1,
+            batch_size=4,
+            learning_rate=1e-3,
+            seed=5,
+        )
+
+        self.assertIsInstance(result.model, SpatialLatentDynamicsConvGRU)
+        self.assertFalse(result.model.training)
+
     def test_decoded_metrics_include_changed_pixels_and_copy_last(self):
         visual = make_tiny_visual_dataset()
         visual["frames"][3].fill(0)
@@ -272,6 +311,18 @@ class VisualLatentDynamicsTrainingTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["copy_last_pixel_mse"], 1.0)
         self.assertAlmostEqual(metrics["copy_last_pixel_mae"], 1.0)
         self.assertAlmostEqual(metrics["copy_last_changed_pixel_mae"], 1.0)
+        self.assertAlmostEqual(
+            metrics["decoded_last_latent_pixel_mse"],
+            0.25,
+        )
+        self.assertAlmostEqual(
+            metrics["decoded_last_latent_pixel_mae"],
+            0.5,
+        )
+        self.assertAlmostEqual(
+            metrics["decoded_last_latent_changed_pixel_mae"],
+            0.5,
+        )
 
     def test_oracle_reconstruction_decodes_the_target_latent(self):
         class ScalarDecoder(torch.nn.Module):
@@ -315,6 +366,162 @@ class VisualLatentDynamicsTrainingTest(unittest.TestCase):
             metrics["oracle_reconstruction_pixel_mse"],
             0.0,
         )
+
+    def test_action_ablations_are_deterministic_and_change_sensitive_model(self):
+        class CurrentActionDynamics(torch.nn.Module):
+            def forward(
+                self,
+                context: torch.Tensor,
+                history: torch.Tensor,
+                current: torch.Tensor,
+            ) -> torch.Tensor:
+                del history
+                return context[:, -1] + current[:, :1]
+
+        class ScalarDecoder(torch.nn.Module):
+            def decode(self, latents: torch.Tensor) -> torch.Tensor:
+                return latents[:, :1, None, None].expand(
+                    -1,
+                    3,
+                    64,
+                    64,
+                )
+
+        visual = make_tiny_visual_dataset()
+        current_actions = np.asarray(
+            [[0.1, 0.0], [0.2, 0.0], [0.3, 0.0], [0.4, 0.0]],
+            dtype=np.float64,
+        )
+        arrays = LatentWindowArrays(
+            context_latents=np.zeros((4, 4, 1), dtype=np.float32),
+            history_actions=np.zeros((4, 3, 2), dtype=np.float64),
+            current_actions=current_actions,
+            target_latents=current_actions[:, :1].astype(np.float32),
+            last_frame_indices=np.asarray([3, 8, 13, 18], dtype=np.int64),
+            target_frame_indices=np.asarray([4, 9, 14, 19], dtype=np.int64),
+            episode_ids=np.asarray([10, 11, 12, 13], dtype=np.int64),
+            step_ids=np.full(4, 3, dtype=np.int64),
+        )
+        kwargs = {
+            "latent_normalizer": Normalizer(np.zeros(1), np.ones(1)),
+            "action_normalizer": Normalizer(np.zeros(2), np.ones(2)),
+            "batch_size": 2,
+            "action_shuffle_seed": 7,
+        }
+
+        first = evaluate_latent_dynamics(
+            CurrentActionDynamics(),
+            ScalarDecoder(),
+            visual,
+            arrays,
+            **kwargs,
+        )
+        second = evaluate_latent_dynamics(
+            CurrentActionDynamics(),
+            ScalarDecoder(),
+            visual,
+            arrays,
+            **kwargs,
+        )
+
+        self.assertEqual(first, second)
+        self.assertAlmostEqual(first["normalized_latent_mse"], 0.0)
+        self.assertGreater(
+            first["mean_action_ablation_normalized_latent_mse"],
+            0.0,
+        )
+        self.assertGreater(
+            first["shuffled_action_ablation_normalized_latent_mse"],
+            0.0,
+        )
+        for prefix in ("mean_action_ablation", "shuffled_action_ablation"):
+            for suffix in (
+                "normalized_latent_mse",
+                "pixel_mse",
+                "changed_pixel_mae",
+            ):
+                self.assertTrue(math.isfinite(float(first[f"{prefix}_{suffix}"])))
+
+        with self.assertRaises(ValueError):
+            evaluate_latent_dynamics(
+                CurrentActionDynamics(),
+                ScalarDecoder(),
+                visual,
+                arrays,
+                latent_normalizer=kwargs["latent_normalizer"],
+                action_normalizer=kwargs["action_normalizer"],
+                batch_size=2,
+                action_shuffle_seed=-1,
+            )
+
+    def test_context_ablations_expose_history_sensitive_dynamics(self):
+        class HistoryDynamics(torch.nn.Module):
+            def forward(
+                self,
+                context: torch.Tensor,
+                history: torch.Tensor,
+                current: torch.Tensor,
+            ) -> torch.Tensor:
+                del history, current
+                return context[:, -1] + context[:, -2] - context[:, -3]
+
+        class ScalarDecoder(torch.nn.Module):
+            def decode(self, latents: torch.Tensor) -> torch.Tensor:
+                return latents[:, :1, None, None].expand(
+                    -1,
+                    3,
+                    64,
+                    64,
+                )
+
+        visual = make_tiny_visual_dataset()
+        context = np.tile(
+            np.asarray([0.1, 0.2, 0.4, 0.7], dtype=np.float32)[
+                None,
+                :,
+                None,
+            ],
+            (4, 1, 1),
+        )
+        arrays = LatentWindowArrays(
+            context_latents=context,
+            history_actions=np.zeros((4, 3, 2), dtype=np.float64),
+            current_actions=np.zeros((4, 2), dtype=np.float64),
+            target_latents=np.full((4, 1), 0.9, dtype=np.float32),
+            last_frame_indices=np.asarray([3, 8, 13, 18], dtype=np.int64),
+            target_frame_indices=np.asarray([4, 9, 14, 19], dtype=np.int64),
+            episode_ids=np.asarray([10, 11, 12, 13], dtype=np.int64),
+            step_ids=np.full(4, 3, dtype=np.int64),
+        )
+
+        metrics = evaluate_latent_dynamics(
+            HistoryDynamics(),
+            ScalarDecoder(),
+            visual,
+            arrays,
+            latent_normalizer=Normalizer(np.zeros(1), np.ones(1)),
+            action_normalizer=Normalizer(np.zeros(2), np.ones(2)),
+            batch_size=2,
+        )
+
+        self.assertAlmostEqual(metrics["normalized_latent_mse"], 0.0)
+        self.assertAlmostEqual(
+            metrics["repeat_last_context_normalized_latent_mse"],
+            0.04,
+        )
+        self.assertAlmostEqual(
+            metrics["reverse_history_context_normalized_latent_mse"],
+            0.09,
+        )
+        for prefix in ("repeat_last_context", "reverse_history_context"):
+            for suffix in (
+                "normalized_latent_mse",
+                "pixel_mse",
+                "changed_pixel_mae",
+            ):
+                self.assertTrue(
+                    math.isfinite(float(metrics[f"{prefix}_{suffix}"]))
+                )
 
 
 class VisualLatentCheckpointTest(unittest.TestCase):
@@ -402,6 +609,149 @@ class VisualLatentCheckpointTest(unittest.TestCase):
         current = torch.zeros((2, 2))
         with torch.no_grad():
             expected = dynamics_result.model(context, history, current)
+            actual = loaded.dynamics(context, history, current)
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+    def test_spatial_checkpoint_round_trip_preserves_grid_model(self):
+        autoencoder = SpatialConvAutoencoder(
+            latent_channels=2,
+            base_channels=2,
+        )
+        dynamics = SpatialLatentDynamicsCNN(
+            latent_channels=2,
+            hidden_channels=4,
+        )
+        autoencoder_result = PhaseTrainingResult(
+            model=autoencoder,
+            train_losses=[0.4],
+            validation_losses=[0.5],
+            best_epoch=1,
+        )
+        dynamics_result = PhaseTrainingResult(
+            model=dynamics,
+            train_losses=[0.3],
+            validation_losses=[0.35],
+            best_epoch=1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "spatial.pt"
+            save_visual_latent_checkpoint(
+                path,
+                autoencoder_result=autoencoder_result,
+                dynamics_result=dynamics_result,
+                latent_normalizer=Normalizer(
+                    np.zeros(autoencoder.latent_dim),
+                    np.ones(autoencoder.latent_dim),
+                ),
+                action_normalizer=Normalizer(np.zeros(2), np.ones(2)),
+                split_episode_ids={
+                    "train": np.arange(8, dtype=np.int64),
+                    "validation": np.asarray([8], dtype=np.int64),
+                    "test": np.asarray([9], dtype=np.int64),
+                },
+                training_config={"latent_layout": "spatial"},
+                dataset_metadata={
+                    "path": "/tmp/visual.npz",
+                    "sha256": "a" * 64,
+                    "schema_version": 1,
+                    "renderer_version": "pillow-raster-v1",
+                },
+                autoencoder_test_metrics={"frames": 1},
+                dynamics_test_metrics={"windows": 1},
+            )
+            loaded = load_visual_latent_checkpoint(path)
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+            legacy_payload = dict(payload)
+            legacy_model_config = dict(legacy_payload["model_config"])
+            legacy_model_config.pop("spatial_dynamics_architecture")
+            legacy_payload["model_config"] = legacy_model_config
+            legacy_path = Path(directory) / "legacy-spatial.pt"
+            torch.save(legacy_payload, legacy_path)
+            legacy_loaded = load_visual_latent_checkpoint(legacy_path)
+
+        self.assertIsInstance(loaded.autoencoder, SpatialConvAutoencoder)
+        self.assertIsInstance(loaded.dynamics, SpatialLatentDynamicsCNN)
+        self.assertIsInstance(
+            legacy_loaded.dynamics,
+            SpatialLatentDynamicsCNN,
+        )
+        self.assertEqual(payload["model_config"]["latent_layout"], "spatial")
+        self.assertEqual(
+            payload["model_config"]["spatial_dynamics_architecture"],
+            "cnn",
+        )
+        self.assertEqual(loaded.autoencoder.latent_channels, 2)
+        context = torch.zeros((2, 4, autoencoder.latent_dim))
+        history = torch.zeros((2, 3, 2))
+        current = torch.zeros((2, 2))
+        with torch.no_grad():
+            expected = dynamics(context, history, current)
+            actual = loaded.dynamics(context, history, current)
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+    def test_convgru_checkpoint_round_trip_preserves_predictions(self):
+        autoencoder = SpatialConvAutoencoder(
+            latent_channels=2,
+            base_channels=2,
+        )
+        dynamics = SpatialLatentDynamicsConvGRU(
+            latent_channels=2,
+            hidden_channels=4,
+        )
+        autoencoder_result = PhaseTrainingResult(
+            model=autoencoder,
+            train_losses=[0.4],
+            validation_losses=[0.5],
+            best_epoch=1,
+        )
+        dynamics_result = PhaseTrainingResult(
+            model=dynamics,
+            train_losses=[0.3],
+            validation_losses=[0.35],
+            best_epoch=1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "spatial-convgru.pt"
+            save_visual_latent_checkpoint(
+                path,
+                autoencoder_result=autoencoder_result,
+                dynamics_result=dynamics_result,
+                latent_normalizer=Normalizer(
+                    np.zeros(autoencoder.latent_dim),
+                    np.ones(autoencoder.latent_dim),
+                ),
+                action_normalizer=Normalizer(np.zeros(2), np.ones(2)),
+                split_episode_ids={
+                    "train": np.arange(8, dtype=np.int64),
+                    "validation": np.asarray([8], dtype=np.int64),
+                    "test": np.asarray([9], dtype=np.int64),
+                },
+                training_config={"latent_layout": "spatial"},
+                dataset_metadata={
+                    "path": "/tmp/visual.npz",
+                    "sha256": "a" * 64,
+                    "schema_version": 1,
+                    "renderer_version": "pillow-raster-v1",
+                },
+                autoencoder_test_metrics={"frames": 1},
+                dynamics_test_metrics={"windows": 1},
+            )
+            loaded = load_visual_latent_checkpoint(path)
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+
+        self.assertIsInstance(
+            loaded.dynamics,
+            SpatialLatentDynamicsConvGRU,
+        )
+        self.assertEqual(
+            payload["model_config"]["spatial_dynamics_architecture"],
+            "convgru",
+        )
+        context = torch.randn((2, 4, autoencoder.latent_dim))
+        history = torch.randn((2, 3, 2))
+        current = torch.randn((2, 2))
+        with torch.no_grad():
+            expected = dynamics(context, history, current)
             actual = loaded.dynamics(context, history, current)
         torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
@@ -535,6 +885,74 @@ class VisualLatentEndToEndTest(unittest.TestCase):
                 3.0,
             )
 
+    def test_tiny_spatial_training_writes_reloadable_models(self):
+        visual = make_tiny_visual_dataset()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = root / "visual.npz"
+            checkpoint_path = root / "spatial.pt"
+            preview_path = root / "spatial.png"
+            save_visual_dataset(visual, data_path)
+
+            summary = run_visual_latent_training(
+                data_path=data_path,
+                output_path=checkpoint_path,
+                preview_path=preview_path,
+                latent_layout="spatial",
+                spatial_latent_channels=2,
+                base_channels=2,
+                dynamics_hidden_size=4,
+                autoencoder_epochs=1,
+                dynamics_epochs=1,
+                autoencoder_batch_size=8,
+                dynamics_batch_size=8,
+                seed=3,
+                split_seed=19,
+            )
+            loaded = load_visual_latent_checkpoint(checkpoint_path)
+
+        self.assertIsInstance(loaded.autoencoder, SpatialConvAutoencoder)
+        self.assertIsInstance(loaded.dynamics, SpatialLatentDynamicsCNN)
+        self.assertEqual(loaded.training_config["latent_layout"], "spatial")
+        self.assertEqual(loaded.training_config["spatial_latent_channels"], 2)
+        self.assertIn("oracle_reconstruction_pixel_mse", summary["dynamics"]["test"])
+
+    def test_tiny_spatial_convgru_training_writes_reloadable_models(self):
+        visual = make_tiny_visual_dataset()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = root / "visual.npz"
+            checkpoint_path = root / "spatial-convgru.pt"
+            preview_path = root / "spatial-convgru.png"
+            save_visual_dataset(visual, data_path)
+
+            run_visual_latent_training(
+                data_path=data_path,
+                output_path=checkpoint_path,
+                preview_path=preview_path,
+                latent_layout="spatial",
+                spatial_latent_channels=2,
+                spatial_dynamics_architecture="convgru",
+                base_channels=2,
+                dynamics_hidden_size=4,
+                autoencoder_epochs=1,
+                dynamics_epochs=1,
+                autoencoder_batch_size=8,
+                dynamics_batch_size=8,
+                seed=3,
+                split_seed=19,
+            )
+            loaded = load_visual_latent_checkpoint(checkpoint_path)
+
+        self.assertIsInstance(
+            loaded.dynamics,
+            SpatialLatentDynamicsConvGRU,
+        )
+        self.assertEqual(
+            loaded.training_config["spatial_dynamics_architecture"],
+            "convgru",
+        )
+
     def test_output_collisions_fail_before_training(self):
         visual = make_tiny_visual_dataset()
         with tempfile.TemporaryDirectory() as directory:
@@ -589,6 +1007,9 @@ class VisualLatentEndToEndTest(unittest.TestCase):
             "--autoencoder-epochs",
             "--dynamics-epochs",
             "--latent-dim",
+            "--latent-layout",
+            "--spatial-latent-channels",
+            "--spatial-dynamics-architecture",
             "--motion-loss-weight",
             "--split-seed",
         ):
@@ -605,6 +1026,9 @@ class VisualLatentEndToEndTest(unittest.TestCase):
         for phrase in (
             "ConvAutoencoder",
             "LatentDynamicsMLP",
+            "SpatialConvAutoencoder",
+            "SpatialLatentDynamicsCNN",
+            "SpatialLatentDynamicsConvGRU",
             "copy-last",
             "oracle reconstruction",
             "不读取 `states`",
