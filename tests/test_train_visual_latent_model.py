@@ -755,6 +755,84 @@ class VisualLatentCheckpointTest(unittest.TestCase):
             actual = loaded.dynamics(context, history, current)
         torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
+    def test_checkpoint_writer_rejects_an_unloadable_model_pair(self):
+        autoencoder_result, _ = self._make_phase_results()
+        incompatible_dynamics_result = PhaseTrainingResult(
+            model=LatentDynamicsMLP(latent_dim=5, hidden_size=8),
+            train_losses=[0.3],
+            validation_losses=[0.35],
+            best_epoch=1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "unloadable.pt"
+
+            with self.assertRaisesRegex(ValueError, "unloadable"):
+                save_visual_latent_checkpoint(
+                    path,
+                    autoencoder_result=autoencoder_result,
+                    dynamics_result=incompatible_dynamics_result,
+                    latent_normalizer=Normalizer(
+                        np.zeros(4),
+                        np.ones(4),
+                    ),
+                    action_normalizer=Normalizer(
+                        np.zeros(2),
+                        np.ones(2),
+                    ),
+                    split_episode_ids={
+                        "train": np.arange(8, dtype=np.int64),
+                        "validation": np.asarray([8], dtype=np.int64),
+                        "test": np.asarray([9], dtype=np.int64),
+                    },
+                    training_config={},
+                    dataset_metadata={
+                        "path": "/tmp/visual.npz",
+                        "sha256": "a" * 64,
+                        "schema_version": 1,
+                        "renderer_version": "pillow-raster-v1",
+                    },
+                    autoencoder_test_metrics={"frames": 1},
+                    dynamics_test_metrics={"windows": 1},
+                )
+
+            self.assertFalse(path.exists())
+
+    def test_checkpoint_validation_does_not_advance_torch_rng(self):
+        autoencoder_result, dynamics_result = self._make_phase_results()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "visual-latent.pt"
+            torch.manual_seed(17)
+            state_before = torch.random.get_rng_state().clone()
+
+            save_visual_latent_checkpoint(
+                path,
+                autoencoder_result=autoencoder_result,
+                dynamics_result=dynamics_result,
+                latent_normalizer=Normalizer(np.zeros(4), np.ones(4)),
+                action_normalizer=Normalizer(np.zeros(2), np.ones(2)),
+                split_episode_ids={
+                    "train": np.arange(8, dtype=np.int64),
+                    "validation": np.asarray([8], dtype=np.int64),
+                    "test": np.asarray([9], dtype=np.int64),
+                },
+                training_config={},
+                dataset_metadata={
+                    "path": "/tmp/visual.npz",
+                    "sha256": "a" * 64,
+                    "schema_version": 1,
+                    "renderer_version": "pillow-raster-v1",
+                },
+                autoencoder_test_metrics={"frames": 1},
+                dynamics_test_metrics={"windows": 1},
+            )
+
+            torch.testing.assert_close(
+                torch.random.get_rng_state(),
+                state_before,
+                rtol=0.0,
+                atol=0.0,
+            )
+
     def test_checkpoint_refuses_to_overwrite(self):
         autoencoder_result, dynamics_result = self._make_phase_results()
         with tempfile.TemporaryDirectory() as directory:
@@ -989,6 +1067,82 @@ class VisualLatentEndToEndTest(unittest.TestCase):
                                 split_seed=19,
                             )
                         train.assert_not_called()
+
+    def test_output_paths_cannot_be_ancestors(self):
+        visual = make_tiny_visual_dataset()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = root / "visual.npz"
+            save_visual_dataset(visual, data_path)
+            cases = (
+                (
+                    root / "checkpoint-parent",
+                    root / "checkpoint-parent" / "preview.png",
+                ),
+                (
+                    root / "preview-parent" / "checkpoint.pt",
+                    root / "preview-parent",
+                ),
+            )
+
+            for output, preview in cases:
+                with self.subTest(output=output, preview=preview):
+                    with patch(
+                        "world_model_lab.train_visual_latent_model."
+                        "train_autoencoder"
+                    ) as train:
+                        with self.assertRaisesRegex(ValueError, "ancestors"):
+                            run_visual_latent_training(
+                                data_path=data_path,
+                                output_path=output,
+                                preview_path=preview,
+                                latent_dim=4,
+                                base_channels=2,
+                                dynamics_hidden_size=8,
+                                autoencoder_epochs=1,
+                                dynamics_epochs=1,
+                                autoencoder_batch_size=8,
+                                dynamics_batch_size=8,
+                                seed=3,
+                                split_seed=19,
+                            )
+
+                        train.assert_not_called()
+                    self.assertFalse(output.exists())
+                    self.assertFalse(preview.exists())
+
+    def test_preview_failure_rolls_back_the_new_checkpoint(self):
+        visual = make_tiny_visual_dataset()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = root / "visual.npz"
+            checkpoint_path = root / "visual-latent.pt"
+            preview_path = root / "preview.png"
+            save_visual_dataset(visual, data_path)
+
+            with patch(
+                "world_model_lab.train_visual_latent_model."
+                "plot_visual_latent_predictions",
+                side_effect=RuntimeError("preview failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "preview failed"):
+                    run_visual_latent_training(
+                        data_path=data_path,
+                        output_path=checkpoint_path,
+                        preview_path=preview_path,
+                        latent_dim=4,
+                        base_channels=2,
+                        dynamics_hidden_size=8,
+                        autoencoder_epochs=1,
+                        dynamics_epochs=1,
+                        autoencoder_batch_size=8,
+                        dynamics_batch_size=8,
+                        seed=3,
+                        split_seed=19,
+                    )
+
+            self.assertFalse(checkpoint_path.exists())
+            self.assertFalse(preview_path.exists())
 
     def test_cli_help_and_pyproject_expose_visual_training_command(self):
         standard_output = io.StringIO()

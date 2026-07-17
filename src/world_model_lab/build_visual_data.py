@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
-import unicodedata
 from pathlib import Path
 from typing import Mapping
 
 import numpy as np
 from PIL import Image
 
-from ._artifact_io import write_new_file_atomically
+from ._artifact_io import (
+    is_prospective_ancestor,
+    prospective_path_key,
+    write_new_file_atomically,
+)
 from .visual_dataset import (
     build_visual_dataset,
     load_transition_dataset,
@@ -20,28 +23,6 @@ from .visual_dataset import (
     summarize_visual_dataset,
     validate_visual_dataset,
 )
-
-
-def _prospective_path_key(path: Path) -> tuple[str, ...]:
-    """Return a conservative key for unresolved case/Unicode aliases."""
-
-    return tuple(
-        unicodedata.normalize(
-            "NFC",
-            unicodedata.normalize("NFC", component).casefold(),
-        )
-        for component in path.parts
-    )
-
-
-def _is_prospective_ancestor(
-    ancestor: tuple[str, ...],
-    descendant: tuple[str, ...],
-) -> bool:
-    return (
-        len(ancestor) < len(descendant)
-        and descendant[: len(ancestor)] == ancestor
-    )
 
 
 def _resolved_paths(
@@ -53,16 +34,16 @@ def _resolved_paths(
     source = Path(data_path).expanduser().resolve(strict=False)
     output = Path(output_path).expanduser().resolve(strict=False)
     preview = Path(preview_path).expanduser().resolve(strict=False)
-    source_key = _prospective_path_key(source)
-    output_key = _prospective_path_key(output)
-    preview_key = _prospective_path_key(preview)
+    source_key = prospective_path_key(source)
+    output_key = prospective_path_key(output)
+    preview_key = prospective_path_key(preview)
     if len({source_key, output_key, preview_key}) != 3:
         raise ValueError(
             "data, output, and preview paths must be pairwise distinct"
         )
     if (
-        _is_prospective_ancestor(output_key, preview_key)
-        or _is_prospective_ancestor(preview_key, output_key)
+        is_prospective_ancestor(output_key, preview_key)
+        or is_prospective_ancestor(preview_key, output_key)
     ):
         raise ValueError(
             "output and preview paths must not be ancestors of one another"

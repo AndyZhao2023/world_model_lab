@@ -17,7 +17,11 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from ._artifact_io import write_new_file_atomically
+from ._artifact_io import (
+    is_prospective_ancestor,
+    prospective_path_key,
+    write_new_file_atomically,
+)
 from .dataset import Normalizer, split_episode_ids
 from .diagnose_model import sha256_file
 from .visual_dataset import (
@@ -1052,6 +1056,13 @@ def save_visual_latent_checkpoint(
         ),
         "dynamics_test_metrics": _metric_payload(dynamics_test_metrics),
     }
+    try:
+        with torch.random.fork_rng(devices=[]):
+            _load_visual_latent_payload(payload)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            "checkpoint inputs would produce an unloadable payload"
+        ) from error
     return write_new_file_atomically(
         output,
         writer=lambda handle: torch.save(payload, handle),
@@ -1134,12 +1145,11 @@ def _loaded_metrics(
     return result
 
 
-def load_visual_latent_checkpoint(
-    path: Path | str,
+def _load_visual_latent_payload(
+    payload: dict[str, Any],
 ) -> LoadedVisualLatentModel:
-    """Load a visual latent checkpoint without enabling arbitrary pickle."""
+    """Validate and reconstruct one in-memory checkpoint payload."""
 
-    payload = torch.load(Path(path), map_location="cpu", weights_only=True)
     if payload.get("format_version") != CHECKPOINT_FORMAT_VERSION:
         raise ValueError("unsupported visual latent checkpoint format")
     if payload.get("kind") != CHECKPOINT_KIND:
@@ -1252,6 +1262,17 @@ def load_visual_latent_checkpoint(
     )
 
 
+def load_visual_latent_checkpoint(
+    path: Path | str,
+) -> LoadedVisualLatentModel:
+    """Load a visual latent checkpoint without enabling arbitrary pickle."""
+
+    payload = torch.load(Path(path), map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict):
+        raise ValueError("visual latent checkpoint payload must be a mapping")
+    return _load_visual_latent_payload(payload)
+
+
 def plot_visual_latent_predictions(
     output_path: Path | str,
     *,
@@ -1350,12 +1371,24 @@ def _preflight_output_paths(
     output_path: Path,
     preview_path: Path,
 ) -> None:
-    if output_path.resolve(strict=False) == preview_path.resolve(strict=False):
+    output = output_path.resolve(strict=False)
+    preview = preview_path.resolve(strict=False)
+    output_key = prospective_path_key(output)
+    preview_key = prospective_path_key(preview)
+    if output_key == preview_key:
         raise ValueError("checkpoint and preview paths must be different")
-    if output_path.exists():
-        raise FileExistsError(f"checkpoint already exists: {output_path}")
-    if preview_path.exists():
-        raise FileExistsError(f"preview already exists: {preview_path}")
+    if (
+        is_prospective_ancestor(output_key, preview_key)
+        or is_prospective_ancestor(preview_key, output_key)
+    ):
+        raise ValueError(
+            "checkpoint and preview paths must not be ancestors "
+            "of one another"
+        )
+    if output.exists():
+        raise FileExistsError(f"checkpoint already exists: {output}")
+    if preview.exists():
+        raise FileExistsError(f"preview already exists: {preview}")
 
 
 def run_visual_latent_training(
@@ -1529,15 +1562,25 @@ def run_visual_latent_training(
         autoencoder_test_metrics=autoencoder_test_metrics,
         dynamics_test_metrics=dynamics_test_metrics,
     )
-    plot_visual_latent_predictions(
-        preview,
-        autoencoder=autoencoder,
-        dynamics=dynamics,
-        dataset=dataset,
-        arrays=window_arrays["test"],
-        latent_normalizer=latent_normalizer,
-        action_normalizer=action_normalizer,
-    )
+    try:
+        plot_visual_latent_predictions(
+            preview,
+            autoencoder=autoencoder,
+            dynamics=dynamics,
+            dataset=dataset,
+            arrays=window_arrays["test"],
+            latent_normalizer=latent_normalizer,
+            action_normalizer=action_normalizer,
+        )
+    except Exception:
+        try:
+            output.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            raise RuntimeError(
+                "preview publication failed and checkpoint rollback failed: "
+                f"{output}"
+            ) from cleanup_error
+        raise
     return {
         "dataset": dataset_metadata,
         "split_episodes": {
