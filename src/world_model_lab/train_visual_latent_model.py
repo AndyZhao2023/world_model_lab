@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import copy
 from dataclasses import dataclass
 import io
@@ -27,6 +28,7 @@ from .diagnose_model import sha256_file
 from .visual_dataset import (
     CONTEXT_FRAMES,
     load_visual_dataset,
+    validate_visual_dataset,
 )
 from .visual_latent_data import (
     LatentWindowArrays,
@@ -250,6 +252,38 @@ def _motion_weighted_mse(
     )
 
 
+def _changed_pixel_mae_loss(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    changed_masks: torch.Tensor,
+) -> torch.Tensor:
+    """Return RGB MAE over only spatial pixels marked as changed."""
+
+    if predictions.ndim != 4 or predictions.shape != targets.shape:
+        raise ValueError(
+            "decoded predictions and targets must share shape [B, C, H, W]"
+        )
+    expected_mask_shape = (
+        predictions.shape[0],
+        1,
+        predictions.shape[2],
+        predictions.shape[3],
+    )
+    if tuple(changed_masks.shape) != expected_mask_shape:
+        raise ValueError("changed_masks must have shape [B, 1, H, W]")
+    if not bool(torch.all((changed_masks == 0) | (changed_masks == 1))):
+        raise ValueError("changed_masks must be binary")
+
+    expanded_masks = changed_masks.expand_as(predictions)
+    absolute_error_sum = torch.sum(
+        torch.abs(predictions - targets) * expanded_masks
+    )
+    changed_value_count = torch.sum(expanded_masks)
+    if float(changed_value_count) == 0.0:
+        return absolute_error_sum
+    return absolute_error_sum / changed_value_count
+
+
 def train_autoencoder(
     dataset: dict[str, np.ndarray],
     *,
@@ -423,20 +457,110 @@ def _normalized_window_tensors(
     )
 
 
+def _dynamics_image_supervision_tensors(
+    visual_dataset: Mapping[str, np.ndarray],
+    arrays: LatentWindowArrays,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return compact uint8 targets and boolean changed-pixel masks."""
+
+    validate_visual_dataset(visual_dataset)
+    frames = np.asarray(visual_dataset["frames"])
+    frame_count = int(frames.shape[0])
+    last_indexes = np.asarray(arrays.last_frame_indices, dtype=np.int64)
+    target_indexes = np.asarray(arrays.target_frame_indices, dtype=np.int64)
+    if (
+        np.any(last_indexes < 0)
+        or np.any(last_indexes >= frame_count)
+        or np.any(target_indexes < 0)
+        or np.any(target_indexes >= frame_count)
+    ):
+        raise ValueError("latent window frame indices are out of range")
+    last_frames = frames[last_indexes]
+    target_frames = frames[target_indexes]
+    changed_masks = np.any(last_frames != target_frames, axis=3)
+    return (
+        torch.from_numpy(np.ascontiguousarray(target_frames)),
+        torch.from_numpy(np.ascontiguousarray(changed_masks)),
+    )
+
+
+def _dynamics_batch_loss(
+    model: VisualLatentDynamics,
+    batch: tuple[torch.Tensor, ...] | list[torch.Tensor],
+    *,
+    latent_normalizer: Normalizer,
+    decoder: VisualAutoencoder | None,
+    changed_pixel_loss_weight: float,
+) -> torch.Tensor:
+    """Evaluate the configured latent plus decoded-image objective."""
+
+    if len(batch) not in (4, 6):
+        raise ValueError("latent dynamics batch has an invalid structure")
+    context, history, current, target = batch[:4]
+    prediction = model(context, history, current)
+    latent_mse = torch.mean(torch.square(prediction - target))
+    if changed_pixel_loss_weight == 0.0:
+        loss = latent_mse
+    else:
+        if decoder is None or len(batch) != 6:
+            raise ValueError(
+                "positive changed-pixel loss requires decoder image targets"
+            )
+        target_uint8, changed = batch[4:]
+        target_frames = (
+            target_uint8.permute(0, 3, 1, 2)
+            .to(dtype=prediction.dtype)
+            .div(255.0)
+        )
+        changed_masks = changed.unsqueeze(1).to(dtype=prediction.dtype)
+        latent_mean = torch.as_tensor(
+            latent_normalizer.mean,
+            dtype=prediction.dtype,
+            device=prediction.device,
+        )
+        latent_std = torch.as_tensor(
+            latent_normalizer.std,
+            dtype=prediction.dtype,
+            device=prediction.device,
+        )
+        decoded_frames = decoder.decode(
+            prediction * latent_std + latent_mean
+        )
+        changed_pixel_mae = _changed_pixel_mae_loss(
+            decoded_frames,
+            target_frames,
+            changed_masks,
+        )
+        loss = (
+            latent_mse
+            + changed_pixel_loss_weight * changed_pixel_mae
+        )
+    if not torch.isfinite(loss):
+        raise ValueError("latent dynamics loss is non-finite")
+    return loss
+
+
 def _mean_dynamics_loss(
     model: VisualLatentDynamics,
     loader: DataLoader,
+    *,
+    latent_normalizer: Normalizer,
+    decoder: VisualAutoencoder | None,
+    changed_pixel_loss_weight: float,
 ) -> float:
     model.eval()
     loss_sum = 0.0
     sample_count = 0
     with torch.no_grad():
-        for context, history, current, target in loader:
-            prediction = model(context, history, current)
-            loss = torch.mean(torch.square(prediction - target))
-            if not torch.isfinite(loss):
-                raise ValueError("latent dynamics validation loss is non-finite")
-            batch_count = int(context.shape[0])
+        for batch in loader:
+            loss = _dynamics_batch_loss(
+                model,
+                batch,
+                latent_normalizer=latent_normalizer,
+                decoder=decoder,
+                changed_pixel_loss_weight=changed_pixel_loss_weight,
+            )
+            batch_count = int(batch[0].shape[0])
             loss_sum += float(loss) * batch_count
             sample_count += batch_count
     if sample_count == 0:
@@ -458,8 +582,11 @@ def train_latent_dynamics(
     batch_size: int = 256,
     learning_rate: float = 1e-3,
     seed: int = 0,
+    decoder: VisualAutoencoder | None = None,
+    visual_dataset: Mapping[str, np.ndarray] | None = None,
+    changed_pixel_loss_weight: float = 0.0,
 ) -> PhaseTrainingResult:
-    """Train residual one-step dynamics in normalized latent space."""
+    """Train residual one-step dynamics with optional decoded supervision."""
 
     _validate_training_parameters(
         epochs=epochs,
@@ -469,6 +596,20 @@ def train_latent_dynamics(
     )
     if train_arrays.count == 0 or validation_arrays.count == 0:
         raise ValueError("latent dynamics train and validation data must not be empty")
+    if (
+        not math.isfinite(changed_pixel_loss_weight)
+        or changed_pixel_loss_weight < 0.0
+    ):
+        raise ValueError(
+            "changed_pixel_loss_weight must be finite and non-negative"
+        )
+    if changed_pixel_loss_weight > 0.0 and (
+        decoder is None or visual_dataset is None
+    ):
+        raise ValueError(
+            "decoder and visual_dataset are required for positive "
+            "changed_pixel_loss_weight"
+        )
     layout = _validate_latent_layout(latent_layout)
     architecture = _validate_spatial_dynamics_architecture(
         spatial_dynamics_architecture
@@ -485,6 +626,20 @@ def train_latent_dynamics(
         latent_normalizer=latent_normalizer,
         action_normalizer=action_normalizer,
     )
+    if changed_pixel_loss_weight > 0.0:
+        assert visual_dataset is not None
+        train_tensors += _dynamics_image_supervision_tensors(
+            visual_dataset,
+            train_arrays,
+        )
+        validation_tensors += _dynamics_image_supervision_tensors(
+            visual_dataset,
+            validation_arrays,
+        )
+        assert decoder is not None
+        decoder.eval()
+        for parameter in decoder.parameters():
+            parameter.requires_grad_(False)
     torch.manual_seed(seed)
     model = _make_dynamics(
         latent_layout=layout,
@@ -519,19 +674,28 @@ def train_latent_dynamics(
         model.train()
         epoch_loss = 0.0
         sample_count = 0
-        for context, history, current, target in train_loader:
+        for batch in train_loader:
             optimizer.zero_grad()
-            prediction = model(context, history, current)
-            loss = torch.mean(torch.square(prediction - target))
-            if not torch.isfinite(loss):
-                raise ValueError("latent dynamics training loss is non-finite")
+            loss = _dynamics_batch_loss(
+                model,
+                batch,
+                latent_normalizer=latent_normalizer,
+                decoder=decoder,
+                changed_pixel_loss_weight=changed_pixel_loss_weight,
+            )
             loss.backward()
             optimizer.step()
-            batch_count = int(context.shape[0])
+            batch_count = int(batch[0].shape[0])
             epoch_loss += float(loss.detach()) * batch_count
             sample_count += batch_count
         train_loss = epoch_loss / sample_count
-        validation_loss = _mean_dynamics_loss(model, validation_loader)
+        validation_loss = _mean_dynamics_loss(
+            model,
+            validation_loader,
+            latent_normalizer=latent_normalizer,
+            decoder=decoder,
+            changed_pixel_loss_weight=changed_pixel_loss_weight,
+        )
         train_losses.append(train_loss)
         validation_losses.append(validation_loss)
         if validation_loss < best_validation_loss:

@@ -17,6 +17,7 @@ from tests.test_visual_windows import make_visual_dataset
 from world_model_lab.dataset import Normalizer, split_episode_ids
 from world_model_lab.train_visual_latent_model import (
     PhaseTrainingResult,
+    _changed_pixel_mae_loss,
     _motion_weighted_mse,
     evaluate_autoencoder,
     evaluate_latent_dynamics,
@@ -181,6 +182,61 @@ class VisualAutoencoderTrainingTest(unittest.TestCase):
 
 
 class VisualLatentDynamicsTrainingTest(unittest.TestCase):
+    def test_changed_pixel_mae_loss_uses_only_masked_rgb_values(self):
+        target = torch.zeros((1, 3, 1, 2), dtype=torch.float32)
+        prediction = torch.tensor(
+            [[[[1.0, 0.5]], [[1.0, 0.5]], [[1.0, 0.5]]]],
+            dtype=torch.float32,
+        )
+        mask = torch.tensor([[[[1.0, 0.0]]]], dtype=torch.float32)
+
+        loss = _changed_pixel_mae_loss(prediction, target, mask)
+
+        torch.testing.assert_close(loss, torch.tensor(1.0))
+
+    def test_changed_pixel_mae_loss_returns_differentiable_zero_for_empty_mask(
+        self,
+    ):
+        prediction = torch.ones(
+            (1, 3, 2, 2),
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+
+        loss = _changed_pixel_mae_loss(
+            prediction,
+            torch.zeros_like(prediction),
+            torch.zeros((1, 1, 2, 2), dtype=torch.float32),
+        )
+        loss.backward()
+
+        self.assertEqual(float(loss.detach()), 0.0)
+        torch.testing.assert_close(
+            prediction.grad,
+            torch.zeros_like(prediction),
+        )
+
+    def test_changed_pixel_mae_loss_rejects_invalid_inputs(self):
+        prediction = torch.zeros((1, 3, 2, 2), dtype=torch.float32)
+        target = torch.zeros_like(prediction)
+        mask = torch.zeros((1, 1, 2, 2), dtype=torch.float32)
+        cases = (
+            (prediction[:, :2], target, mask),
+            (prediction, target, mask[:, :, :1]),
+            (prediction, target, torch.full_like(mask, 0.5)),
+        )
+        for candidate, candidate_target, candidate_mask in cases:
+            with self.subTest(
+                prediction_shape=tuple(candidate.shape),
+                mask_shape=tuple(candidate_mask.shape),
+            ):
+                with self.assertRaises(ValueError):
+                    _changed_pixel_mae_loss(
+                        candidate,
+                        candidate_target,
+                        candidate_mask,
+                    )
+
     def test_dynamics_training_reduces_a_deterministic_residual(self):
         arrays = make_latent_arrays()
         train = LatentWindowArrays(
@@ -258,6 +314,156 @@ class VisualLatentDynamicsTrainingTest(unittest.TestCase):
 
         self.assertIsInstance(result.model, SpatialLatentDynamicsConvGRU)
         self.assertFalse(result.model.training)
+
+    def test_changed_pixel_objective_freezes_decoder_parameters(self):
+        visual = make_tiny_visual_dataset()
+        arrays = make_latent_arrays(count=12, latent_dim=2 * 8 * 8)
+        arrays = LatentWindowArrays(
+            **{
+                name: (
+                    np.arange(1, 13, dtype=np.int64)
+                    if name == "target_frame_indices"
+                    else np.asarray(getattr(arrays, name))
+                )
+                for name in arrays.__dataclass_fields__
+            }
+        )
+        train = LatentWindowArrays(
+            **{
+                name: np.asarray(getattr(arrays, name))[:8]
+                for name in arrays.__dataclass_fields__
+            }
+        )
+        validation = LatentWindowArrays(
+            **{
+                name: np.asarray(getattr(arrays, name))[8:]
+                for name in arrays.__dataclass_fields__
+            }
+        )
+        decoder = SpatialConvAutoencoder(
+            latent_channels=2,
+            base_channels=2,
+        )
+        original_parameters = {
+            name: value.detach().clone()
+            for name, value in decoder.state_dict().items()
+        }
+
+        result = train_latent_dynamics(
+            train,
+            validation,
+            latent_normalizer=Normalizer(
+                np.zeros(2 * 8 * 8),
+                np.ones(2 * 8 * 8),
+            ),
+            action_normalizer=Normalizer(np.zeros(2), np.ones(2)),
+            latent_layout="spatial",
+            spatial_latent_channels=2,
+            hidden_size=4,
+            epochs=1,
+            batch_size=4,
+            learning_rate=1e-3,
+            seed=5,
+            decoder=decoder,
+            visual_dataset=visual,
+            changed_pixel_loss_weight=0.1,
+        )
+
+        self.assertIsInstance(result.model, SpatialLatentDynamicsCNN)
+        self.assertFalse(decoder.training)
+        self.assertTrue(
+            all(
+                not parameter.requires_grad
+                for parameter in decoder.parameters()
+            )
+        )
+        for name, expected in original_parameters.items():
+            torch.testing.assert_close(
+                decoder.state_dict()[name],
+                expected,
+                rtol=0.0,
+                atol=0.0,
+            )
+
+    def test_changed_pixel_objective_rejects_invalid_configuration(self):
+        arrays = make_latent_arrays(count=4)
+        kwargs = {
+            "latent_normalizer": Normalizer(np.zeros(3), np.ones(3)),
+            "action_normalizer": Normalizer(np.zeros(2), np.ones(2)),
+            "hidden_size": 4,
+            "epochs": 1,
+            "batch_size": 4,
+            "learning_rate": 1e-3,
+            "seed": 5,
+        }
+        for weight in (-1.0, float("nan"), float("inf")):
+            with self.subTest(weight=weight):
+                with self.assertRaises(ValueError):
+                    train_latent_dynamics(
+                        arrays,
+                        arrays,
+                        changed_pixel_loss_weight=weight,
+                        **kwargs,
+                    )
+        with self.assertRaisesRegex(ValueError, "decoder and visual_dataset"):
+            train_latent_dynamics(
+                arrays,
+                arrays,
+                changed_pixel_loss_weight=0.1,
+                **kwargs,
+            )
+
+    def test_zero_changed_pixel_weight_preserves_legacy_training_exactly(self):
+        arrays = make_latent_arrays(count=12)
+        train = LatentWindowArrays(
+            **{
+                name: np.asarray(getattr(arrays, name))[:8]
+                for name in arrays.__dataclass_fields__
+            }
+        )
+        validation = LatentWindowArrays(
+            **{
+                name: np.asarray(getattr(arrays, name))[8:]
+                for name in arrays.__dataclass_fields__
+            }
+        )
+        kwargs = {
+            "latent_normalizer": Normalizer(np.zeros(3), np.ones(3)),
+            "action_normalizer": Normalizer(np.zeros(2), np.ones(2)),
+            "hidden_size": 4,
+            "epochs": 2,
+            "batch_size": 4,
+            "learning_rate": 1e-3,
+            "seed": 5,
+        }
+
+        legacy = train_latent_dynamics(
+            train,
+            validation,
+            **kwargs,
+        )
+        explicit_zero = train_latent_dynamics(
+            train,
+            validation,
+            decoder=ConvAutoencoder(latent_dim=3, base_channels=2),
+            visual_dataset=make_tiny_visual_dataset(),
+            changed_pixel_loss_weight=0.0,
+            **kwargs,
+        )
+
+        self.assertEqual(legacy.train_losses, explicit_zero.train_losses)
+        self.assertEqual(
+            legacy.validation_losses,
+            explicit_zero.validation_losses,
+        )
+        self.assertEqual(legacy.best_epoch, explicit_zero.best_epoch)
+        for name, expected in legacy.model.state_dict().items():
+            torch.testing.assert_close(
+                explicit_zero.model.state_dict()[name],
+                expected,
+                rtol=0.0,
+                atol=0.0,
+            )
 
     def test_decoded_metrics_include_changed_pixels_and_copy_last(self):
         visual = make_tiny_visual_dataset()

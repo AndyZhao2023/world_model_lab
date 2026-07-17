@@ -310,6 +310,44 @@ MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
 默认的 `--latent-layout global` 仍使用原来的 `ConvAutoencoder` 和
 `LatentDynamicsMLP`，所以旧命令和旧 checkpoint 保持兼容。
 
+### 使用冻结 Decoder 对齐 Dynamics 训练目标
+
+空间 CNN 的 latent MSE 与解码后的小车质量并不完全一致。下面的命令复用已经训练
+成功的空间 autoencoder、normalizer 和 episode split，只重新初始化并训练相同的
+CNN dynamics：
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
+  .venv/bin/python -m \
+  world_model_lab.train_visual_dynamics_objective \
+  --data data/visual_episodes.npz \
+  --source-checkpoint artifacts/visual_latent_spatial8.pt \
+  --output artifacts/visual_latent_spatial8_objective_w01.pt \
+  --preview artifacts/visual_latent_spatial8_objective_w01_predictions.png \
+  --changed-pixel-loss-weight 0.1 \
+  --dynamics-epochs 50 \
+  --dynamics-batch-size 256
+```
+
+训练目标为：
+
+```text
+total loss
+  = normalized latent MSE
+  + 0.1 * decoded changed-pixel MAE
+```
+
+预测 latent 会先反归一化，再通过冻结 decoder 生成图像。变化区域 mask 来自训练
+样本的真实目标帧与最后一张 context frame 的 RGB 差异，只作为监督信号；推理时
+模型仍然只能看到四帧历史和对齐动作。该路径不读取物理状态、小车位置标签、
+reward 或 done，也不会更新 autoencoder 权重或重新拟合 normalizer。
+
+在固定权重 `0.1` 的受控实验中，变化区 MAE 从 latent-only CNN 的
+`0.314072` 降至 `0.299908`，改善 `4.51%`；normalized latent MSE 从
+`0.0308590` 变为 `0.0313650`，恶化 `1.64%`。该候选通过预先设定的变化区改善
+和 latent 稳定性门槛，成为当前领先的一步 dynamics 目标。Mean-action 仍略优于
+真实动作的解码变化区指标，因此动作因果性仍需在后续多步实验中验证。
+
 ## 训练第一个 Learned World Model
 
 安装新增的 PyTorch 依赖：

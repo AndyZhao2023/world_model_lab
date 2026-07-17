@@ -133,6 +133,12 @@ dynamics with normalized latent MSE plus a frozen-decoder changed-region loss,
 then check whether the World-to-Oracle changed-pixel gap closes without
 damaging latent stability.
 
+That experiment is now complete. With auxiliary weight `0.1`, changed-pixel
+MAE improved from `0.314072` to `0.299908` while normalized latent MSE worsened
+only `1.64%`. The candidate passed both preregistered gates and reduced the
+remaining World-to-Oracle changed-pixel gap by `29.53%`; see
+`docs/experiments/2026-07-17-spatial-dynamics-objective-alignment.md`.
+
 ## Artifacts
 
 - ConvGRU checkpoint:
