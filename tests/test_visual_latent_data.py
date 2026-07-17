@@ -7,9 +7,11 @@ import torch
 
 from tests.test_visual_windows import make_visual_dataset
 from world_model_lab.visual_latent_data import (
+    LatentRolloutArrays,
     LatentWindowArrays,
     VisualFrameDataset,
     VisualMotionFrameDataset,
+    build_latent_rollout_arrays,
     build_latent_window_arrays,
     encode_all_frames,
     fit_safe_normalizer,
@@ -299,6 +301,126 @@ class VisualLatentArrayTest(unittest.TestCase):
 
         self.assertEqual(latents.shape, (2, 3 * 8 * 8))
         np.testing.assert_allclose(latents, expected.cpu().numpy())
+
+
+class VisualLatentRolloutArrayTest(unittest.TestCase):
+    def setUp(self):
+        self.visual = make_visual_dataset((10, 8, 7))
+        self.latent_frames = np.arange(
+            self.visual["frames"].shape[0] * 3,
+            dtype=np.float32,
+        ).reshape(-1, 3)
+
+    def test_rollouts_follow_exact_episode_frame_and_action_offsets(self):
+        arrays = build_latent_rollout_arrays(
+            self.visual,
+            np.asarray([10, 11, 12], dtype=np.int64),
+            self.latent_frames,
+            horizon=5,
+        )
+
+        self.assertIsInstance(arrays, LatentRolloutArrays)
+        self.assertEqual(arrays.count, 4)
+        self.assertEqual(arrays.horizon, 5)
+        self.assertEqual(arrays.context_latents.shape, (4, 4, 3))
+        self.assertEqual(arrays.history_actions.shape, (4, 3, 2))
+        self.assertEqual(arrays.rollout_actions.shape, (4, 5, 2))
+        self.assertEqual(arrays.target_latents.shape, (4, 5, 3))
+        self.assertEqual(arrays.target_frame_indices.shape, (4, 5))
+        np.testing.assert_array_equal(arrays.episode_ids, [10, 10, 10, 11])
+        np.testing.assert_array_equal(arrays.start_step_ids, [3, 4, 5, 3])
+
+        np.testing.assert_array_equal(
+            arrays.context_latents[0],
+            self.latent_frames[0:4],
+        )
+        np.testing.assert_array_equal(
+            arrays.history_actions[0],
+            self.visual["actions"][0:3],
+        )
+        np.testing.assert_array_equal(
+            arrays.rollout_actions[0],
+            self.visual["actions"][3:8],
+        )
+        np.testing.assert_array_equal(
+            arrays.target_latents[0],
+            self.latent_frames[4:9],
+        )
+        np.testing.assert_array_equal(
+            arrays.target_frame_indices[0],
+            np.arange(4, 9, dtype=np.int64),
+        )
+        self.assertEqual(int(arrays.initial_frame_indices[0]), 3)
+
+        second_episode_index = 3
+        frame_start = int(self.visual["frame_offsets"][1])
+        action_start = int(self.visual["transition_offsets"][1])
+        np.testing.assert_array_equal(
+            arrays.context_latents[second_episode_index],
+            self.latent_frames[frame_start : frame_start + 4],
+        )
+        np.testing.assert_array_equal(
+            arrays.rollout_actions[second_episode_index],
+            self.visual["actions"][action_start + 3 : action_start + 8],
+        )
+        for values in arrays.__dict__.values():
+            self.assertFalse(np.asarray(values).flags.writeable)
+
+    def test_rollouts_reject_invalid_protocol_or_latents(self):
+        count = self.visual["frames"].shape[0]
+        cases = (
+            {
+                "selected_episode_ids": np.asarray([], dtype=np.int64),
+            },
+            {
+                "selected_episode_ids": np.asarray([[10]], dtype=np.int64),
+            },
+            {
+                "selected_episode_ids": np.asarray([10.0]),
+            },
+            {
+                "selected_episode_ids": np.asarray([10, 10], dtype=np.int64),
+            },
+            {
+                "selected_episode_ids": np.asarray([99], dtype=np.int64),
+            },
+            {"horizon": 0},
+            {
+                "latent_frames": np.zeros(
+                    (count - 1, 3),
+                    dtype=np.float32,
+                ),
+            },
+            {
+                "latent_frames": np.full(
+                    (count, 3),
+                    np.nan,
+                    dtype=np.float32,
+                ),
+            },
+        )
+        for update in cases:
+            with self.subTest(update=update):
+                kwargs = {
+                    "dataset": self.visual,
+                    "selected_episode_ids": np.asarray(
+                        [10, 11, 12],
+                        dtype=np.int64,
+                    ),
+                    "latent_frames": self.latent_frames,
+                    "horizon": 5,
+                }
+                kwargs.update(update)
+                with self.assertRaises(ValueError):
+                    build_latent_rollout_arrays(**kwargs)
+
+        with self.assertRaisesRegex(ValueError, "long enough"):
+            build_latent_rollout_arrays(
+                self.visual,
+                np.asarray([12], dtype=np.int64),
+                self.latent_frames,
+                horizon=5,
+            )
 
 
 if __name__ == "__main__":

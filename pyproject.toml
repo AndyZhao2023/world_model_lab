@@ -28,6 +28,7 @@ world-model-multiseed = "world_model_lab.multiseed_experiment:main"
 world-model-plot-training = "world_model_lab.plot_training:main"
 world-model-train = "world_model_lab.train_world_model:main"
 world-model-train-visual-dynamics-objective = "world_model_lab.train_visual_dynamics_objective:main"
+world-model-train-visual-dynamics-recursive = "world_model_lab.train_visual_dynamics_recursive:main"
 world-model-train-visual-latent = "world_model_lab.train_visual_latent_model:main"
 
 [tool.setuptools]

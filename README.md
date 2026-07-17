@@ -381,10 +381,42 @@ free-rollout 累计变化区 MAE 在 horizon 1、5、10 分别改善 `4.63%`、`
 
 但 horizon 10 的 free-rollout normalized latent MSE 已达到约 `0.857`，teacher
 forcing 只有约 `0.051`，递归误差仍很严重。Action divergence 只证明敏感性，
-不证明没有真实标签的反事实轨迹是正确的。因此当前模型还不应接入 MPC；下一步是
-加入短 horizon recursive rollout loss，并用模拟器生成匹配的反事实真值。完整协议
+不证明没有真实标签的反事实轨迹是正确的。因此当前模型还不应接入 MPC。完整协议
 和结果见
 `docs/experiments/2026-07-17-visual-multistep-rollout-diagnostics.md`。
+
+### H5 递归 Rollout 训练
+
+下一项受控实验复用 objective-aligned checkpoint 的 autoencoder、normalizer 和
+episode split，重新初始化相同的 CNN dynamics，同时训练单步目标和 H5
+free-rollout 目标：
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
+  .venv/bin/python -m \
+  world_model_lab.train_visual_dynamics_recursive \
+  --data data/visual_episodes.npz \
+  --source-checkpoint artifacts/visual_latent_spatial8_objective_w01.pt \
+  --output artifacts/visual_latent_spatial8_objective_w01_h5.pt \
+  --preview artifacts/visual_latent_spatial8_objective_w01_h5_predictions.png \
+  --changed-pixel-loss-weight 0.1 \
+  --rollout-horizon 5 \
+  --rollout-loss-weight 1.0 \
+  --dynamics-epochs 50 \
+  --dynamics-batch-size 256
+```
+
+每一步都会把自己的预测 latent 放回四帧 context，后续误差可以穿过之前的预测反向
+传播。总损失是原单步目标加上五步目标的平均值；decoder 仍冻结，变化区 mask 仍只
+用于监督。
+
+结果表明 H5 free-rollout latent MSE 改善 `30.04%`，但累计变化区 MAE 恶化
+`0.265%`，因此只通过四个预注册门槛中的三个，未晋级为默认模型。作为次要结果，
+H10 latent MSE 改善 `30.73%`，累计变化区 MAE 改善 `1.98%`。这说明递归训练确实
+缓解了 latent 漂移，但还没有在训练 horizon 上稳定改善小车像素轨迹。当前默认仍是
+`visual_latent_spatial8_objective_w01.pt`，两者都不接入 MPC；下一步应生成有真实
+标签的 action 反事实轨迹，或直接监督对象运动。完整协议、门槛和结果见
+`docs/experiments/2026-07-18-visual-recursive-rollout-training.md`。
 
 ## 训练第一个 Learned World Model
 
