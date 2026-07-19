@@ -26,6 +26,8 @@ from .train_visual_latent_model import (
 )
 from .visual_dataset import CONTEXT_FRAMES, validate_visual_dataset
 from .visual_latent_data import LatentRolloutArrays, LatentWindowArrays
+from .visual_object_position import LinearObjectPositionProbe
+from .visual_object_position import normalize_object_positions
 
 
 def _validate_recursive_tensors(
@@ -125,6 +127,9 @@ def recursive_rollout_objective(
     target_frames_uint8: torch.Tensor | None = None,
     changed_masks: torch.Tensor | None = None,
     changed_pixel_loss_weight: float = 0.0,
+    position_probe: LinearObjectPositionProbe | None = None,
+    target_positions: torch.Tensor | None = None,
+    object_position_loss_weight: float = 0.0,
 ) -> torch.Tensor:
     """Return the mean latent-plus-image loss across recursive steps."""
 
@@ -140,6 +145,13 @@ def recursive_rollout_objective(
     ):
         raise ValueError(
             "changed_pixel_loss_weight must be finite and non-negative"
+        )
+    if (
+        not math.isfinite(object_position_loss_weight)
+        or object_position_loss_weight < 0.0
+    ):
+        raise ValueError(
+            "object_position_loss_weight must be finite and non-negative"
         )
     mean = np.asarray(latent_normalizer.mean)
     std = np.asarray(latent_normalizer.std)
@@ -172,6 +184,18 @@ def recursive_rollout_objective(
             or changed_masks.dtype != torch.bool
         ):
             raise ValueError("recursive image supervision is invalid")
+    if object_position_loss_weight > 0.0:
+        if position_probe is None or target_positions is None:
+            raise ValueError(
+                "positive object-position loss requires probe and targets"
+            )
+        if (
+            target_positions.shape != (batch_size, horizon, 2)
+            or not bool(torch.all(torch.isfinite(target_positions)))
+        ):
+            raise ValueError(
+                "target_positions must be finite with shape [B, H, 2]"
+            )
 
     predictions = recursive_normalized_latents(
         model,
@@ -221,6 +245,19 @@ def recursive_rollout_objective(
             step_loss = (
                 latent_mse
                 + changed_pixel_loss_weight * changed_mae
+            )
+        if object_position_loss_weight > 0.0:
+            assert position_probe is not None
+            assert target_positions is not None
+            predicted_positions = position_probe(prediction)
+            position_mse = torch.mean(
+                torch.square(
+                    predicted_positions - target_positions[:, step]
+                )
+            )
+            step_loss = (
+                step_loss
+                + object_position_loss_weight * position_mse
             )
         step_losses.append(step_loss)
     loss = torch.mean(torch.stack(step_losses))
@@ -305,6 +342,8 @@ def _mean_recursive_objective(
     latent_normalizer: Normalizer,
     decoder: VisualAutoencoder | None,
     changed_pixel_loss_weight: float,
+    position_probe: LinearObjectPositionProbe | None = None,
+    object_position_loss_weight: float = 0.0,
 ) -> float:
     loader = DataLoader(
         TensorDataset(*tensors),
@@ -317,21 +356,39 @@ def _mean_recursive_objective(
     model.eval()
     with torch.no_grad():
         for batch in loader:
+            objective_batch = (
+                batch[:-1]
+                if object_position_loss_weight > 0.0
+                else batch
+            )
             loss = recursive_rollout_objective(
                 model,
-                context_latents=batch[0],
-                history_actions=batch[1],
-                rollout_actions=batch[2],
-                target_latents=batch[3],
+                context_latents=objective_batch[0],
+                history_actions=objective_batch[1],
+                rollout_actions=objective_batch[2],
+                target_latents=objective_batch[3],
                 latent_normalizer=latent_normalizer,
                 decoder=decoder,
                 target_frames_uint8=(
-                    batch[4] if len(batch) == 6 else None
+                    objective_batch[4]
+                    if len(objective_batch) == 6
+                    else None
                 ),
                 changed_masks=(
-                    batch[5] if len(batch) == 6 else None
+                    objective_batch[5]
+                    if len(objective_batch) == 6
+                    else None
                 ),
                 changed_pixel_loss_weight=changed_pixel_loss_weight,
+                position_probe=position_probe,
+                target_positions=(
+                    batch[-1]
+                    if object_position_loss_weight > 0.0
+                    else None
+                ),
+                object_position_loss_weight=(
+                    object_position_loss_weight
+                ),
             )
             batch_count = int(batch[0].shape[0])
             loss_sum += float(loss) * batch_count
@@ -339,6 +396,28 @@ def _mean_recursive_objective(
     if sample_count == 0:
         raise ValueError("recursive validation data must not be empty")
     return loss_sum / sample_count
+
+
+def _object_position_supervision_tensor(
+    visual_dataset: Mapping[str, np.ndarray],
+    target_frame_indices: np.ndarray,
+) -> torch.Tensor:
+    """Resolve frame-aligned physical states to normalized XY targets."""
+
+    validate_visual_dataset(visual_dataset)
+    indices = np.asarray(target_frame_indices, dtype=np.int64)
+    frame_count = int(np.asarray(visual_dataset["states"]).shape[0])
+    if (
+        indices.size == 0
+        or np.any(indices < 0)
+        or np.any(indices >= frame_count)
+    ):
+        raise ValueError("object-position frame indices are out of range")
+    positions = normalize_object_positions(
+        np.asarray(visual_dataset["states"])[indices],
+        np.asarray(visual_dataset["scene_world_bounds"]),
+    )
+    return torch.from_numpy(np.ascontiguousarray(positions))
 
 
 def train_recursive_latent_dynamics(
@@ -359,6 +438,8 @@ def train_recursive_latent_dynamics(
     visual_dataset: Mapping[str, np.ndarray] | None,
     changed_pixel_loss_weight: float,
     rollout_loss_weight: float,
+    position_probe: LinearObjectPositionProbe | None = None,
+    object_position_loss_weight: float = 0.0,
 ) -> RecursiveDynamicsTrainingResult:
     """Train fresh CNN dynamics with one-step and recursive objectives."""
 
@@ -409,12 +490,30 @@ def train_recursive_latent_dynamics(
         raise ValueError(
             "rollout_loss_weight must be finite and non-negative"
         )
+    if (
+        not math.isfinite(object_position_loss_weight)
+        or object_position_loss_weight < 0.0
+    ):
+        raise ValueError(
+            "object_position_loss_weight must be finite and non-negative"
+        )
     if changed_pixel_loss_weight > 0.0 and (
         decoder is None or visual_dataset is None
     ):
         raise ValueError(
             "positive changed-pixel loss requires decoder and visual_dataset"
         )
+    if object_position_loss_weight > 0.0 and (
+        position_probe is None or visual_dataset is None
+    ):
+        raise ValueError(
+            "positive object-position loss requires probe and visual_dataset"
+        )
+    if (
+        position_probe is not None
+        and position_probe.latent_dim != latent_dim
+    ):
+        raise ValueError("position probe latent dimension does not match")
 
     train_one_step_tensors = _normalized_window_tensors(
         train_one_step_arrays,
@@ -455,9 +554,39 @@ def train_recursive_latent_dynamics(
             validation_rollout_arrays,
         )
         assert decoder is not None
+    if object_position_loss_weight > 0.0:
+        assert visual_dataset is not None
+        train_one_step_tensors += (
+            _object_position_supervision_tensor(
+                visual_dataset,
+                train_one_step_arrays.target_frame_indices,
+            ),
+        )
+        validation_one_step_tensors += (
+            _object_position_supervision_tensor(
+                visual_dataset,
+                validation_one_step_arrays.target_frame_indices,
+            ),
+        )
+        train_rollout_tensors += (
+            _object_position_supervision_tensor(
+                visual_dataset,
+                train_rollout_arrays.target_frame_indices,
+            ),
+        )
+        validation_rollout_tensors += (
+            _object_position_supervision_tensor(
+                visual_dataset,
+                validation_rollout_arrays.target_frame_indices,
+            ),
+        )
     if decoder is not None:
         decoder.eval()
         for parameter in decoder.parameters():
+            parameter.requires_grad_(False)
+    if position_probe is not None:
+        position_probe.eval()
+        for parameter in position_probe.parameters():
             parameter.requires_grad_(False)
 
     torch.manual_seed(seed)
@@ -519,33 +648,61 @@ def train_recursive_latent_dynamics(
                 tensor[rollout_indices]
                 for tensor in train_rollout_tensors
             )
+            one_step_objective_batch = (
+                one_step_batch[:-1]
+                if object_position_loss_weight > 0.0
+                else one_step_batch
+            )
+            rollout_objective_batch = (
+                rollout_batch[:-1]
+                if object_position_loss_weight > 0.0
+                else rollout_batch
+            )
             optimizer.zero_grad()
             one_step_loss = _dynamics_batch_loss(
                 model,
-                one_step_batch,
+                one_step_objective_batch,
                 latent_normalizer=latent_normalizer,
                 decoder=decoder,
                 changed_pixel_loss_weight=changed_pixel_loss_weight,
+                position_probe=position_probe,
+                target_positions=(
+                    one_step_batch[-1]
+                    if object_position_loss_weight > 0.0
+                    else None
+                ),
+                object_position_loss_weight=(
+                    object_position_loss_weight
+                ),
             )
             rollout_loss = recursive_rollout_objective(
                 model,
-                context_latents=rollout_batch[0],
-                history_actions=rollout_batch[1],
-                rollout_actions=rollout_batch[2],
-                target_latents=rollout_batch[3],
+                context_latents=rollout_objective_batch[0],
+                history_actions=rollout_objective_batch[1],
+                rollout_actions=rollout_objective_batch[2],
+                target_latents=rollout_objective_batch[3],
                 latent_normalizer=latent_normalizer,
                 decoder=decoder,
                 target_frames_uint8=(
-                    rollout_batch[4]
-                    if len(rollout_batch) == 6
+                    rollout_objective_batch[4]
+                    if len(rollout_objective_batch) == 6
                     else None
                 ),
                 changed_masks=(
-                    rollout_batch[5]
-                    if len(rollout_batch) == 6
+                    rollout_objective_batch[5]
+                    if len(rollout_objective_batch) == 6
                     else None
                 ),
                 changed_pixel_loss_weight=changed_pixel_loss_weight,
+                position_probe=position_probe,
+                target_positions=(
+                    rollout_batch[-1]
+                    if object_position_loss_weight > 0.0
+                    else None
+                ),
+                object_position_loss_weight=(
+                    object_position_loss_weight
+                ),
             )
             total_loss = (
                 one_step_loss + rollout_loss_weight * rollout_loss
@@ -572,6 +729,8 @@ def train_recursive_latent_dynamics(
             latent_normalizer=latent_normalizer,
             decoder=decoder,
             changed_pixel_loss_weight=changed_pixel_loss_weight,
+            position_probe=position_probe,
+            object_position_loss_weight=object_position_loss_weight,
         )
         validation_rollout = _mean_recursive_objective(
             model,
@@ -580,6 +739,8 @@ def train_recursive_latent_dynamics(
             latent_normalizer=latent_normalizer,
             decoder=decoder,
             changed_pixel_loss_weight=changed_pixel_loss_weight,
+            position_probe=position_probe,
+            object_position_loss_weight=object_position_loss_weight,
         )
         validation_total = (
             validation_one_step

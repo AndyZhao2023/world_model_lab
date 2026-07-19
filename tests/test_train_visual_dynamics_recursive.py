@@ -45,6 +45,8 @@ class RecursiveDynamicsRunnerTest(unittest.TestCase):
             "--changed-pixel-loss-weight",
             "--rollout-horizon",
             "--rollout-loss-weight",
+            "--object-position-loss-weight",
+            "--object-position-probe-ridge",
             "--dynamics-epochs",
             "--dynamics-batch-size",
         ):
@@ -82,6 +84,8 @@ class RecursiveDynamicsRunnerTest(unittest.TestCase):
                 changed_pixel_loss_weight=0.1,
                 rollout_horizon=5,
                 rollout_loss_weight=1.0,
+                object_position_loss_weight=1.0,
+                object_position_probe_ridge=1e-3,
                 dynamics_epochs=1,
                 dynamics_batch_size=8,
             )
@@ -105,6 +109,35 @@ class RecursiveDynamicsRunnerTest(unittest.TestCase):
                 config["dynamics_changed_pixel_loss_weight"],
                 0.1,
             )
+            self.assertEqual(
+                config["dynamics_loss"],
+                "one_step_plus_recursive_rollout_plus_object_position",
+            )
+            self.assertEqual(
+                config["dynamics_object_position_loss_weight"],
+                1.0,
+            )
+            self.assertEqual(
+                config["object_position_probe_ridge"],
+                1e-3,
+            )
+            self.assertEqual(
+                config["object_position_probe_fit_split"],
+                "train_frames",
+            )
+            self.assertEqual(
+                config["object_position_target"],
+                "normalized_xy",
+            )
+            self.assertEqual(
+                len(config["object_position_probe_sha256"]),
+                64,
+            )
+            self.assertEqual(
+                summary["dynamics"]["object_position_loss_weight"],
+                1.0,
+            )
+            self.assertIn("object_position_probe", summary)
             self.assertTrue(config["dynamics_reinitialized"])
             self.assertTrue(config["autoencoder_frozen"])
             self.assertEqual(
@@ -152,6 +185,14 @@ class RecursiveDynamicsRunnerTest(unittest.TestCase):
                     {"rollout_loss_weight": float("inf")},
                     "rollout_loss_weight",
                 ),
+                (
+                    {"object_position_loss_weight": -1.0},
+                    "object_position_loss_weight",
+                ),
+                (
+                    {"object_position_probe_ridge": float("inf")},
+                    "object_position_probe_ridge",
+                ),
             )
             for index, (update, message) in enumerate(cases):
                 with self.subTest(update=update):
@@ -163,6 +204,8 @@ class RecursiveDynamicsRunnerTest(unittest.TestCase):
                         "changed_pixel_loss_weight": 0.1,
                         "rollout_horizon": 5,
                         "rollout_loss_weight": 1.0,
+                        "object_position_loss_weight": 0.0,
+                        "object_position_probe_ridge": 1e-3,
                     }
                     kwargs.update(update)
                     with self.assertRaisesRegex(ValueError, message):

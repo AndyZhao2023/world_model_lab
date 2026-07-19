@@ -12,6 +12,10 @@ from world_model_lab.visual_latent_data import (
     build_latent_window_arrays,
 )
 from world_model_lab.visual_latent_model import SpatialConvAutoencoder
+from world_model_lab.train_visual_latent_model import _dynamics_batch_loss
+from world_model_lab.visual_object_position import (
+    LinearObjectPositionProbe,
+)
 from world_model_lab.visual_recursive_training import (
     recursive_normalized_latents,
     recursive_rollout_objective,
@@ -100,6 +104,34 @@ class RecursiveRolloutObjectiveTest(unittest.TestCase):
             dtype=torch.float32,
         )
         self.identity_latent = Normalizer(np.zeros(1), np.ones(1))
+        self.position_probe = LinearObjectPositionProbe(
+            weight=np.asarray([[1.0], [1.0]], dtype=np.float32),
+            bias=np.zeros(2, dtype=np.float32),
+        )
+
+    def test_one_step_position_term_adds_to_existing_objective(self):
+        batch = (
+            self.context,
+            self.history,
+            self.actions[:, 0],
+            torch.tensor([[3.0]], dtype=torch.float32),
+        )
+
+        loss = _dynamics_batch_loss(
+            CurrentActionDynamics(),
+            batch,
+            latent_normalizer=self.identity_latent,
+            decoder=None,
+            changed_pixel_loss_weight=0.0,
+            position_probe=self.position_probe,
+            target_positions=torch.tensor(
+                [[2.5, 2.5]],
+                dtype=torch.float32,
+            ),
+            object_position_loss_weight=2.0,
+        )
+
+        self.assertAlmostEqual(float(loss), 0.5)
 
     def test_zero_and_positive_latent_only_objectives_are_exact(self):
         matching_targets = torch.tensor([[[3.0], [6.0]]])
@@ -154,6 +186,28 @@ class RecursiveRolloutObjectiveTest(unittest.TestCase):
 
         self.assertAlmostEqual(float(loss), 0.45)
 
+    def test_position_term_uses_every_rollout_step(self):
+        targets = torch.tensor([[[3.0], [6.0]]])
+        target_positions = torch.tensor(
+            [[[2.0, 2.0], [4.0, 4.0]]],
+            dtype=torch.float32,
+        )
+
+        loss = recursive_rollout_objective(
+            CurrentActionDynamics(),
+            context_latents=self.context,
+            history_actions=self.history,
+            rollout_actions=self.actions,
+            target_latents=targets,
+            latent_normalizer=self.identity_latent,
+            changed_pixel_loss_weight=0.0,
+            position_probe=self.position_probe,
+            target_positions=target_positions,
+            object_position_loss_weight=0.5,
+        )
+
+        self.assertAlmostEqual(float(loss), 1.25)
+
     def test_gradient_flows_through_later_recursive_steps(self):
         model = ScaledActionDynamics()
         targets = torch.zeros((1, 2, 1), dtype=torch.float32)
@@ -166,12 +220,24 @@ class RecursiveRolloutObjectiveTest(unittest.TestCase):
             target_latents=targets,
             latent_normalizer=self.identity_latent,
             changed_pixel_loss_weight=0.0,
+            position_probe=self.position_probe,
+            target_positions=torch.zeros(
+                (1, 2, 2),
+                dtype=torch.float32,
+            ),
+            object_position_loss_weight=1.0,
         )
         loss.backward()
 
         self.assertIsNotNone(model.scale.grad)
         self.assertTrue(torch.isfinite(model.scale.grad))
         self.assertNotEqual(float(model.scale.grad), 0.0)
+        self.assertTrue(
+            all(
+                parameter.grad is None
+                for parameter in self.position_probe.parameters()
+            )
+        )
 
     def test_positive_image_weight_requires_complete_supervision(self):
         with self.assertRaises(ValueError):
@@ -183,6 +249,19 @@ class RecursiveRolloutObjectiveTest(unittest.TestCase):
                 target_latents=torch.zeros((1, 2, 1)),
                 latent_normalizer=self.identity_latent,
                 changed_pixel_loss_weight=0.1,
+            )
+
+    def test_positive_position_weight_requires_complete_supervision(self):
+        with self.assertRaises(ValueError):
+            recursive_rollout_objective(
+                CurrentActionDynamics(),
+                context_latents=self.context,
+                history_actions=self.history,
+                rollout_actions=self.actions,
+                target_latents=torch.zeros((1, 2, 1)),
+                latent_normalizer=self.identity_latent,
+                changed_pixel_loss_weight=0.0,
+                object_position_loss_weight=1.0,
             )
 
 

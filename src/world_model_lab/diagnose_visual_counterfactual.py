@@ -32,7 +32,19 @@ from .visual_counterfactual_data import (
     build_matched_counterfactual_batch,
 )
 from .visual_dataset import load_visual_dataset
-from .visual_latent_data import encode_all_frames
+from .visual_latent_data import (
+    encode_all_frames,
+    frame_indices_for_episode_ids,
+)
+from .visual_object_position import (
+    LinearObjectPositionProbe,
+    evaluate_object_position_probe,
+    fit_linear_object_position_probe,
+    normalize_object_positions,
+    object_position_probe_sha256,
+    predict_normalized_object_positions,
+    world_position_errors,
+)
 
 
 _METRIC_NAMES = (
@@ -42,7 +54,12 @@ _METRIC_NAMES = (
     "cumulative_changed_pixel_mae",
     "normalized_latent_effect_mse",
     "pixel_effect_mse",
+    "normalized_position_mse",
+    "world_position_error",
+    "normalized_position_effect_mse",
 )
+
+_OBJECT_POSITION_PROBE_RIDGE = 1e-3
 
 
 def _masked_episode_macro_curve(
@@ -154,6 +171,10 @@ def summarize_matched_counterfactual_predictions(
     predicted_factual_frames: np.ndarray,
     true_factual_frames: np.ndarray,
     true_initial_frames: np.ndarray,
+    position_probe: LinearObjectPositionProbe,
+    true_counterfactual_normalized_positions: np.ndarray,
+    true_factual_normalized_positions: np.ndarray,
+    world_bounds: np.ndarray,
     valid_steps: np.ndarray,
     episode_ids: np.ndarray,
 ) -> dict[str, dict[str, float | int]]:
@@ -227,6 +248,21 @@ def summarize_matched_counterfactual_predictions(
         or ids.dtype.kind not in "iu"
     ):
         raise ValueError("matched validity or episode arrays are invalid")
+    true_cf_positions = np.asarray(
+        true_counterfactual_normalized_positions
+    )
+    true_factual_positions = np.asarray(
+        true_factual_normalized_positions
+    )
+    position_shape = (count, horizon, 2)
+    if (
+        not isinstance(position_probe, LinearObjectPositionProbe)
+        or true_cf_positions.shape != position_shape
+        or true_factual_positions.shape != position_shape
+        or not np.all(np.isfinite(true_cf_positions))
+        or not np.all(np.isfinite(true_factual_positions))
+    ):
+        raise ValueError("matched object-position arrays are invalid")
 
     latent_direct = np.mean(
         np.square(
@@ -265,6 +301,40 @@ def summarize_matched_counterfactual_predictions(
         np.square(predicted_pixel_effect - true_pixel_effect),
         axis=(2, 3, 4),
     )
+    predicted_cf_positions = predict_normalized_object_positions(
+        position_probe,
+        predicted_cf_latents,
+    )
+    predicted_factual_positions = predict_normalized_object_positions(
+        position_probe,
+        predicted_factual_latents,
+    )
+    position_direct = np.mean(
+        np.square(
+            predicted_cf_positions.astype(np.float64)
+            - true_cf_positions
+        ),
+        axis=2,
+    )
+    world_position_direct = world_position_errors(
+        predicted_cf_positions,
+        true_cf_positions,
+        world_bounds,
+    )
+    predicted_position_effect = (
+        predicted_cf_positions.astype(np.float64)
+        - predicted_factual_positions
+    )
+    true_position_effect = (
+        true_cf_positions.astype(np.float64)
+        - true_factual_positions
+    )
+    position_effect = np.mean(
+        np.square(
+            predicted_position_effect - true_position_effect
+        ),
+        axis=2,
+    )
     latent_curve, episode_counts, window_counts = (
         _masked_episode_macro_curve(
             latent_direct,
@@ -284,6 +354,21 @@ def summarize_matched_counterfactual_predictions(
     )
     pixel_effect_curve, _, _ = _masked_episode_macro_curve(
         pixel_effect,
+        valid_steps=valid,
+        episode_ids=ids,
+    )
+    position_curve, _, _ = _masked_episode_macro_curve(
+        position_direct,
+        valid_steps=valid,
+        episode_ids=ids,
+    )
+    world_position_curve, _, _ = _masked_episode_macro_curve(
+        world_position_direct,
+        valid_steps=valid,
+        episode_ids=ids,
+    )
+    position_effect_curve, _, _ = _masked_episode_macro_curve(
+        position_effect,
         valid_steps=valid,
         episode_ids=ids,
     )
@@ -317,6 +402,9 @@ def summarize_matched_counterfactual_predictions(
         "cumulative_changed_pixel_mae": cumulative_changed,
         "normalized_latent_effect_mse": latent_effect_curve,
         "pixel_effect_mse": pixel_effect_curve,
+        "normalized_position_mse": position_curve,
+        "world_position_error": world_position_curve,
+        "normalized_position_effect_mse": position_effect_curve,
     }
     return {
         str(step + 1): {
@@ -490,6 +578,13 @@ def _build_preregistered_decision(
             "horizon_latent_action_effect_improvement",
             horizon,
             "normalized_latent_effect_mse",
+            "strict_improvement",
+            1.0,
+        ),
+        (
+            "horizon_direct_position_improvement",
+            horizon,
+            "normalized_position_mse",
             "strict_improvement",
             1.0,
         ),
@@ -675,7 +770,11 @@ def plot_matched_counterfactual_comparison(
             "Latent action-effect error",
             "MSE",
         ),
-        ("pixel_effect_mse", "Pixel action-effect error", "MSE"),
+        (
+            "world_position_error",
+            "Matched car-centre error",
+            "world units",
+        ),
     )
     figure, axes = plt.subplots(2, 2, figsize=(12, 8))
     for axis, (metric, title, ylabel) in zip(axes.flat, panels):
@@ -810,6 +909,53 @@ def run_visual_counterfactual_diagnostics(
         dataset["frames"],
         batch_size=encode_batch_size,
     )
+    normalized_latent_frames = np.asarray(
+        source.latent_normalizer.normalize(latent_frames),
+        dtype=np.float32,
+    )
+    normalized_positions = normalize_object_positions(
+        np.asarray(dataset["states"]),
+        np.asarray(dataset["scene_world_bounds"]),
+    )
+    train_frame_indices = frame_indices_for_episode_ids(
+        dataset,
+        source.split_episode_ids["train"],
+    )
+    validation_frame_indices = frame_indices_for_episode_ids(
+        dataset,
+        source.split_episode_ids["validation"],
+    )
+    position_probe = fit_linear_object_position_probe(
+        normalized_latent_frames[train_frame_indices],
+        normalized_positions[train_frame_indices],
+        ridge=_OBJECT_POSITION_PROBE_RIDGE,
+    )
+    position_probe_metadata: dict[str, object] = {
+        "ridge": _OBJECT_POSITION_PROBE_RIDGE,
+        "fit_split": "train_frames",
+        "target": "normalized_xy",
+        "sha256": object_position_probe_sha256(position_probe),
+        "train": evaluate_object_position_probe(
+            position_probe,
+            normalized_latents=normalized_latent_frames[
+                train_frame_indices
+            ],
+            normalized_positions=normalized_positions[
+                train_frame_indices
+            ],
+            world_bounds=np.asarray(dataset["scene_world_bounds"]),
+        ),
+        "validation": evaluate_object_position_probe(
+            position_probe,
+            normalized_latents=normalized_latent_frames[
+                validation_frame_indices
+            ],
+            normalized_positions=normalized_positions[
+                validation_frame_indices
+            ],
+            world_bounds=np.asarray(dataset["scene_world_bounds"]),
+        ),
+    }
     selection = select_visual_rollout_windows(
         dataset=dataset,
         latent_frames=latent_frames,
@@ -828,6 +974,9 @@ def run_visual_counterfactual_diagnostics(
     true_factual_frames = _channels_first_frames(
         dataset["frames"][arrays["target_frame_indices"]]
     )
+    true_factual_positions = normalized_positions[
+        arrays["target_frame_indices"]
+    ]
     factual_predictions: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for name, model in (("source", source), ("candidate", candidate)):
         factual_latents = rollout_normalized_latents(
@@ -883,6 +1032,16 @@ def run_visual_counterfactual_diagnostics(
         true_counterfactual_frames = _channels_first_frames(
             batch.true_frames
         )
+        true_counterfactual_positions = np.zeros(
+            (batch.count, batch.horizon, 2),
+            dtype=np.float32,
+        )
+        true_counterfactual_positions[batch.valid_steps] = (
+            normalize_object_positions(
+                batch.true_states[batch.valid_steps],
+                np.asarray(dataset["scene_world_bounds"]),
+            )
+        )
         oracle_counterfactual_frames = (
             _decode_normalized_rollout_latents(
                 source.autoencoder,
@@ -909,6 +1068,12 @@ def run_visual_counterfactual_diagnostics(
             predicted_factual_frames=oracle_factual_frames,
             true_factual_frames=true_factual_frames,
             true_initial_frames=true_initial_frames,
+            position_probe=position_probe,
+            true_counterfactual_normalized_positions=(
+                true_counterfactual_positions
+            ),
+            true_factual_normalized_positions=true_factual_positions,
+            world_bounds=np.asarray(dataset["scene_world_bounds"]),
             valid_steps=batch.valid_steps,
             episode_ids=batch.recipient_episode_ids,
         )
@@ -946,6 +1111,16 @@ def run_visual_counterfactual_diagnostics(
                 predicted_factual_frames=factual_frames,
                 true_factual_frames=true_factual_frames,
                 true_initial_frames=true_initial_frames,
+                position_probe=position_probe,
+                true_counterfactual_normalized_positions=(
+                    true_counterfactual_positions
+                ),
+                true_factual_normalized_positions=(
+                    true_factual_positions
+                ),
+                world_bounds=np.asarray(
+                    dataset["scene_world_bounds"]
+                ),
                 valid_steps=batch.valid_steps,
                 episode_ids=batch.recipient_episode_ids,
             )
@@ -979,6 +1154,7 @@ def run_visual_counterfactual_diagnostics(
         "schema_version": 1,
         "models": model_records,
         "oracle": oracle,
+        "object_position_probe": position_probe_metadata,
         "coverage": coverage,
         "comparison": {"candidate_minus_source": comparison},
         "decision": decision,
@@ -1029,6 +1205,14 @@ def run_visual_counterfactual_diagnostics(
             "aggregation": (
                 "valid-windows-within-episode-then-episodes-equally-"
                 "then-seeds"
+            ),
+            "object_position_target": "normalized_xy",
+            "object_position_probe_fit_split": "train_frames",
+            "object_position_probe_ridge": (
+                _OBJECT_POSITION_PROBE_RIDGE
+            ),
+            "object_position_probe_sha256": (
+                position_probe_metadata["sha256"]
             ),
         },
         "test_episode_ids": [

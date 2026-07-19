@@ -25,6 +25,9 @@ from world_model_lab.diagnose_visual_counterfactual import (
     run_visual_counterfactual_diagnostics,
     summarize_matched_counterfactual_predictions,
 )
+from world_model_lab.visual_object_position import (
+    LinearObjectPositionProbe,
+)
 from world_model_lab.visual_dataset import save_visual_dataset
 
 
@@ -73,6 +76,23 @@ class MatchedCounterfactualMetricTest(unittest.TestCase):
             (3, 3, 2, 2),
             dtype=np.uint8,
         )
+        self.position_probe = LinearObjectPositionProbe(
+            weight=np.asarray([[1.0], [1.0]], dtype=np.float32),
+            bias=np.zeros(2, dtype=np.float32),
+        )
+        self.true_counterfactual_positions = np.zeros(
+            (3, 2, 2),
+            dtype=np.float32,
+        )
+        self.true_factual_positions = np.full(
+            (3, 2, 2),
+            -1.0,
+            dtype=np.float32,
+        )
+        self.world_bounds = np.asarray(
+            [0.0, 2.0, 0.0, 2.0],
+            dtype=np.float64,
+        )
 
     def _summarize(self):
         return summarize_matched_counterfactual_predictions(
@@ -95,6 +115,14 @@ class MatchedCounterfactualMetricTest(unittest.TestCase):
             predicted_factual_frames=self.predicted_factual_frames,
             true_factual_frames=self.true_factual_frames,
             true_initial_frames=self.initial_frames,
+            position_probe=self.position_probe,
+            true_counterfactual_normalized_positions=(
+                self.true_counterfactual_positions
+            ),
+            true_factual_normalized_positions=(
+                self.true_factual_positions
+            ),
+            world_bounds=self.world_bounds,
             valid_steps=self.valid,
             episode_ids=self.episode_ids,
         )
@@ -114,6 +142,22 @@ class MatchedCounterfactualMetricTest(unittest.TestCase):
         self.assertAlmostEqual(
             record["2"]["normalized_latent_mse"],
             20.0,
+        )
+        self.assertAlmostEqual(
+            record["1"]["normalized_position_mse"],
+            15.0,
+        )
+        self.assertAlmostEqual(
+            record["2"]["normalized_position_mse"],
+            20.0,
+        )
+        self.assertAlmostEqual(
+            record["1"]["world_position_error"],
+            3.5 * np.sqrt(2.0),
+        )
+        self.assertAlmostEqual(
+            record["2"]["world_position_error"],
+            4.0 * np.sqrt(2.0),
         )
         for step in ("1", "2"):
             self.assertAlmostEqual(record[step]["pixel_mse"], 1.0)
@@ -139,6 +183,10 @@ class MatchedCounterfactualMetricTest(unittest.TestCase):
                 0.0,
             )
             self.assertEqual(record[step]["pixel_effect_mse"], 0.0)
+            self.assertEqual(
+                record[step]["normalized_position_effect_mse"],
+                0.0,
+            )
 
     def test_seed_aggregation_comparison_and_gates_are_exact(self):
         seed_record = self._summarize()
@@ -170,10 +218,14 @@ class MatchedCounterfactualMetricTest(unittest.TestCase):
             0.0,
         )
         self.assertFalse(decision["candidate_passes"])
-        self.assertEqual(len(decision["gates"]), 5)
+        self.assertEqual(len(decision["gates"]), 6)
         self.assertEqual(
             sum(gate["passed"] for gate in decision["gates"]),
             2,
+        )
+        self.assertEqual(
+            decision["gates"][3]["name"],
+            "horizon_direct_position_improvement",
         )
 
     def test_metrics_reject_misaligned_arrays(self):
@@ -198,6 +250,14 @@ class MatchedCounterfactualMetricTest(unittest.TestCase):
                 predicted_factual_frames=self.predicted_factual_frames,
                 true_factual_frames=self.true_factual_frames,
                 true_initial_frames=self.initial_frames,
+                position_probe=self.position_probe,
+                true_counterfactual_normalized_positions=(
+                    self.true_counterfactual_positions
+                ),
+                true_factual_normalized_positions=(
+                    self.true_factual_positions
+                ),
+                world_bounds=self.world_bounds,
                 valid_steps=self.valid,
                 episode_ids=self.episode_ids,
             )
@@ -296,7 +356,16 @@ class VisualCounterfactualDiagnosticsRunnerTest(unittest.TestCase):
             self.assertEqual(set(metrics["snapshots"]), {"1", "2"})
             self.assertIn("oracle", metrics)
             self.assertIn("coverage", metrics)
+            self.assertIn("object_position_probe", metrics)
             self.assertFalse(metrics["decision"]["candidate_passes"])
+            self.assertIn(
+                "normalized_position_mse",
+                metrics["snapshots"]["2"]["source"],
+            )
+            self.assertEqual(
+                manifest["protocol"]["object_position_target"],
+                "normalized_xy",
+            )
             self.assertEqual(
                 metrics["comparison"]["candidate_minus_source"]["2"][
                     "normalized_latent_mse"

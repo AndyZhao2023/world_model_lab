@@ -8,6 +8,9 @@ import math
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import torch
+
 from .diagnose_model import sha256_file
 from .train_visual_dynamics_objective import (
     _positive_source_float,
@@ -27,12 +30,20 @@ from .visual_latent_data import (
     build_latent_rollout_arrays,
     build_latent_window_arrays,
     encode_all_frames,
+    frame_indices_for_episode_ids,
 )
 from .visual_latent_model import (
     SpatialConvAutoencoder,
     SpatialLatentDynamicsCNN,
 )
 from .visual_recursive_training import train_recursive_latent_dynamics
+from .visual_object_position import (
+    LinearObjectPositionProbe,
+    fit_linear_object_position_probe,
+    normalize_object_positions,
+    object_position_probe_sha256,
+    world_position_errors,
+)
 from .visual_windows import build_visual_window_index
 
 
@@ -41,7 +52,9 @@ def _validate_rollout_protocol(
     rollout_horizon: int,
     rollout_loss_weight: float,
     changed_pixel_loss_weight: float,
-) -> tuple[int, float, float]:
+    object_position_loss_weight: float,
+    object_position_probe_ridge: float,
+) -> tuple[int, float, float, float, float]:
     if (
         isinstance(rollout_horizon, bool)
         or not isinstance(rollout_horizon, int)
@@ -62,11 +75,66 @@ def _validate_rollout_protocol(
         raise ValueError(
             "changed_pixel_loss_weight must be finite and non-negative"
         )
+    if (
+        not math.isfinite(object_position_loss_weight)
+        or object_position_loss_weight < 0.0
+    ):
+        raise ValueError(
+            "object_position_loss_weight must be finite and non-negative"
+        )
+    if (
+        not math.isfinite(object_position_probe_ridge)
+        or object_position_probe_ridge < 0.0
+    ):
+        raise ValueError(
+            "object_position_probe_ridge must be finite and non-negative"
+        )
     return (
         int(rollout_horizon),
         float(rollout_loss_weight),
         float(changed_pixel_loss_weight),
+        float(object_position_loss_weight),
+        float(object_position_probe_ridge),
     )
+
+
+def _position_probe_split_metrics(
+    probe: LinearObjectPositionProbe,
+    *,
+    normalized_latents: np.ndarray,
+    normalized_positions: np.ndarray,
+    frame_indices: np.ndarray,
+    world_bounds: np.ndarray,
+) -> dict[str, float | int]:
+    indices = np.asarray(frame_indices, dtype=np.int64)
+    if indices.ndim != 1 or indices.size == 0:
+        raise ValueError("position probe frame indices must be non-empty")
+    with torch.no_grad():
+        predicted = (
+            probe(
+                torch.as_tensor(
+                    normalized_latents[indices],
+                    dtype=torch.float32,
+                )
+            )
+            .cpu()
+            .numpy()
+        )
+    target = normalized_positions[indices]
+    errors = predicted.astype(np.float64) - target
+    world_errors = world_position_errors(
+        predicted,
+        target,
+        world_bounds,
+    )
+    return {
+        "frames": int(indices.size),
+        "normalized_position_mse": float(np.mean(np.square(errors))),
+        "mean_world_position_error": float(np.mean(world_errors)),
+        "p95_world_position_error": float(
+            np.quantile(world_errors, 0.95)
+        ),
+    }
 
 
 def run_recursive_dynamics_training(
@@ -78,6 +146,8 @@ def run_recursive_dynamics_training(
     changed_pixel_loss_weight: float = 0.1,
     rollout_horizon: int = 5,
     rollout_loss_weight: float = 1.0,
+    object_position_loss_weight: float = 0.0,
+    object_position_probe_ridge: float = 1e-3,
     dynamics_epochs: int | None = None,
     dynamics_batch_size: int | None = None,
 ) -> dict[str, Any]:
@@ -86,10 +156,18 @@ def run_recursive_dynamics_training(
     output = Path(output_path)
     preview = Path(preview_path)
     _preflight_output_paths(output, preview)
-    horizon, rollout_weight, changed_weight = _validate_rollout_protocol(
+    (
+        horizon,
+        rollout_weight,
+        changed_weight,
+        object_position_weight,
+        probe_ridge,
+    ) = _validate_rollout_protocol(
         rollout_horizon=rollout_horizon,
         rollout_loss_weight=rollout_loss_weight,
         changed_pixel_loss_weight=changed_pixel_loss_weight,
+        object_position_loss_weight=object_position_loss_weight,
+        object_position_probe_ridge=object_position_probe_ridge,
     )
     data = Path(data_path)
     source_path = Path(source_checkpoint_path)
@@ -134,6 +212,54 @@ def run_recursive_dynamics_training(
         dataset["frames"],
         batch_size=autoencoder_batch_size,
     )
+    position_probe: LinearObjectPositionProbe | None = None
+    position_probe_metadata: dict[str, object] | None = None
+    if object_position_weight > 0.0:
+        normalized_latent_frames = np.asarray(
+            source.latent_normalizer.normalize(latent_frames),
+            dtype=np.float32,
+        )
+        normalized_positions = normalize_object_positions(
+            np.asarray(dataset["states"]),
+            np.asarray(dataset["scene_world_bounds"]),
+        )
+        train_frame_indices = frame_indices_for_episode_ids(
+            dataset,
+            source.split_episode_ids["train"],
+        )
+        validation_frame_indices = frame_indices_for_episode_ids(
+            dataset,
+            source.split_episode_ids["validation"],
+        )
+        position_probe = fit_linear_object_position_probe(
+            normalized_latent_frames[train_frame_indices],
+            normalized_positions[train_frame_indices],
+            ridge=probe_ridge,
+        )
+        position_probe_metadata = {
+            "ridge": probe_ridge,
+            "fit_split": "train_frames",
+            "target": "normalized_xy",
+            "sha256": object_position_probe_sha256(position_probe),
+            "train": _position_probe_split_metrics(
+                position_probe,
+                normalized_latents=normalized_latent_frames,
+                normalized_positions=normalized_positions,
+                frame_indices=train_frame_indices,
+                world_bounds=np.asarray(
+                    dataset["scene_world_bounds"]
+                ),
+            ),
+            "validation": _position_probe_split_metrics(
+                position_probe,
+                normalized_latents=normalized_latent_frames,
+                normalized_positions=normalized_positions,
+                frame_indices=validation_frame_indices,
+                world_bounds=np.asarray(
+                    dataset["scene_world_bounds"]
+                ),
+            ),
+        }
     one_step_arrays = {
         name: build_latent_window_arrays(
             dataset,
@@ -181,6 +307,8 @@ def run_recursive_dynamics_training(
         visual_dataset=dataset,
         changed_pixel_loss_weight=changed_weight,
         rollout_loss_weight=rollout_weight,
+        position_probe=position_probe,
+        object_position_loss_weight=object_position_weight,
     )
     dynamics = dynamics_result.model
     assert isinstance(dynamics, SpatialLatentDynamicsCNN)
@@ -203,6 +331,11 @@ def run_recursive_dynamics_training(
     )
     source_sha256 = sha256_file(source_path)
     training_config = dict(config)
+    dynamics_loss_name = (
+        "one_step_plus_recursive_rollout_plus_object_position"
+        if object_position_weight > 0.0
+        else "one_step_plus_recursive_rollout"
+    )
     training_config.update(
         {
             "data_path": str(data.resolve()),
@@ -220,10 +353,32 @@ def run_recursive_dynamics_training(
             "source_checkpoint_sha256": source_sha256,
             "autoencoder_frozen": True,
             "dynamics_reinitialized": True,
-            "dynamics_loss": "one_step_plus_recursive_rollout",
+            "dynamics_loss": dynamics_loss_name,
             "dynamics_changed_pixel_loss_weight": changed_weight,
             "dynamics_rollout_horizon": horizon,
             "dynamics_rollout_loss_weight": rollout_weight,
+            "dynamics_object_position_loss_weight": (
+                object_position_weight
+            ),
+            "object_position_probe_ridge": probe_ridge,
+            "object_position_probe_fit_split": (
+                "train_frames"
+                if position_probe_metadata is not None
+                else None
+            ),
+            "object_position_target": (
+                "normalized_xy"
+                if position_probe_metadata is not None
+                else None
+            ),
+            "object_position_probe_sha256": (
+                position_probe_metadata["sha256"]
+                if position_probe_metadata is not None
+                else None
+            ),
+            "object_position_probe_metrics": (
+                position_probe_metadata
+            ),
             "dynamics_train_one_step_losses": list(
                 dynamics_result.train_one_step_losses
             ),
@@ -294,6 +449,7 @@ def run_recursive_dynamics_training(
             "changed_pixel_loss_weight": changed_weight,
             "rollout_horizon": horizon,
             "rollout_loss_weight": rollout_weight,
+            "object_position_loss_weight": object_position_weight,
             "initial_train_loss": dynamics_result.train_losses[0],
             "final_train_loss": dynamics_result.train_losses[-1],
             "best_epoch": dynamics_result.best_epoch,
@@ -308,6 +464,7 @@ def run_recursive_dynamics_training(
             ),
             "test": test_metrics,
         },
+        "object_position_probe": position_probe_metadata,
         "checkpoint": str(output),
         "preview": str(preview),
     }
@@ -349,6 +506,16 @@ def main() -> None:
     )
     parser.add_argument("--rollout-horizon", type=int, default=5)
     parser.add_argument("--rollout-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--object-position-loss-weight",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--object-position-probe-ridge",
+        type=float,
+        default=1e-3,
+    )
     parser.add_argument("--dynamics-epochs", type=int)
     parser.add_argument("--dynamics-batch-size", type=int)
     arguments = parser.parse_args()
@@ -363,6 +530,12 @@ def main() -> None:
             ),
             rollout_horizon=arguments.rollout_horizon,
             rollout_loss_weight=arguments.rollout_loss_weight,
+            object_position_loss_weight=(
+                arguments.object_position_loss_weight
+            ),
+            object_position_probe_ridge=(
+                arguments.object_position_probe_ridge
+            ),
             dynamics_epochs=arguments.dynamics_epochs,
             dynamics_batch_size=arguments.dynamics_batch_size,
         )

@@ -48,6 +48,7 @@ from .visual_latent_model import (
     SpatialLatentDynamicsCNN,
     SpatialLatentDynamicsConvGRU,
 )
+from .visual_object_position import LinearObjectPositionProbe
 from .visual_windows import build_visual_window_index
 
 
@@ -491,11 +492,21 @@ def _dynamics_batch_loss(
     latent_normalizer: Normalizer,
     decoder: VisualAutoencoder | None,
     changed_pixel_loss_weight: float,
+    position_probe: LinearObjectPositionProbe | None = None,
+    target_positions: torch.Tensor | None = None,
+    object_position_loss_weight: float = 0.0,
 ) -> torch.Tensor:
     """Evaluate the configured latent plus decoded-image objective."""
 
     if len(batch) not in (4, 6):
         raise ValueError("latent dynamics batch has an invalid structure")
+    if (
+        not math.isfinite(object_position_loss_weight)
+        or object_position_loss_weight < 0.0
+    ):
+        raise ValueError(
+            "object_position_loss_weight must be finite and non-negative"
+        )
     context, history, current, target = batch[:4]
     prediction = model(context, history, current)
     latent_mse = torch.mean(torch.square(prediction - target))
@@ -535,6 +546,26 @@ def _dynamics_batch_loss(
             latent_mse
             + changed_pixel_loss_weight * changed_pixel_mae
         )
+    if object_position_loss_weight > 0.0:
+        if position_probe is None or target_positions is None:
+            raise ValueError(
+                "positive object-position loss requires probe and targets"
+            )
+        if (
+            target_positions.shape != (prediction.shape[0], 2)
+            or not bool(torch.all(torch.isfinite(target_positions)))
+        ):
+            raise ValueError(
+                "target_positions must be finite with shape [B, 2]"
+            )
+        predicted_positions = position_probe(prediction)
+        position_mse = torch.mean(
+            torch.square(predicted_positions - target_positions)
+        )
+        loss = (
+            loss
+            + object_position_loss_weight * position_mse
+        )
     if not torch.isfinite(loss):
         raise ValueError("latent dynamics loss is non-finite")
     return loss
@@ -547,18 +578,34 @@ def _mean_dynamics_loss(
     latent_normalizer: Normalizer,
     decoder: VisualAutoencoder | None,
     changed_pixel_loss_weight: float,
+    position_probe: LinearObjectPositionProbe | None = None,
+    object_position_loss_weight: float = 0.0,
 ) -> float:
     model.eval()
     loss_sum = 0.0
     sample_count = 0
     with torch.no_grad():
         for batch in loader:
+            objective_batch = (
+                batch[:-1]
+                if object_position_loss_weight > 0.0
+                else batch
+            )
             loss = _dynamics_batch_loss(
                 model,
-                batch,
+                objective_batch,
                 latent_normalizer=latent_normalizer,
                 decoder=decoder,
                 changed_pixel_loss_weight=changed_pixel_loss_weight,
+                position_probe=position_probe,
+                target_positions=(
+                    batch[-1]
+                    if object_position_loss_weight > 0.0
+                    else None
+                ),
+                object_position_loss_weight=(
+                    object_position_loss_weight
+                ),
             )
             batch_count = int(batch[0].shape[0])
             loss_sum += float(loss) * batch_count
