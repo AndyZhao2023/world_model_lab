@@ -131,9 +131,15 @@ def _make_autoencoder(
     latent_dim: int,
     spatial_latent_channels: int,
     base_channels: int,
+    object_residual_decoder: bool = False,
+    object_head_channels: int = 0,
 ) -> VisualAutoencoder:
     layout = _validate_latent_layout(latent_layout)
     if layout == "global":
+        if object_residual_decoder or object_head_channels != 0:
+            raise ValueError(
+                "object residual decoding requires a spatial latent layout"
+            )
         return ConvAutoencoder(
             latent_dim=latent_dim,
             base_channels=base_channels,
@@ -141,6 +147,10 @@ def _make_autoencoder(
     return SpatialConvAutoencoder(
         latent_channels=spatial_latent_channels,
         base_channels=base_channels,
+        object_residual_decoder=object_residual_decoder,
+        object_head_channels=(
+            object_head_channels if object_residual_decoder else None
+        ),
     )
 
 
@@ -1373,6 +1383,12 @@ def save_visual_latent_checkpoint(
     spatial_latent_channels = (
         autoencoder.latent_channels if is_spatial else 0
     )
+    object_residual_decoder = (
+        autoencoder.object_residual_decoder if is_spatial else False
+    )
+    object_head_channels = (
+        autoencoder.object_head_channels if is_spatial else 0
+    )
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -1387,6 +1403,8 @@ def save_visual_latent_checkpoint(
                 spatial_dynamics_architecture
             ),
             "base_channels": autoencoder.base_channels,
+            "object_residual_decoder": object_residual_decoder,
+            "object_head_channels": object_head_channels,
             "dynamics_hidden_size": dynamics.hidden_size,
             "context_frames": dynamics.context_frames,
         },
@@ -1529,6 +1547,32 @@ def _load_visual_latent_payload(
         model_config.get("spatial_latent_channels", 0)
     )
     base_channels = int(model_config.get("base_channels", 0))
+    object_residual_decoder = model_config.get(
+        "object_residual_decoder",
+        False,
+    )
+    if not isinstance(object_residual_decoder, bool):
+        raise ValueError("object_residual_decoder must be boolean")
+    raw_object_head_channels = model_config.get("object_head_channels", 0)
+    if isinstance(raw_object_head_channels, bool):
+        raise ValueError("object_head_channels must be an integer")
+    try:
+        object_head_channels = int(raw_object_head_channels)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("object_head_channels must be an integer") from None
+    if object_head_channels != raw_object_head_channels:
+        raise ValueError("object_head_channels must be an integer")
+    if object_residual_decoder:
+        if latent_layout != "spatial" or object_head_channels <= 0:
+            raise ValueError(
+                "object residual decoding requires positive spatial "
+                "head channels"
+            )
+    elif object_head_channels != 0:
+        raise ValueError(
+            "object_head_channels must be zero when residual decoding "
+            "is disabled"
+        )
     hidden_size = int(model_config.get("dynamics_hidden_size", 0))
     context_frames = int(model_config.get("context_frames", 0))
     spatial_dynamics_architecture = (
@@ -1548,6 +1592,8 @@ def _load_visual_latent_payload(
         latent_dim=latent_dim,
         spatial_latent_channels=spatial_latent_channels,
         base_channels=base_channels,
+        object_residual_decoder=object_residual_decoder,
+        object_head_channels=object_head_channels,
     )
     dynamics = _make_dynamics(
         latent_layout=latent_layout,

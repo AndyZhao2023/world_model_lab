@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 
@@ -120,14 +122,45 @@ class SpatialConvAutoencoder(nn.Module):
         *,
         latent_channels: int = 8,
         base_channels: int = 16,
+        object_residual_decoder: bool = False,
+        object_head_channels: int | None = None,
+        object_initial_alpha: float = 0.01,
     ) -> None:
         super().__init__()
         if latent_channels <= 0 or base_channels <= 0:
             raise ValueError(
                 "latent_channels and base_channels must be positive"
             )
+        if not isinstance(object_residual_decoder, bool):
+            raise ValueError("object_residual_decoder must be boolean")
+        if (
+            not math.isfinite(object_initial_alpha)
+            or object_initial_alpha <= 0.0
+            or object_initial_alpha >= 1.0
+        ):
+            raise ValueError("object_initial_alpha must be between zero and one")
+        if object_residual_decoder:
+            selected_head_channels = (
+                base_channels
+                if object_head_channels is None
+                else object_head_channels
+            )
+            if (
+                isinstance(selected_head_channels, bool)
+                or not isinstance(selected_head_channels, int)
+                or selected_head_channels <= 0
+            ):
+                raise ValueError("object_head_channels must be positive")
+        else:
+            if object_head_channels is not None:
+                raise ValueError(
+                    "object_head_channels requires object residual decoding"
+                )
+            selected_head_channels = 0
         self.latent_channels = int(latent_channels)
         self.base_channels = int(base_channels)
+        self.object_residual_decoder = object_residual_decoder
+        self.object_head_channels = int(selected_head_channels)
         self.latent_dim = (
             self.latent_channels * self.latent_size * self.latent_size
         )
@@ -171,13 +204,50 @@ class SpatialConvAutoencoder(nn.Module):
             nn.ConvTranspose2d(self.base_channels, 3, 4, 2, 1),
             nn.Sigmoid(),
         )
+        if self.object_residual_decoder:
+            self.object_decoder_convolutions: nn.Sequential | None = (
+                nn.Sequential(
+                    nn.ConvTranspose2d(
+                        self.latent_channels,
+                        2 * self.object_head_channels,
+                        4,
+                        2,
+                        1,
+                    ),
+                    nn.ReLU(),
+                    nn.ConvTranspose2d(
+                        2 * self.object_head_channels,
+                        self.object_head_channels,
+                        4,
+                        2,
+                        1,
+                    ),
+                    nn.ReLU(),
+                    nn.ConvTranspose2d(
+                        self.object_head_channels,
+                        4,
+                        4,
+                        2,
+                        1,
+                    ),
+                )
+            )
+            final_convolution = self.object_decoder_convolutions[-1]
+            assert isinstance(final_convolution, nn.ConvTranspose2d)
+            with torch.no_grad():
+                final_convolution.weight[:, 3].zero_()
+                final_convolution.bias[3] = math.log(
+                    object_initial_alpha / (1.0 - object_initial_alpha)
+                )
+        else:
+            self.object_decoder_convolutions = None
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         if images.ndim != 4 or tuple(images.shape[1:]) != (3, 64, 64):
             raise ValueError("images must have shape [B, 3, 64, 64]")
         return self.encoder_convolutions(images)
 
-    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+    def _latent_grid(self, latents: torch.Tensor) -> torch.Tensor:
         if latents.ndim == 2:
             if latents.shape[1] != self.latent_dim:
                 raise ValueError(
@@ -203,7 +273,36 @@ class SpatialConvAutoencoder(nn.Module):
                 f"[B, {self.latent_channels}, 8, 8] or "
                 f"[B, {self.latent_dim}]"
             )
-        return self.decoder_convolutions(latent_grid)
+        return latent_grid
+
+    def decode_components(
+        self,
+        latents: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Decode frozen-base and learned object-composite components."""
+
+        if (
+            not self.object_residual_decoder
+            or self.object_decoder_convolutions is None
+        ):
+            raise ValueError("object residual decoder is not enabled")
+        latent_grid = self._latent_grid(latents)
+        base = self.decoder_convolutions(latent_grid)
+        object_output = self.object_decoder_convolutions(latent_grid)
+        foreground = torch.sigmoid(object_output[:, :3])
+        mask_logits = object_output[:, 3:4]
+        alpha = torch.sigmoid(mask_logits)
+        composite = base * (1.0 - alpha) + foreground * alpha
+        return base, foreground, mask_logits, composite
+
+    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+        latent_grid = self._latent_grid(latents)
+        if (
+            not self.object_residual_decoder
+            or self.object_decoder_convolutions is None
+        ):
+            return self.decoder_convolutions(latent_grid)
+        return self.decode_components(latent_grid)[-1]
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         return self.decode(self.encode(images))
