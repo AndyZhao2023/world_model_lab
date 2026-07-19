@@ -19,6 +19,7 @@ from world_model_lab.train_visual_latent_model import (
     PhaseTrainingResult,
     _changed_pixel_mae_loss,
     _motion_weighted_mse,
+    _object_balanced_mse,
     evaluate_autoencoder,
     evaluate_latent_dynamics,
     load_visual_latent_checkpoint,
@@ -37,6 +38,7 @@ from world_model_lab.visual_latent_model import (
     SpatialLatentDynamicsCNN,
     SpatialLatentDynamicsConvGRU,
 )
+from world_model_lab.visual_observation import CAR_COLOR, HEADING_COLOR
 
 
 def make_tiny_visual_dataset() -> dict[str, np.ndarray]:
@@ -117,6 +119,63 @@ class VisualAutoencoderTrainingTest(unittest.TestCase):
                         motion_loss_weight=weight,
                     )
 
+    def test_object_balanced_mse_normalizes_object_and_background_separately(
+        self,
+    ):
+        target = torch.zeros((1, 3, 1, 2), dtype=torch.float32)
+        prediction = torch.tensor(
+            [[[[1.0, 0.5]], [[1.0, 0.5]], [[1.0, 0.5]]]],
+            dtype=torch.float32,
+        )
+        mask = torch.tensor([[[[1.0, 0.0]]]], dtype=torch.float32)
+
+        plain = _object_balanced_mse(
+            prediction,
+            target,
+            mask,
+            object_loss_weight=0.0,
+        )
+        balanced = _object_balanced_mse(
+            prediction,
+            target,
+            mask,
+            object_loss_weight=1.0,
+        )
+
+        torch.testing.assert_close(
+            plain,
+            torch.mean(torch.square(prediction - target)),
+        )
+        torch.testing.assert_close(balanced, torch.tensor(1.25))
+
+    def test_object_balanced_mse_rejects_invalid_inputs(self):
+        images = torch.zeros((1, 3, 2, 2))
+        masks = torch.zeros((1, 1, 2, 2))
+        cases = (
+            (images[:, :2], images, masks, 1.0),
+            (images, images, masks[:, :, :1], 1.0),
+            (images, images, torch.full_like(masks, 0.5), 1.0),
+            (images, images, masks, -1.0),
+            (images, images, masks, float("nan")),
+            (images, images, masks, float("inf")),
+        )
+        for prediction, target, mask, weight in cases:
+            with self.subTest(weight=weight):
+                with self.assertRaises(ValueError):
+                    _object_balanced_mse(
+                        prediction,
+                        target,
+                        mask,
+                        object_loss_weight=weight,
+                    )
+        with self.assertRaisesRegex(ValueError, "object and background"):
+            _object_balanced_mse(
+                images,
+                images,
+                masks,
+                object_loss_weight=1.0,
+            )
+
     def test_autoencoder_training_records_histories_and_test_metrics(self):
         visual = make_tiny_visual_dataset()
         splits = split_episode_ids(visual["episode_ids"], seed=19)
@@ -149,6 +208,15 @@ class VisualAutoencoderTrainingTest(unittest.TestCase):
         self.assertEqual(metrics["frames"], 5)
         for name in ("pixel_mse", "pixel_mae", "psnr_db"):
             self.assertTrue(math.isfinite(float(metrics[name])))
+        for name in (
+            "object_pixels",
+            "background_pixels",
+            "object_pixel_mse",
+            "object_pixel_mae",
+            "background_pixel_mse",
+            "background_pixel_mae",
+        ):
+            self.assertIn(name, metrics)
 
     def test_autoencoder_training_rejects_invalid_hyperparameters(self):
         visual = make_tiny_visual_dataset()
@@ -160,6 +228,9 @@ class VisualAutoencoderTrainingTest(unittest.TestCase):
             {"motion_loss_weight": -1.0},
             {"motion_loss_weight": float("nan")},
             {"motion_loss_weight": float("inf")},
+            {"object_loss_weight": -1.0},
+            {"object_loss_weight": float("nan")},
+            {"object_loss_weight": float("inf")},
             {"seed": -1},
         )
         for values in invalid:
@@ -179,6 +250,19 @@ class VisualAutoencoderTrainingTest(unittest.TestCase):
                         base_channels=2,
                         **config,
                     )
+        with self.assertRaisesRegex(ValueError, "cannot both be positive"):
+            train_autoencoder(
+                visual,
+                split_episode_ids=splits,
+                latent_dim=4,
+                base_channels=2,
+                epochs=1,
+                batch_size=8,
+                learning_rate=1e-3,
+                motion_loss_weight=1.0,
+                object_loss_weight=1.0,
+                seed=3,
+            )
 
 
 class VisualLatentDynamicsTrainingTest(unittest.TestCase):
@@ -1201,6 +1285,42 @@ class VisualLatentEndToEndTest(unittest.TestCase):
         self.assertEqual(loaded.training_config["spatial_latent_channels"], 2)
         self.assertIn("oracle_reconstruction_pixel_mse", summary["dynamics"]["test"])
 
+    def test_object_aligned_training_records_weight_and_region_metrics(self):
+        visual = make_tiny_visual_dataset()
+        visual["frames"][:, 2, 3] = CAR_COLOR
+        visual["frames"][:, 4, 5] = HEADING_COLOR
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path = root / "visual.npz"
+            checkpoint_path = root / "object.pt"
+            preview_path = root / "object.png"
+            save_visual_dataset(visual, data_path)
+
+            summary = run_visual_latent_training(
+                data_path=data_path,
+                output_path=checkpoint_path,
+                preview_path=preview_path,
+                latent_layout="spatial",
+                spatial_latent_channels=2,
+                base_channels=2,
+                dynamics_hidden_size=4,
+                autoencoder_epochs=1,
+                dynamics_epochs=1,
+                autoencoder_batch_size=8,
+                dynamics_batch_size=8,
+                object_loss_weight=1.0,
+                seed=3,
+                split_seed=19,
+            )
+            loaded = load_visual_latent_checkpoint(checkpoint_path)
+
+        self.assertEqual(loaded.training_config["object_loss_weight"], 1.0)
+        self.assertEqual(summary["autoencoder"]["test"]["object_pixels"], 10)
+        self.assertGreater(
+            summary["autoencoder"]["test"]["background_pixels"],
+            0,
+        )
+
     def test_tiny_spatial_convgru_training_writes_reloadable_models(self):
         visual = make_tiny_visual_dataset()
         with tempfile.TemporaryDirectory() as directory:
@@ -1371,6 +1491,7 @@ class VisualLatentEndToEndTest(unittest.TestCase):
             "--spatial-latent-channels",
             "--spatial-dynamics-architecture",
             "--motion-loss-weight",
+            "--object-loss-weight",
             "--split-seed",
         ):
             self.assertIn(option, help_text)

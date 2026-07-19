@@ -11,18 +11,21 @@ from world_model_lab.visual_latent_data import (
     LatentWindowArrays,
     VisualFrameDataset,
     VisualMotionFrameDataset,
+    VisualObjectFrameDataset,
     build_latent_rollout_arrays,
     build_latent_window_arrays,
     encode_all_frames,
     fit_safe_normalizer,
     frame_indices_for_episode_ids,
     frames_to_tensor,
+    renderer_object_masks,
     transition_indices_for_episode_ids,
 )
 from world_model_lab.visual_latent_model import (
     ConvAutoencoder,
     SpatialConvAutoencoder,
 )
+from world_model_lab.visual_observation import CAR_COLOR, HEADING_COLOR
 from world_model_lab.visual_windows import build_visual_window_index
 
 
@@ -157,6 +160,56 @@ class VisualFrameAdapterTest(unittest.TestCase):
         self.assertEqual(
             int(self.visual["frames"][second_episode_start + 1, 2, 3, 1]),
             int(self.visual["frames"][second_episode_start, 2, 3, 1]) + 1,
+        )
+        for invalid in (slice(None), np.asarray([0]), 0.5, True):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(TypeError):
+                    dataset[invalid]
+
+    def test_renderer_object_masks_match_exact_car_and_heading_colours(self):
+        frames = np.zeros((2, 64, 64, 3), dtype=np.uint8)
+        frames[0, 2, 3] = CAR_COLOR
+        frames[0, 4, 5] = HEADING_COLOR
+        frames[0, 6, 7] = np.asarray(CAR_COLOR) + [0, 0, 1]
+
+        masks = renderer_object_masks(frames)
+        single = renderer_object_masks(frames[0])
+
+        self.assertEqual(tuple(masks.shape), (2, 1, 64, 64))
+        self.assertEqual(tuple(single.shape), (1, 64, 64))
+        self.assertEqual(masks.dtype, torch.float32)
+        self.assertEqual(int(torch.count_nonzero(masks[0])), 2)
+        self.assertEqual(float(masks[0, 0, 2, 3]), 1.0)
+        self.assertEqual(float(masks[0, 0, 4, 5]), 1.0)
+        self.assertEqual(float(masks[0, 0, 6, 7]), 0.0)
+        self.assertEqual(int(torch.count_nonzero(masks[1])), 0)
+
+    def test_object_frame_dataset_preserves_order_and_returns_owned_tensors(
+        self,
+    ):
+        first_selected_index = int(self.visual["frame_offsets"][1])
+        self.visual["frames"][first_selected_index, 2, 3] = CAR_COLOR
+        self.visual["frames"][first_selected_index, 4, 5] = HEADING_COLOR
+        dataset = VisualObjectFrameDataset(
+            self.visual,
+            np.asarray([11, 10], dtype=np.int64),
+        )
+
+        image, mask = dataset[0]
+
+        self.assertEqual(len(dataset), 11)
+        self.assertEqual(tuple(image.shape), (3, 64, 64))
+        self.assertEqual(tuple(mask.shape), (1, 64, 64))
+        self.assertEqual(int(torch.count_nonzero(mask)), 2)
+        torch.testing.assert_close(
+            image,
+            frames_to_tensor(self.visual["frames"][first_selected_index]),
+        )
+        image[:, 2, 3] = 0.0
+        mask[:, 2, 3] = 0.0
+        self.assertEqual(
+            tuple(self.visual["frames"][first_selected_index, 2, 3]),
+            CAR_COLOR,
         )
         for invalid in (slice(None), np.asarray([0]), 0.5, True):
             with self.subTest(invalid=invalid):

@@ -32,8 +32,8 @@ from .visual_dataset import (
 )
 from .visual_latent_data import (
     LatentWindowArrays,
-    VisualFrameDataset,
     VisualMotionFrameDataset,
+    VisualObjectFrameDataset,
     build_latent_window_arrays,
     encode_all_frames,
     fit_safe_normalizer,
@@ -190,20 +190,22 @@ def _mean_autoencoder_loss(
     loader: DataLoader,
     *,
     motion_loss_weight: float,
+    object_loss_weight: float,
 ) -> float:
     model.eval()
     loss_sum = 0.0
     sample_count = 0
     with torch.no_grad():
-        for images, motion_masks in loader:
+        for images, masks in loader:
             reconstructions = model(images)
             if not torch.all(torch.isfinite(reconstructions)):
                 raise ValueError("autoencoder produced non-finite pixels")
-            batch_loss = _motion_weighted_mse(
+            batch_loss = _autoencoder_reconstruction_loss(
                 reconstructions,
                 images,
-                motion_masks,
+                masks,
                 motion_loss_weight=motion_loss_weight,
+                object_loss_weight=object_loss_weight,
             )
             batch_count = int(images.shape[0])
             loss_sum += float(batch_loss) * batch_count
@@ -253,6 +255,90 @@ def _motion_weighted_mse(
     )
 
 
+def _object_balanced_mse(
+    reconstructions: torch.Tensor,
+    images: torch.Tensor,
+    object_masks: torch.Tensor,
+    *,
+    object_loss_weight: float,
+) -> torch.Tensor:
+    """Return full MSE or separately normalized object/background MSE."""
+
+    if (
+        reconstructions.ndim != 4
+        or reconstructions.shape != images.shape
+        or reconstructions.shape[1] != 3
+    ):
+        raise ValueError(
+            "reconstructions and images must share shape [B, 3, H, W]"
+        )
+    expected_mask_shape = (
+        images.shape[0],
+        1,
+        images.shape[2],
+        images.shape[3],
+    )
+    if tuple(object_masks.shape) != expected_mask_shape:
+        raise ValueError("object_masks must have shape [B, 1, H, W]")
+    if not math.isfinite(object_loss_weight) or object_loss_weight < 0.0:
+        raise ValueError("object_loss_weight must be finite and non-negative")
+    if not torch.all(torch.isfinite(object_masks)):
+        raise ValueError("object_masks must be finite")
+    if not bool(torch.all((object_masks == 0) | (object_masks == 1))):
+        raise ValueError("object_masks must be binary")
+    squared_errors = torch.square(reconstructions - images)
+    if object_loss_weight == 0.0:
+        return torch.mean(squared_errors)
+    expanded_object = object_masks.expand_as(squared_errors)
+    object_value_count = torch.sum(expanded_object)
+    background = 1.0 - expanded_object
+    background_value_count = torch.sum(background)
+    if (
+        float(object_value_count) == 0.0
+        or float(background_value_count) == 0.0
+    ):
+        raise ValueError(
+            "positive object loss requires non-empty object and background "
+            "regions"
+        )
+    object_mse = torch.sum(squared_errors * expanded_object) / (
+        object_value_count
+    )
+    background_mse = torch.sum(squared_errors * background) / (
+        background_value_count
+    )
+    return background_mse + object_loss_weight * object_mse
+
+
+def _autoencoder_reconstruction_loss(
+    reconstructions: torch.Tensor,
+    images: torch.Tensor,
+    masks: torch.Tensor,
+    *,
+    motion_loss_weight: float,
+    object_loss_weight: float,
+) -> torch.Tensor:
+    """Dispatch to the one configured reconstruction objective."""
+
+    if motion_loss_weight > 0.0 and object_loss_weight > 0.0:
+        raise ValueError(
+            "motion_loss_weight and object_loss_weight cannot both be positive"
+        )
+    if object_loss_weight > 0.0:
+        return _object_balanced_mse(
+            reconstructions,
+            images,
+            masks,
+            object_loss_weight=object_loss_weight,
+        )
+    return _motion_weighted_mse(
+        reconstructions,
+        images,
+        masks,
+        motion_loss_weight=motion_loss_weight,
+    )
+
+
 def _changed_pixel_mae_loss(
     predictions: torch.Tensor,
     targets: torch.Tensor,
@@ -297,6 +383,7 @@ def train_autoencoder(
     batch_size: int = 128,
     learning_rate: float = 1e-3,
     motion_loss_weight: float = 0.0,
+    object_loss_weight: float = 0.0,
     seed: int = 0,
 ) -> PhaseTrainingResult:
     """Train the frame autoencoder and restore its best validation weights."""
@@ -309,14 +396,25 @@ def train_autoencoder(
     )
     if not math.isfinite(motion_loss_weight) or motion_loss_weight < 0.0:
         raise ValueError("motion_loss_weight must be finite and non-negative")
+    if not math.isfinite(object_loss_weight) or object_loss_weight < 0.0:
+        raise ValueError("object_loss_weight must be finite and non-negative")
+    if motion_loss_weight > 0.0 and object_loss_weight > 0.0:
+        raise ValueError(
+            "motion_loss_weight and object_loss_weight cannot both be positive"
+        )
     layout = _validate_latent_layout(latent_layout)
     if spatial_latent_channels <= 0:
         raise ValueError("spatial_latent_channels must be positive")
-    train_data = VisualMotionFrameDataset(
+    frame_dataset_type = (
+        VisualObjectFrameDataset
+        if object_loss_weight > 0.0
+        else VisualMotionFrameDataset
+    )
+    train_data = frame_dataset_type(
         dataset,
         split_episode_ids["train"],
     )
-    validation_data = VisualMotionFrameDataset(
+    validation_data = frame_dataset_type(
         dataset,
         split_episode_ids["validation"],
     )
@@ -355,14 +453,15 @@ def train_autoencoder(
         model.train()
         epoch_loss = 0.0
         sample_count = 0
-        for images, motion_masks in train_loader:
+        for images, masks in train_loader:
             optimizer.zero_grad()
             reconstructions = model(images)
-            loss = _motion_weighted_mse(
+            loss = _autoencoder_reconstruction_loss(
                 reconstructions,
                 images,
-                motion_masks,
+                masks,
                 motion_loss_weight=motion_loss_weight,
+                object_loss_weight=object_loss_weight,
             )
             if not torch.isfinite(loss):
                 raise ValueError("autoencoder training loss is non-finite")
@@ -376,6 +475,7 @@ def train_autoencoder(
             model,
             validation_loader,
             motion_loss_weight=motion_loss_weight,
+            object_loss_weight=object_loss_weight,
         )
         train_losses.append(train_loss)
         validation_losses.append(validation_loss)
@@ -407,7 +507,7 @@ def evaluate_autoencoder(
 
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    frame_data = VisualFrameDataset(dataset, selected_episode_ids)
+    frame_data = VisualObjectFrameDataset(dataset, selected_episode_ids)
     if len(frame_data) == 0:
         raise ValueError("autoencoder evaluation data must not be empty")
     loader = DataLoader(
@@ -420,8 +520,14 @@ def evaluate_autoencoder(
     squared_error_sum = 0.0
     absolute_error_sum = 0.0
     value_count = 0
+    object_squared_error_sum = 0.0
+    object_absolute_error_sum = 0.0
+    background_squared_error_sum = 0.0
+    background_absolute_error_sum = 0.0
+    object_pixel_count = 0
+    background_pixel_count = 0
     with torch.no_grad():
-        for images in loader:
+        for images, object_masks in loader:
             reconstructions = model(images)
             if not torch.all(torch.isfinite(reconstructions)):
                 raise ValueError("autoencoder produced non-finite pixels")
@@ -429,13 +535,60 @@ def evaluate_autoencoder(
             squared_error_sum += float(torch.sum(torch.square(errors)))
             absolute_error_sum += float(torch.sum(torch.abs(errors)))
             value_count += images.numel()
+            object_values = object_masks.expand_as(errors).to(
+                dtype=torch.bool
+            )
+            background_values = ~object_values
+            squared_errors = torch.square(errors)
+            absolute_errors = torch.abs(errors)
+            object_squared_error_sum += float(
+                torch.sum(squared_errors[object_values])
+            )
+            object_absolute_error_sum += float(
+                torch.sum(absolute_errors[object_values])
+            )
+            background_squared_error_sum += float(
+                torch.sum(squared_errors[background_values])
+            )
+            background_absolute_error_sum += float(
+                torch.sum(absolute_errors[background_values])
+            )
+            batch_object_pixels = int(torch.sum(object_masks))
+            object_pixel_count += batch_object_pixels
+            background_pixel_count += (
+                int(object_masks.numel()) - batch_object_pixels
+            )
     pixel_mse = squared_error_sum / value_count
     pixel_mae = absolute_error_sum / value_count
+    object_value_count = object_pixel_count * 3
+    background_value_count = background_pixel_count * 3
     return {
         "frames": len(frame_data),
         "pixel_mse": pixel_mse,
         "pixel_mae": pixel_mae,
         "psnr_db": 10.0 * math.log10(1.0 / max(pixel_mse, 1e-12)),
+        "object_pixels": object_pixel_count,
+        "background_pixels": background_pixel_count,
+        "object_pixel_mse": (
+            object_squared_error_sum / object_value_count
+            if object_value_count
+            else 0.0
+        ),
+        "object_pixel_mae": (
+            object_absolute_error_sum / object_value_count
+            if object_value_count
+            else 0.0
+        ),
+        "background_pixel_mse": (
+            background_squared_error_sum / background_value_count
+            if background_value_count
+            else 0.0
+        ),
+        "background_pixel_mae": (
+            background_absolute_error_sum / background_value_count
+            if background_value_count
+            else 0.0
+        ),
     }
 
 
@@ -1620,6 +1773,7 @@ def run_visual_latent_training(
     autoencoder_learning_rate: float = 1e-3,
     dynamics_learning_rate: float = 1e-3,
     motion_loss_weight: float = 0.0,
+    object_loss_weight: float = 0.0,
     seed: int = 0,
     split_seed: int = 42,
 ) -> dict[str, Any]:
@@ -1656,6 +1810,7 @@ def run_visual_latent_training(
         batch_size=autoencoder_batch_size,
         learning_rate=autoencoder_learning_rate,
         motion_loss_weight=motion_loss_weight,
+        object_loss_weight=object_loss_weight,
         seed=seed,
     )
     autoencoder = autoencoder_result.model
@@ -1752,6 +1907,7 @@ def run_visual_latent_training(
         "autoencoder_learning_rate": autoencoder_learning_rate,
         "dynamics_learning_rate": dynamics_learning_rate,
         "motion_loss_weight": motion_loss_weight,
+        "object_loss_weight": object_loss_weight,
         "seed": seed,
         "split_seed": split_seed,
     }
@@ -1883,6 +2039,15 @@ def main() -> None:
             "preceding frame"
         ),
     )
+    parser.add_argument(
+        "--object-loss-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "separately normalized reconstruction weight for exact "
+            "renderer car and heading pixels"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--split-seed", type=int, default=42)
     args = parser.parse_args()
@@ -1906,6 +2071,7 @@ def main() -> None:
             autoencoder_learning_rate=args.autoencoder_learning_rate,
             dynamics_learning_rate=args.dynamics_learning_rate,
             motion_loss_weight=args.motion_loss_weight,
+            object_loss_weight=args.object_loss_weight,
             seed=args.seed,
             split_seed=args.split_seed,
         )

@@ -20,6 +20,7 @@ from .visual_latent_model import (
     ConvAutoencoder,
     SpatialConvAutoencoder,
 )
+from .visual_observation import CAR_COLOR, HEADING_COLOR
 from .visual_windows import VisualWindowIndex
 
 
@@ -78,6 +79,34 @@ def frames_to_tensor(frames: np.ndarray) -> torch.Tensor:
         .permute(0, 3, 1, 2)
         .to(dtype=torch.float32)
         .div_(255.0)
+    )
+    return tensor[0] if single else tensor
+
+
+def renderer_object_masks(frames: np.ndarray) -> torch.Tensor:
+    """Return exact binary masks for rendered car and heading pixels."""
+
+    values = np.asarray(frames)
+    single = values.ndim == 3
+    if single:
+        values = values[None, ...]
+    if (
+        values.ndim != 4
+        or values.shape[1:] != (IMAGE_SIZE, IMAGE_SIZE, 3)
+        or values.dtype != np.dtype(np.uint8)
+    ):
+        raise ValueError(
+            "frames must have dtype uint8 and shape "
+            "[64, 64, 3] or [N, 64, 64, 3]"
+        )
+    car_color = np.asarray(CAR_COLOR, dtype=np.uint8)
+    heading_color = np.asarray(HEADING_COLOR, dtype=np.uint8)
+    masks = np.all(values == car_color, axis=3) | np.all(
+        values == heading_color,
+        axis=3,
+    )
+    tensor = torch.from_numpy(masks.copy()).unsqueeze(1).to(
+        dtype=torch.float32
     )
     return tensor[0] if single else tensor
 
@@ -207,6 +236,41 @@ class VisualMotionFrameDataset(Dataset):
             dtype=torch.float32
         )
         return frames_to_tensor(frame), motion_mask
+
+
+class VisualObjectFrameDataset(Dataset):
+    """Return selected frames with exact renderer-derived object masks."""
+
+    def __init__(
+        self,
+        dataset: Mapping[str, np.ndarray],
+        selected_episode_ids: np.ndarray,
+    ) -> None:
+        self.frame_indices = frame_indices_for_episode_ids(
+            dataset,
+            selected_episode_ids,
+        )
+        self.frame_indices.setflags(write=False)
+        self._frames = np.asarray(dataset["frames"])
+
+    def __len__(self) -> int:
+        return int(self.frame_indices.size)
+
+    def __getitem__(self, item: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(item, (bool, np.bool_)):
+            raise TypeError("object frame dataset index must be an integer")
+        try:
+            position = operator.index(item)
+        except TypeError:
+            raise TypeError(
+                "object frame dataset index must be an integer"
+            ) from None
+        if position < 0:
+            position += len(self)
+        if position < 0 or position >= len(self):
+            raise IndexError("object frame dataset index out of range")
+        frame = self._frames[int(self.frame_indices[position])]
+        return frames_to_tensor(frame), renderer_object_masks(frame)
 
 
 def fit_safe_normalizer(
