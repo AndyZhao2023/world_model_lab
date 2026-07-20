@@ -76,6 +76,40 @@ def normalize_object_slot_targets(
     return targets.astype(np.float32)
 
 
+def normalized_affine_to_raw(
+    normalized_weight: np.ndarray,
+    normalized_bias: np.ndarray,
+    mean: np.ndarray,
+    std: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert an affine map over normalized values to raw input space."""
+
+    weight = np.asarray(normalized_weight, dtype=np.float64)
+    bias = np.asarray(normalized_bias, dtype=np.float64)
+    mean_values = np.asarray(mean, dtype=np.float64)
+    std_values = np.asarray(std, dtype=np.float64)
+    if (
+        weight.ndim != 2
+        or weight.shape[0] == 0
+        or weight.shape[1] == 0
+        or bias.shape != (weight.shape[0],)
+        or mean_values.shape != (weight.shape[1],)
+        or std_values.shape != (weight.shape[1],)
+        or not np.all(np.isfinite(weight))
+        or not np.all(np.isfinite(bias))
+        or not np.all(np.isfinite(mean_values))
+        or not np.all(np.isfinite(std_values))
+        or np.any(std_values <= 0.0)
+    ):
+        raise ValueError(
+            "affine weight, bias, mean, and positive std must have "
+            "compatible finite shapes"
+        )
+    raw_weight = weight / std_values[None, :]
+    raw_bias = bias - weight @ (mean_values / std_values)
+    return raw_weight, raw_bias
+
+
 class VisualObjectSlotFrameDataset(Dataset):
     """Return aligned image, object mask, and physical object-slot target."""
 
@@ -180,6 +214,9 @@ def _validate_slot_parameters(
 def initialize_object_slot_autoencoder(
     source: SpatialConvAutoencoder,
     *,
+    locator: str = "spatial_attention",
+    centre_weight: np.ndarray | None = None,
+    centre_bias: np.ndarray | None = None,
     patch_size: int,
     hidden_size: int,
     initial_alpha: float,
@@ -191,6 +228,30 @@ def initialize_object_slot_autoencoder(
         raise ValueError("source must be a spatial autoencoder")
     if source.object_residual_decoder or source.object_slot_decoder:
         raise ValueError("source must not already have an object decoder")
+    if locator not in {"spatial_attention", "global_affine"}:
+        raise ValueError(
+            "locator must be 'spatial_attention' or 'global_affine'"
+        )
+    if locator == "global_affine":
+        weight = np.asarray(centre_weight)
+        bias = np.asarray(centre_bias)
+        if (
+            weight.shape != (2, source.latent_dim)
+            or bias.shape != (2,)
+            or not np.all(np.isfinite(weight))
+            or not np.all(np.isfinite(bias))
+        ):
+            raise ValueError(
+                "global affine centre weight and bias must be finite "
+                f"[2, {source.latent_dim}] and [2]"
+            )
+    else:
+        if centre_weight is not None or centre_bias is not None:
+            raise ValueError(
+                "centre weight and bias require global affine locator"
+            )
+        weight = np.empty((0, 0), dtype=np.float32)
+        bias = np.empty((0,), dtype=np.float32)
     _validate_slot_parameters(
         patch_size=patch_size,
         hidden_size=hidden_size,
@@ -213,6 +274,7 @@ def initialize_object_slot_autoencoder(
             object_slot_decoder=True,
             object_slot_patch_size=patch_size,
             object_slot_hidden_size=hidden_size,
+            object_slot_locator=locator,
         )
     candidate.encoder_convolutions.load_state_dict(
         source.encoder_convolutions.state_dict()
@@ -226,6 +288,15 @@ def initialize_object_slot_autoencoder(
     ):
         for parameter in module.parameters():
             parameter.requires_grad_(False)
+    if locator == "global_affine":
+        assert candidate.object_center is not None
+        with torch.no_grad():
+            candidate.object_center.weight.copy_(
+                torch.as_tensor(weight, dtype=torch.float32)
+            )
+            candidate.object_center.bias.copy_(
+                torch.as_tensor(bias, dtype=torch.float32)
+            )
     candidate.eval()
     return candidate
 
@@ -386,6 +457,9 @@ def train_object_slot_decoder(
     dataset: dict[str, np.ndarray],
     *,
     split_episode_ids: dict[str, np.ndarray],
+    locator: str = "spatial_attention",
+    centre_weight: np.ndarray | None = None,
+    centre_bias: np.ndarray | None = None,
     patch_size: int = 11,
     hidden_size: int = 64,
     initial_alpha: float = 0.01,
@@ -425,6 +499,9 @@ def train_object_slot_decoder(
         raise ValueError("object-slot train and validation data must not be empty")
     model = initialize_object_slot_autoencoder(
         source,
+        locator=locator,
+        centre_weight=centre_weight,
+        centre_bias=centre_bias,
         patch_size=patch_size,
         hidden_size=hidden_size,
         initial_alpha=initial_alpha,

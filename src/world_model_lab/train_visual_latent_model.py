@@ -136,6 +136,7 @@ def _make_autoencoder(
     object_slot_decoder: bool = False,
     object_slot_patch_size: int = 0,
     object_slot_hidden_size: int = 0,
+    object_slot_locator: str = "",
 ) -> VisualAutoencoder:
     layout = _validate_latent_layout(latent_layout)
     if layout == "global":
@@ -145,6 +146,7 @@ def _make_autoencoder(
             or object_slot_decoder
             or object_slot_patch_size != 0
             or object_slot_hidden_size != 0
+            or object_slot_locator != ""
         ):
             raise ValueError(
                 "object decoding requires a spatial latent layout"
@@ -166,6 +168,9 @@ def _make_autoencoder(
         ),
         object_slot_hidden_size=(
             object_slot_hidden_size if object_slot_decoder else None
+        ),
+        object_slot_locator=(
+            object_slot_locator if object_slot_decoder else None
         ),
     )
 
@@ -1414,6 +1419,9 @@ def save_visual_latent_checkpoint(
     object_slot_hidden_size = (
         autoencoder.object_slot_hidden_size if is_spatial else 0
     )
+    object_slot_locator = (
+        autoencoder.object_slot_locator if is_spatial else ""
+    )
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -1433,6 +1441,7 @@ def save_visual_latent_checkpoint(
             "object_slot_decoder": object_slot_decoder,
             "object_slot_patch_size": object_slot_patch_size,
             "object_slot_hidden_size": object_slot_hidden_size,
+            "object_slot_locator": object_slot_locator,
             "dynamics_hidden_size": dynamics.hidden_size,
             "context_frames": dynamics.context_frames,
         },
@@ -1621,6 +1630,15 @@ def _load_visual_latent_payload(
         slot_integer_values[name] = integer_value
     object_slot_patch_size = slot_integer_values["object_slot_patch_size"]
     object_slot_hidden_size = slot_integer_values["object_slot_hidden_size"]
+    default_slot_locator = (
+        "spatial_attention" if object_slot_decoder else ""
+    )
+    object_slot_locator = model_config.get(
+        "object_slot_locator",
+        default_slot_locator,
+    )
+    if not isinstance(object_slot_locator, str):
+        raise ValueError("object_slot_locator must be a string")
     if object_slot_decoder:
         if (
             latent_layout != "spatial"
@@ -1631,9 +1649,21 @@ def _load_visual_latent_payload(
                 "object slot decoding requires positive spatial patch and "
                 "hidden sizes"
             )
-    elif object_slot_patch_size != 0 or object_slot_hidden_size != 0:
+        if object_slot_locator not in {
+            "spatial_attention",
+            "global_affine",
+        }:
+            raise ValueError(
+                "object_slot_locator must be 'spatial_attention' or "
+                "'global_affine'"
+            )
+    elif (
+        object_slot_patch_size != 0
+        or object_slot_hidden_size != 0
+        or object_slot_locator != ""
+    ):
         raise ValueError(
-            "object slot sizes must be zero when slot decoding is disabled"
+            "object slot config must be empty when slot decoding is disabled"
         )
     if object_residual_decoder and object_slot_decoder:
         raise ValueError(
@@ -1663,6 +1693,7 @@ def _load_visual_latent_payload(
         object_slot_decoder=object_slot_decoder,
         object_slot_patch_size=object_slot_patch_size,
         object_slot_hidden_size=object_slot_hidden_size,
+        object_slot_locator=object_slot_locator,
     )
     dynamics = _make_dynamics(
         latent_layout=latent_layout,

@@ -34,6 +34,7 @@ from .visual_latent_model import (
 from .visual_object_slot import (
     evaluate_object_slot_decoder,
     normalize_object_slot_targets,
+    normalized_affine_to_raw,
     train_object_slot_decoder,
 )
 from .visual_windows import build_visual_window_index
@@ -113,7 +114,7 @@ def _fit_source_probe(
     train_indices: np.ndarray,
     split_indices: dict[str, np.ndarray],
     ridge: float,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], np.ndarray]:
     if not math.isfinite(ridge) or ridge < 0.0:
         raise ValueError("source_probe_ridge must be finite and non-negative")
     latents = np.asarray(normalized_latents, dtype=np.float64)
@@ -153,7 +154,7 @@ def _fit_source_probe(
             split_design @ solution,
             slot_targets[indices],
         )
-    return metrics
+    return metrics, solution
 
 
 def run_visual_object_slot_training(
@@ -173,6 +174,7 @@ def run_visual_object_slot_training(
     centre_loss_weight: float = 1.0,
     heading_loss_weight: float = 0.1,
     source_probe_ridge: float = 1e-3,
+    locator: str = "spatial_attention",
 ) -> dict[str, Any]:
     """Train and publish one frozen-base object-slot candidate."""
 
@@ -187,7 +189,7 @@ def run_visual_object_slot_training(
         "mask_loss_weight",
         mask_loss_weight,
     )
-    centre_weight = _require_finite_weight(
+    centre_loss = _require_finite_weight(
         "centre_loss_weight",
         centre_loss_weight,
     )
@@ -199,6 +201,10 @@ def run_visual_object_slot_training(
         "source_probe_ridge",
         source_probe_ridge,
     )
+    if locator not in {"spatial_attention", "global_affine"}:
+        raise ValueError(
+            "locator must be 'spatial_attention' or 'global_affine'"
+        )
     data = Path(data_path)
     source_path = Path(source_checkpoint_path)
     dataset = load_visual_dataset(data)
@@ -242,18 +248,59 @@ def run_visual_object_slot_training(
         )
         for name in ("train", "validation", "test")
     }
-    source_probe = _fit_source_probe(
+    source_probe, probe_solution = _fit_source_probe(
         normalized_source_latents,
         slot_targets,
         train_indices=split_frame_indices["train"],
         split_indices=split_frame_indices,
         ridge=ridge,
     )
+    centre_locator_weight: np.ndarray | None = None
+    centre_locator_bias: np.ndarray | None = None
+    centre_probe_conversion: dict[str, float] | None = None
+    if locator == "global_affine":
+        centre_locator_weight, centre_locator_bias = (
+            normalized_affine_to_raw(
+                probe_solution[:-1, :2].T,
+                probe_solution[-1, :2],
+                np.asarray(source.latent_normalizer.mean),
+                np.asarray(source.latent_normalizer.std),
+            )
+        )
+        test_indices = split_frame_indices["test"]
+        normalized_predictions = (
+            normalized_source_latents[test_indices]
+            @ probe_solution[:-1, :2]
+            + probe_solution[-1, :2]
+        )
+        raw_predictions = (
+            source_latents[test_indices] @ centre_locator_weight.T
+            + centre_locator_bias
+        )
+        centre_probe_conversion = {
+            "max_prediction_delta": float(
+                np.max(
+                    np.abs(
+                        normalized_predictions.astype(np.float64)
+                        - raw_predictions.astype(np.float64)
+                    )
+                )
+            ),
+            "raw_weight_abs_max": float(
+                np.max(np.abs(centre_locator_weight))
+            ),
+            "raw_bias_abs_max": float(
+                np.max(np.abs(centre_locator_bias))
+            ),
+        }
 
     autoencoder_result = train_object_slot_decoder(
         source.autoencoder,
         dataset,
         split_episode_ids=source.split_episode_ids,
+        locator=locator,
+        centre_weight=centre_locator_weight,
+        centre_bias=centre_locator_bias,
         patch_size=patch_size,
         hidden_size=hidden_size,
         initial_alpha=initial_alpha,
@@ -262,13 +309,29 @@ def run_visual_object_slot_training(
         learning_rate=learning_rate,
         foreground_loss_weight=foreground_weight,
         mask_loss_weight=mask_weight,
-        centre_loss_weight=centre_weight,
+        centre_loss_weight=centre_loss,
         heading_loss_weight=heading_weight,
         seed=seed,
     )
     autoencoder = autoencoder_result.model
     if not isinstance(autoencoder, SpatialConvAutoencoder):
         raise RuntimeError("object-slot trainer returned an invalid model")
+    if autoencoder.object_slot_locator != locator:
+        raise RuntimeError("object-slot trainer changed locator mode")
+    if locator == "global_affine":
+        assert (
+            centre_locator_weight is not None
+            and centre_locator_bias is not None
+        )
+        assert autoencoder.object_center is not None
+        if not np.array_equal(
+            autoencoder.object_center.weight.detach().cpu().numpy(),
+            centre_locator_weight.astype(np.float32),
+        ) or not np.array_equal(
+            autoencoder.object_center.bias.detach().cpu().numpy(),
+            centre_locator_bias.astype(np.float32),
+        ):
+            raise RuntimeError("frozen affine centre locator changed")
     for module_name in ("encoder_convolutions", "decoder_convolutions"):
         if not _same_module_state(
             getattr(autoencoder, module_name),
@@ -348,11 +411,12 @@ def run_visual_object_slot_training(
             "autoencoder_object_slot_decoder": True,
             "object_slot_patch_size": patch_size,
             "object_slot_hidden_size": hidden_size,
+            "object_slot_locator": locator,
             "object_initial_alpha": initial_alpha,
             "object_full_frame_loss_weight": 1.0,
             "object_foreground_loss_weight": foreground_weight,
             "object_mask_loss_weight": mask_weight,
-            "object_centre_loss_weight": centre_weight,
+            "object_centre_loss_weight": centre_loss,
             "object_heading_loss_weight": heading_weight,
             "object_slot_source_probe_ridge": ridge,
             "object_slot_target": "image_normalized_cx_cy_sin_cos",
@@ -400,17 +464,27 @@ def run_visual_object_slot_training(
             ) from cleanup_error
         raise
 
+    centre_limit = source_probe["test"]["mean_centre_error_pixels"]
+    centre_operator = "<"
+    centre_name = "held_out_centre_error_improvement"
+    if locator == "global_affine":
+        centre_limit *= 1.05
+        centre_operator = "<="
+        centre_name = "held_out_centre_error_stability"
+    centre_candidate = slot_metrics["mean_centre_error_pixels"]
+    centre_passed = (
+        centre_candidate <= centre_limit
+        if centre_operator == "<="
+        else centre_candidate < centre_limit
+    )
     state_gates = [
         {
-            "name": "held_out_centre_error_improvement",
+            "name": centre_name,
             "metric": "mean_centre_error_pixels",
-            "operator": "<",
-            "limit": source_probe["test"]["mean_centre_error_pixels"],
-            "candidate": slot_metrics["mean_centre_error_pixels"],
-            "passed": (
-                slot_metrics["mean_centre_error_pixels"]
-                < source_probe["test"]["mean_centre_error_pixels"]
-            ),
+            "operator": centre_operator,
+            "limit": centre_limit,
+            "candidate": centre_candidate,
+            "passed": centre_passed,
         },
         {
             "name": "held_out_heading_error_improvement",
@@ -424,23 +498,28 @@ def run_visual_object_slot_training(
             ),
         },
     ]
+    autoencoder_summary: dict[str, Any] = {
+        "initial_train_loss": autoencoder_result.train_losses[0],
+        "final_train_loss": autoencoder_result.train_losses[-1],
+        "best_epoch": autoencoder_result.best_epoch,
+        "best_validation_loss": min(
+            autoencoder_result.validation_losses
+        ),
+        "test": reconstruction_metrics,
+        "source_probe": source_probe,
+        "slot": slot_metrics,
+    }
+    if centre_probe_conversion is not None:
+        autoencoder_summary["centre_probe_conversion"] = (
+            centre_probe_conversion
+        )
     return {
         "dataset": dataset_metadata,
         "source_checkpoint": {
             "path": str(source_path.resolve()),
             "sha256": source_sha256,
         },
-        "autoencoder": {
-            "initial_train_loss": autoencoder_result.train_losses[0],
-            "final_train_loss": autoencoder_result.train_losses[-1],
-            "best_epoch": autoencoder_result.best_epoch,
-            "best_validation_loss": min(
-                autoencoder_result.validation_losses
-            ),
-            "test": reconstruction_metrics,
-            "source_probe": source_probe,
-            "slot": slot_metrics,
-        },
+        "autoencoder": autoencoder_summary,
         "decision": {
             "state_gates": state_gates,
             "state_gates_passed": all(
@@ -479,6 +558,11 @@ def main() -> None:
             "artifacts/visual_latent_spatial8_object_slot_predictions.png"
         ),
     )
+    parser.add_argument(
+        "--locator",
+        choices=("spatial_attention", "global_affine"),
+        default="spatial_attention",
+    )
     parser.add_argument("--patch-size", type=int, default=11)
     parser.add_argument("--hidden-size", type=int, default=64)
     parser.add_argument("--initial-alpha", type=float, default=0.01)
@@ -512,6 +596,7 @@ def main() -> None:
             centre_loss_weight=arguments.centre_loss_weight,
             heading_loss_weight=arguments.heading_loss_weight,
             source_probe_ridge=arguments.source_probe_ridge,
+            locator=arguments.locator,
         )
     except (FileNotFoundError, FileExistsError, ValueError) as error:
         parser.error(str(error))

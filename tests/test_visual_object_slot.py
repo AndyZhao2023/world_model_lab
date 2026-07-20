@@ -13,6 +13,7 @@ from world_model_lab.visual_object_slot import (
     evaluate_object_slot_decoder,
     initialize_object_slot_autoencoder,
     normalize_object_slot_targets,
+    normalized_affine_to_raw,
     object_slot_objective,
     train_object_slot_decoder,
 )
@@ -94,8 +95,105 @@ class ObjectSlotGeometryTest(unittest.TestCase):
                 object_slot_hidden_size=8,
             )
 
+    def test_global_affine_locator_has_frozen_centre_and_trainable_heading(
+        self,
+    ):
+        model = SpatialConvAutoencoder(
+            latent_channels=2,
+            base_channels=2,
+            object_slot_decoder=True,
+            object_slot_patch_size=11,
+            object_slot_hidden_size=8,
+            object_slot_locator="global_affine",
+        )
+        latents = torch.randn((3, 2, 8, 8), dtype=torch.float32)
+
+        components = model.decode_object_slot_components(latents)
+
+        self.assertEqual(model.object_slot_locator, "global_affine")
+        self.assertIsInstance(model.object_center, torch.nn.Linear)
+        self.assertEqual(model.object_center.in_features, model.latent_dim)
+        self.assertTrue(
+            all(
+                not parameter.requires_grad
+                for parameter in model.object_center.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                parameter.requires_grad
+                for parameter in model.object_heading.parameters()
+            )
+        )
+        self.assertEqual(tuple(components.slot.shape), (3, 4))
+        self.assertTrue(bool(torch.all(torch.isfinite(components.slot))))
+        self.assertTrue(
+            bool(torch.all(components.alpha[~components.support] == 0.0))
+        )
+
+    def test_locator_mode_is_strictly_validated(self):
+        with self.assertRaisesRegex(ValueError, "object_slot_locator"):
+            SpatialConvAutoencoder(
+                latent_channels=2,
+                base_channels=2,
+                object_slot_locator="global_affine",
+            )
+        with self.assertRaisesRegex(ValueError, "object_slot_locator"):
+            SpatialConvAutoencoder(
+                latent_channels=2,
+                base_channels=2,
+                object_slot_decoder=True,
+                object_slot_patch_size=11,
+                object_slot_hidden_size=8,
+                object_slot_locator="transformer",
+            )
+
 
 class ObjectSlotTrainingTest(unittest.TestCase):
+    def test_normalized_affine_converts_exactly_to_raw_latent_space(self):
+        normalized_weight = np.asarray(
+            [[1.0, -2.0, 0.5], [-1.0, 3.0, 2.0]],
+            dtype=np.float64,
+        )
+        normalized_bias = np.asarray([0.25, -0.5], dtype=np.float64)
+        mean = np.asarray([2.0, -1.0, 4.0], dtype=np.float64)
+        std = np.asarray([0.5, 2.0, 4.0], dtype=np.float64)
+        raw_latents = np.asarray(
+            [[1.0, 2.0, 3.0], [-2.0, 0.0, 5.0]],
+            dtype=np.float64,
+        )
+
+        raw_weight, raw_bias = normalized_affine_to_raw(
+            normalized_weight,
+            normalized_bias,
+            mean,
+            std,
+        )
+
+        normalized_latents = (raw_latents - mean) / std
+        expected = (
+            normalized_latents @ normalized_weight.T + normalized_bias
+        )
+        actual = raw_latents @ raw_weight.T + raw_bias
+        np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-12)
+
+    def test_normalized_affine_rejects_invalid_shapes_and_scales(self):
+        weight = np.ones((2, 3), dtype=np.float64)
+        bias = np.zeros(2, dtype=np.float64)
+        mean = np.zeros(3, dtype=np.float64)
+        std = np.ones(3, dtype=np.float64)
+        invalid = (
+            (weight[:, :2], bias, mean, std),
+            (weight, bias[:1], mean, std),
+            (weight, bias, mean[:2], std),
+            (weight, bias, mean, np.asarray([1.0, 0.0, 1.0])),
+            (weight, bias, mean, np.asarray([1.0, np.nan, 1.0])),
+        )
+        for values in invalid:
+            with self.subTest(shapes=[value.shape for value in values]):
+                with self.assertRaises(ValueError):
+                    normalized_affine_to_raw(*values)
+
     def test_objective_matches_all_five_declared_terms(self):
         model = SpatialConvAutoencoder(
             latent_channels=2,
@@ -203,6 +301,73 @@ class ObjectSlotTrainingTest(unittest.TestCase):
                 rtol=0.0,
                 atol=0.0,
             )
+
+    def test_global_affine_candidate_copies_and_freezes_centre_only(self):
+        source = SpatialConvAutoencoder(
+            latent_channels=2,
+            base_channels=2,
+        )
+        centre_weight = np.linspace(
+            -0.5,
+            0.5,
+            2 * source.latent_dim,
+            dtype=np.float32,
+        ).reshape(2, source.latent_dim)
+        centre_bias = np.asarray([0.2, -0.3], dtype=np.float32)
+        candidate = initialize_object_slot_autoencoder(
+            source,
+            locator="global_affine",
+            centre_weight=centre_weight,
+            centre_bias=centre_bias,
+            patch_size=11,
+            hidden_size=8,
+            initial_alpha=0.01,
+            seed=7,
+        )
+        images = torch.zeros((2, 3, 64, 64), dtype=torch.float32)
+        images[:, :, 31, 31] = 1.0
+        masks = torch.zeros((2, 1, 64, 64), dtype=torch.float32)
+        masks[:, :, 31, 31] = 1.0
+        targets = torch.tensor(
+            [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]],
+            dtype=torch.float32,
+        )
+
+        loss, _ = object_slot_objective(
+            candidate,
+            images,
+            masks,
+            targets,
+            foreground_loss_weight=1.0,
+            mask_loss_weight=0.01,
+            centre_loss_weight=1.0,
+            heading_loss_weight=0.1,
+        )
+        loss.backward()
+
+        np.testing.assert_array_equal(
+            candidate.object_center.weight.detach().numpy(),
+            centre_weight,
+        )
+        np.testing.assert_array_equal(
+            candidate.object_center.bias.detach().numpy(),
+            centre_bias,
+        )
+        self.assertTrue(
+            all(
+                not parameter.requires_grad and parameter.grad is None
+                for parameter in candidate.object_center.parameters()
+            )
+        )
+        heading_parameters = list(candidate.object_heading.parameters())
+        patch_parameters = list(candidate.object_patch_decoder.parameters())
+        self.assertTrue(
+            any(
+                parameter.grad is not None
+                and bool(torch.any(parameter.grad != 0))
+                for parameter in heading_parameters + patch_parameters
+            )
+        )
 
     def test_training_is_deterministic_and_reports_state_and_alpha_metrics(
         self,

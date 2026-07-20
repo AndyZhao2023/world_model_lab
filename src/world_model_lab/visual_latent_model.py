@@ -142,6 +142,7 @@ class SpatialConvAutoencoder(nn.Module):
         object_slot_decoder: bool = False,
         object_slot_patch_size: int | None = None,
         object_slot_hidden_size: int | None = None,
+        object_slot_locator: str | None = None,
     ) -> None:
         super().__init__()
         if latent_channels <= 0 or base_channels <= 0:
@@ -181,6 +182,19 @@ class SpatialConvAutoencoder(nn.Module):
                 )
             selected_head_channels = 0
         if object_slot_decoder:
+            selected_slot_locator = (
+                "spatial_attention"
+                if object_slot_locator is None
+                else str(object_slot_locator)
+            )
+            if selected_slot_locator not in {
+                "spatial_attention",
+                "global_affine",
+            }:
+                raise ValueError(
+                    "object_slot_locator must be 'spatial_attention' or "
+                    "'global_affine'"
+                )
             selected_patch_size = (
                 11
                 if object_slot_patch_size is None
@@ -211,6 +225,10 @@ class SpatialConvAutoencoder(nn.Module):
                     "object_slot_hidden_size must be a positive integer"
                 )
         else:
+            if object_slot_locator is not None:
+                raise ValueError(
+                    "object_slot_locator requires object slot decoding"
+                )
             if object_slot_patch_size is not None:
                 raise ValueError(
                     "object_slot_patch_size requires object slot decoding"
@@ -221,6 +239,7 @@ class SpatialConvAutoencoder(nn.Module):
                 )
             selected_patch_size = 0
             selected_hidden_size = 0
+            selected_slot_locator = ""
         self.latent_channels = int(latent_channels)
         self.base_channels = int(base_channels)
         self.object_residual_decoder = object_residual_decoder
@@ -228,6 +247,7 @@ class SpatialConvAutoencoder(nn.Module):
         self.object_slot_decoder = object_slot_decoder
         self.object_slot_patch_size = int(selected_patch_size)
         self.object_slot_hidden_size = int(selected_hidden_size)
+        self.object_slot_locator = selected_slot_locator
         self.latent_dim = (
             self.latent_channels * self.latent_size * self.latent_size
         )
@@ -309,15 +329,30 @@ class SpatialConvAutoencoder(nn.Module):
         else:
             self.object_decoder_convolutions = None
         if self.object_slot_decoder:
-            self.object_attention: nn.Conv2d | None = nn.Conv2d(
-                self.latent_channels,
-                1,
-                1,
-            )
-            self.object_heading: nn.Linear | None = nn.Linear(
-                self.latent_channels,
-                2,
-            )
+            if self.object_slot_locator == "spatial_attention":
+                self.object_attention: nn.Conv2d | None = nn.Conv2d(
+                    self.latent_channels,
+                    1,
+                    1,
+                )
+                self.object_center: nn.Linear | None = None
+                self.object_heading: nn.Module | None = nn.Linear(
+                    self.latent_channels,
+                    2,
+                )
+            else:
+                self.object_attention = None
+                self.object_center = nn.Linear(self.latent_dim, 2)
+                for parameter in self.object_center.parameters():
+                    parameter.requires_grad_(False)
+                self.object_heading = nn.Sequential(
+                    nn.Linear(
+                        self.latent_dim,
+                        self.object_slot_hidden_size,
+                    ),
+                    nn.ReLU(),
+                    nn.Linear(self.object_slot_hidden_size, 2),
+                )
             self.object_patch_decoder: nn.Sequential | None = nn.Sequential(
                 nn.Linear(4, self.object_slot_hidden_size),
                 nn.ReLU(),
@@ -338,6 +373,7 @@ class SpatialConvAutoencoder(nn.Module):
                 )
         else:
             self.object_attention = None
+            self.object_center = None
             self.object_heading = None
             self.object_patch_decoder = None
 
@@ -398,8 +434,22 @@ class SpatialConvAutoencoder(nn.Module):
         self,
         latent_grid: torch.Tensor,
     ) -> torch.Tensor:
-        if self.object_attention is None or self.object_heading is None:
+        if self.object_heading is None:
             raise ValueError("object slot decoder is not enabled")
+        if self.object_slot_locator == "global_affine":
+            if self.object_center is None:
+                raise RuntimeError("global affine centre head is missing")
+            flattened = latent_grid.flatten(start_dim=1)
+            centre = self.object_center(flattened)
+            heading = functional.normalize(
+                self.object_heading(flattened),
+                p=2.0,
+                dim=1,
+                eps=1e-8,
+            )
+            return torch.cat((centre, heading), dim=1)
+        if self.object_attention is None:
+            raise RuntimeError("spatial attention head is missing")
         logits = self.object_attention(latent_grid)
         attention = torch.softmax(logits.flatten(start_dim=1), dim=1).reshape(
             latent_grid.shape[0],

@@ -135,6 +135,63 @@ class VisualObjectSlotRunnerTest(unittest.TestCase):
                     )
                 train.assert_not_called()
 
+    def test_global_affine_runner_freezes_probe_and_uses_stability_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_path, source_path = write_object_slot_fixture(root)
+            output_path = root / "candidate-affine.pt"
+            preview_path = root / "candidate-affine.png"
+
+            summary = run_visual_object_slot_training(
+                data_path=data_path,
+                source_checkpoint_path=source_path,
+                output_path=output_path,
+                preview_path=preview_path,
+                locator="global_affine",
+                patch_size=11,
+                hidden_size=8,
+                initial_alpha=0.01,
+                epochs=1,
+                batch_size=8,
+                learning_rate=1e-3,
+                foreground_loss_weight=1.0,
+                mask_loss_weight=0.01,
+                centre_loss_weight=1.0,
+                heading_loss_weight=0.1,
+                source_probe_ridge=1e-3,
+            )
+            candidate = load_visual_latent_checkpoint(output_path)
+
+        self.assertEqual(
+            candidate.autoencoder.object_slot_locator,
+            "global_affine",
+        )
+        self.assertEqual(
+            candidate.training_config["object_slot_locator"],
+            "global_affine",
+        )
+        self.assertTrue(
+            all(
+                not parameter.requires_grad
+                for parameter in candidate.autoencoder.object_center.parameters()
+            )
+        )
+        centre_gate, heading_gate = summary["decision"]["state_gates"]
+        self.assertEqual(
+            centre_gate["name"],
+            "held_out_centre_error_stability",
+        )
+        self.assertEqual(centre_gate["operator"], "<=")
+        self.assertAlmostEqual(
+            centre_gate["limit"],
+            1.05
+            * summary["autoencoder"]["source_probe"]["test"][
+                "mean_centre_error_pixels"
+            ],
+        )
+        self.assertEqual(heading_gate["operator"], "<")
+        self.assertIn("centre_probe_conversion", summary["autoencoder"])
+
     def test_cli_help_and_pyproject_register_command(self):
         output = io.StringIO()
         with patch.object(
@@ -152,6 +209,7 @@ class VisualObjectSlotRunnerTest(unittest.TestCase):
             "--source-checkpoint",
             "--output",
             "--preview",
+            "--locator",
             "--patch-size",
             "--hidden-size",
             "--initial-alpha",
