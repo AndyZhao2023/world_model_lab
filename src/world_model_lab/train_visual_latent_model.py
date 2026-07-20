@@ -133,12 +133,21 @@ def _make_autoencoder(
     base_channels: int,
     object_residual_decoder: bool = False,
     object_head_channels: int = 0,
+    object_slot_decoder: bool = False,
+    object_slot_patch_size: int = 0,
+    object_slot_hidden_size: int = 0,
 ) -> VisualAutoencoder:
     layout = _validate_latent_layout(latent_layout)
     if layout == "global":
-        if object_residual_decoder or object_head_channels != 0:
+        if (
+            object_residual_decoder
+            or object_head_channels != 0
+            or object_slot_decoder
+            or object_slot_patch_size != 0
+            or object_slot_hidden_size != 0
+        ):
             raise ValueError(
-                "object residual decoding requires a spatial latent layout"
+                "object decoding requires a spatial latent layout"
             )
         return ConvAutoencoder(
             latent_dim=latent_dim,
@@ -150,6 +159,13 @@ def _make_autoencoder(
         object_residual_decoder=object_residual_decoder,
         object_head_channels=(
             object_head_channels if object_residual_decoder else None
+        ),
+        object_slot_decoder=object_slot_decoder,
+        object_slot_patch_size=(
+            object_slot_patch_size if object_slot_decoder else None
+        ),
+        object_slot_hidden_size=(
+            object_slot_hidden_size if object_slot_decoder else None
         ),
     )
 
@@ -1389,6 +1405,15 @@ def save_visual_latent_checkpoint(
     object_head_channels = (
         autoencoder.object_head_channels if is_spatial else 0
     )
+    object_slot_decoder = (
+        autoencoder.object_slot_decoder if is_spatial else False
+    )
+    object_slot_patch_size = (
+        autoencoder.object_slot_patch_size if is_spatial else 0
+    )
+    object_slot_hidden_size = (
+        autoencoder.object_slot_hidden_size if is_spatial else 0
+    )
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -1405,6 +1430,9 @@ def save_visual_latent_checkpoint(
             "base_channels": autoencoder.base_channels,
             "object_residual_decoder": object_residual_decoder,
             "object_head_channels": object_head_channels,
+            "object_slot_decoder": object_slot_decoder,
+            "object_slot_patch_size": object_slot_patch_size,
+            "object_slot_hidden_size": object_slot_hidden_size,
             "dynamics_hidden_size": dynamics.hidden_size,
             "context_frames": dynamics.context_frames,
         },
@@ -1573,6 +1601,44 @@ def _load_visual_latent_payload(
             "object_head_channels must be zero when residual decoding "
             "is disabled"
         )
+    object_slot_decoder = model_config.get(
+        "object_slot_decoder",
+        False,
+    )
+    if not isinstance(object_slot_decoder, bool):
+        raise ValueError("object_slot_decoder must be boolean")
+    slot_integer_values: dict[str, int] = {}
+    for name in ("object_slot_patch_size", "object_slot_hidden_size"):
+        raw_value = model_config.get(name, 0)
+        if isinstance(raw_value, bool):
+            raise ValueError(f"{name} must be an integer")
+        try:
+            integer_value = int(raw_value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"{name} must be an integer") from None
+        if integer_value != raw_value:
+            raise ValueError(f"{name} must be an integer")
+        slot_integer_values[name] = integer_value
+    object_slot_patch_size = slot_integer_values["object_slot_patch_size"]
+    object_slot_hidden_size = slot_integer_values["object_slot_hidden_size"]
+    if object_slot_decoder:
+        if (
+            latent_layout != "spatial"
+            or object_slot_patch_size <= 0
+            or object_slot_hidden_size <= 0
+        ):
+            raise ValueError(
+                "object slot decoding requires positive spatial patch and "
+                "hidden sizes"
+            )
+    elif object_slot_patch_size != 0 or object_slot_hidden_size != 0:
+        raise ValueError(
+            "object slot sizes must be zero when slot decoding is disabled"
+        )
+    if object_residual_decoder and object_slot_decoder:
+        raise ValueError(
+            "object residual and object slot decoding are mutually exclusive"
+        )
     hidden_size = int(model_config.get("dynamics_hidden_size", 0))
     context_frames = int(model_config.get("context_frames", 0))
     spatial_dynamics_architecture = (
@@ -1594,6 +1660,9 @@ def _load_visual_latent_payload(
         base_channels=base_channels,
         object_residual_decoder=object_residual_decoder,
         object_head_channels=object_head_channels,
+        object_slot_decoder=object_slot_decoder,
+        object_slot_patch_size=object_slot_patch_size,
+        object_slot_hidden_size=object_slot_hidden_size,
     )
     dynamics = _make_dynamics(
         latent_layout=latent_layout,

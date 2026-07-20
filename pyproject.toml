@@ -33,6 +33,7 @@ world-model-train-visual-dynamics-objective = "world_model_lab.train_visual_dyna
 world-model-train-visual-dynamics-recursive = "world_model_lab.train_visual_dynamics_recursive:main"
 world-model-train-visual-latent = "world_model_lab.train_visual_latent_model:main"
 world-model-train-visual-object-residual = "world_model_lab.train_visual_object_residual:main"
+world-model-train-visual-object-slot = "world_model_lab.train_visual_object_slot:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

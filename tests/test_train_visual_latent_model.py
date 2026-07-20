@@ -956,6 +956,9 @@ class VisualLatentCheckpointTest(unittest.TestCase):
             legacy_model_config.pop("spatial_dynamics_architecture")
             legacy_model_config.pop("object_residual_decoder", None)
             legacy_model_config.pop("object_head_channels", None)
+            legacy_model_config.pop("object_slot_decoder", None)
+            legacy_model_config.pop("object_slot_patch_size", None)
+            legacy_model_config.pop("object_slot_hidden_size", None)
             legacy_payload["model_config"] = legacy_model_config
             legacy_path = Path(directory) / "legacy-spatial.pt"
             torch.save(legacy_payload, legacy_path)
@@ -977,6 +980,7 @@ class VisualLatentCheckpointTest(unittest.TestCase):
         )
         self.assertEqual(payload["model_config"]["object_head_channels"], 0)
         self.assertFalse(legacy_loaded.autoencoder.object_residual_decoder)
+        self.assertFalse(legacy_loaded.autoencoder.object_slot_decoder)
         self.assertEqual(loaded.autoencoder.latent_channels, 2)
         context = torch.zeros((2, 4, autoencoder.latent_dim))
         history = torch.zeros((2, 3, 2))
@@ -1044,6 +1048,78 @@ class VisualLatentCheckpointTest(unittest.TestCase):
         self.assertEqual(loaded.autoencoder.object_head_channels, 3)
         self.assertTrue(payload["model_config"]["object_residual_decoder"])
         self.assertEqual(payload["model_config"]["object_head_channels"], 3)
+        images = torch.randn((2, 3, 64, 64))
+        with torch.no_grad():
+            expected = autoencoder(images)
+            actual = loaded.autoencoder(images)
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+        for name, expected_tensor in autoencoder.state_dict().items():
+            torch.testing.assert_close(
+                loaded.autoencoder.state_dict()[name],
+                expected_tensor,
+                rtol=0.0,
+                atol=0.0,
+            )
+
+    def test_object_slot_checkpoint_round_trip_preserves_predictions(self):
+        autoencoder = SpatialConvAutoencoder(
+            latent_channels=2,
+            base_channels=2,
+            object_slot_decoder=True,
+            object_slot_patch_size=11,
+            object_slot_hidden_size=8,
+        )
+        dynamics = SpatialLatentDynamicsCNN(
+            latent_channels=2,
+            hidden_channels=4,
+        )
+        autoencoder_result = PhaseTrainingResult(
+            model=autoencoder,
+            train_losses=[0.4],
+            validation_losses=[0.5],
+            best_epoch=1,
+        )
+        dynamics_result = PhaseTrainingResult(
+            model=dynamics,
+            train_losses=[0.3],
+            validation_losses=[0.35],
+            best_epoch=1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "object-slot.pt"
+            save_visual_latent_checkpoint(
+                path,
+                autoencoder_result=autoencoder_result,
+                dynamics_result=dynamics_result,
+                latent_normalizer=Normalizer(
+                    np.zeros(autoencoder.latent_dim),
+                    np.ones(autoencoder.latent_dim),
+                ),
+                action_normalizer=Normalizer(np.zeros(2), np.ones(2)),
+                split_episode_ids={
+                    "train": np.arange(8, dtype=np.int64),
+                    "validation": np.asarray([8], dtype=np.int64),
+                    "test": np.asarray([9], dtype=np.int64),
+                },
+                training_config={"latent_layout": "spatial"},
+                dataset_metadata={
+                    "path": "/tmp/visual.npz",
+                    "sha256": "a" * 64,
+                    "schema_version": 1,
+                    "renderer_version": "pillow-raster-v1",
+                },
+                autoencoder_test_metrics={"frames": 1},
+                dynamics_test_metrics={"windows": 1},
+            )
+            loaded = load_visual_latent_checkpoint(path)
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+
+        self.assertTrue(loaded.autoencoder.object_slot_decoder)
+        self.assertEqual(loaded.autoencoder.object_slot_patch_size, 11)
+        self.assertEqual(loaded.autoencoder.object_slot_hidden_size, 8)
+        self.assertTrue(payload["model_config"]["object_slot_decoder"])
+        self.assertEqual(payload["model_config"]["object_slot_patch_size"], 11)
+        self.assertEqual(payload["model_config"]["object_slot_hidden_size"], 8)
         images = torch.randn((2, 3, 64, 64))
         with torch.no_grad():
             expected = autoencoder(images)

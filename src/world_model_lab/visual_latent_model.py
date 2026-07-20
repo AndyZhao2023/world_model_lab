@@ -2,10 +2,24 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 
 import torch
 from torch import nn
+from torch.nn import functional
+
+
+@dataclass(frozen=True)
+class ObjectSlotDecodeComponents:
+    """Structured object state and its support-constrained composition."""
+
+    base: torch.Tensor
+    slot: torch.Tensor
+    foreground: torch.Tensor
+    alpha: torch.Tensor
+    support: torch.Tensor
+    composite: torch.Tensor
 
 
 class ConvAutoencoder(nn.Module):
@@ -125,6 +139,9 @@ class SpatialConvAutoencoder(nn.Module):
         object_residual_decoder: bool = False,
         object_head_channels: int | None = None,
         object_initial_alpha: float = 0.01,
+        object_slot_decoder: bool = False,
+        object_slot_patch_size: int | None = None,
+        object_slot_hidden_size: int | None = None,
     ) -> None:
         super().__init__()
         if latent_channels <= 0 or base_channels <= 0:
@@ -133,6 +150,12 @@ class SpatialConvAutoencoder(nn.Module):
             )
         if not isinstance(object_residual_decoder, bool):
             raise ValueError("object_residual_decoder must be boolean")
+        if not isinstance(object_slot_decoder, bool):
+            raise ValueError("object_slot_decoder must be boolean")
+        if object_residual_decoder and object_slot_decoder:
+            raise ValueError(
+                "object residual and object slot decoding are mutually exclusive"
+            )
         if (
             not math.isfinite(object_initial_alpha)
             or object_initial_alpha <= 0.0
@@ -157,10 +180,54 @@ class SpatialConvAutoencoder(nn.Module):
                     "object_head_channels requires object residual decoding"
                 )
             selected_head_channels = 0
+        if object_slot_decoder:
+            selected_patch_size = (
+                11
+                if object_slot_patch_size is None
+                else object_slot_patch_size
+            )
+            selected_hidden_size = (
+                64
+                if object_slot_hidden_size is None
+                else object_slot_hidden_size
+            )
+            if (
+                isinstance(selected_patch_size, bool)
+                or not isinstance(selected_patch_size, int)
+                or selected_patch_size <= 0
+                or selected_patch_size > self.image_size
+                or selected_patch_size % 2 == 0
+            ):
+                raise ValueError(
+                    "object_slot_patch_size must be a positive odd image-sized "
+                    "integer"
+                )
+            if (
+                isinstance(selected_hidden_size, bool)
+                or not isinstance(selected_hidden_size, int)
+                or selected_hidden_size <= 0
+            ):
+                raise ValueError(
+                    "object_slot_hidden_size must be a positive integer"
+                )
+        else:
+            if object_slot_patch_size is not None:
+                raise ValueError(
+                    "object_slot_patch_size requires object slot decoding"
+                )
+            if object_slot_hidden_size is not None:
+                raise ValueError(
+                    "object_slot_hidden_size requires object slot decoding"
+                )
+            selected_patch_size = 0
+            selected_hidden_size = 0
         self.latent_channels = int(latent_channels)
         self.base_channels = int(base_channels)
         self.object_residual_decoder = object_residual_decoder
         self.object_head_channels = int(selected_head_channels)
+        self.object_slot_decoder = object_slot_decoder
+        self.object_slot_patch_size = int(selected_patch_size)
+        self.object_slot_hidden_size = int(selected_hidden_size)
         self.latent_dim = (
             self.latent_channels * self.latent_size * self.latent_size
         )
@@ -241,6 +308,38 @@ class SpatialConvAutoencoder(nn.Module):
                 )
         else:
             self.object_decoder_convolutions = None
+        if self.object_slot_decoder:
+            self.object_attention: nn.Conv2d | None = nn.Conv2d(
+                self.latent_channels,
+                1,
+                1,
+            )
+            self.object_heading: nn.Linear | None = nn.Linear(
+                self.latent_channels,
+                2,
+            )
+            self.object_patch_decoder: nn.Sequential | None = nn.Sequential(
+                nn.Linear(4, self.object_slot_hidden_size),
+                nn.ReLU(),
+                nn.Linear(
+                    self.object_slot_hidden_size,
+                    4
+                    * self.object_slot_patch_size
+                    * self.object_slot_patch_size,
+                ),
+            )
+            final_linear = self.object_patch_decoder[-1]
+            assert isinstance(final_linear, nn.Linear)
+            alpha_start = 3 * self.object_slot_patch_size**2
+            with torch.no_grad():
+                final_linear.weight[alpha_start:].zero_()
+                final_linear.bias[alpha_start:] = math.log(
+                    object_initial_alpha / (1.0 - object_initial_alpha)
+                )
+        else:
+            self.object_attention = None
+            self.object_heading = None
+            self.object_patch_decoder = None
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         if images.ndim != 4 or tuple(images.shape[1:]) != (3, 64, 64):
@@ -295,14 +394,159 @@ class SpatialConvAutoencoder(nn.Module):
         composite = base * (1.0 - alpha) + foreground * alpha
         return base, foreground, mask_logits, composite
 
+    def _predict_object_slot(
+        self,
+        latent_grid: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.object_attention is None or self.object_heading is None:
+            raise ValueError("object slot decoder is not enabled")
+        logits = self.object_attention(latent_grid)
+        attention = torch.softmax(logits.flatten(start_dim=1), dim=1).reshape(
+            latent_grid.shape[0],
+            1,
+            self.latent_size,
+            self.latent_size,
+        )
+        coordinates = torch.linspace(
+            -1.0,
+            1.0,
+            self.latent_size,
+            dtype=latent_grid.dtype,
+            device=latent_grid.device,
+        )
+        centre_x = torch.sum(
+            attention * coordinates.reshape(1, 1, 1, -1),
+            dim=(2, 3),
+        )
+        centre_y = torch.sum(
+            attention * coordinates.reshape(1, 1, -1, 1),
+            dim=(2, 3),
+        )
+        object_feature = torch.sum(
+            latent_grid * attention,
+            dim=(2, 3),
+        )
+        heading = functional.normalize(
+            self.object_heading(object_feature),
+            p=2.0,
+            dim=1,
+            eps=1e-8,
+        )
+        return torch.cat((centre_x, centre_y, heading), dim=1)
+
+    def _place_object_patch(
+        self,
+        local_foreground: torch.Tensor,
+        local_alpha: torch.Tensor,
+        centre: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        output_coordinates = torch.linspace(
+            -1.0,
+            1.0,
+            self.image_size,
+            dtype=local_foreground.dtype,
+            device=local_foreground.device,
+        )
+        output_y, output_x = torch.meshgrid(
+            output_coordinates,
+            output_coordinates,
+            indexing="ij",
+        )
+        patch_scale = (self.image_size - 1) / (
+            self.object_slot_patch_size - 1
+        )
+        sample_x = (
+            output_x.reshape(1, self.image_size, self.image_size)
+            - centre[:, 0, None, None]
+        ) * patch_scale
+        sample_y = (
+            output_y.reshape(1, self.image_size, self.image_size)
+            - centre[:, 1, None, None]
+        ) * patch_scale
+        sample_grid = torch.stack((sample_x, sample_y), dim=-1)
+        foreground = functional.grid_sample(
+            local_foreground,
+            sample_grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        alpha = functional.grid_sample(
+            local_alpha,
+            sample_grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        pixel_coordinates = torch.arange(
+            self.image_size,
+            dtype=local_foreground.dtype,
+            device=local_foreground.device,
+        )
+        centre_pixels = torch.round(
+            (centre + 1.0) * ((self.image_size - 1) / 2.0)
+        )
+        radius = self.object_slot_patch_size // 2
+        support_x = (
+            torch.abs(
+                pixel_coordinates.reshape(1, 1, -1)
+                - centre_pixels[:, 0, None, None]
+            )
+            <= radius
+        )
+        support_y = (
+            torch.abs(
+                pixel_coordinates.reshape(1, -1, 1)
+                - centre_pixels[:, 1, None, None]
+            )
+            <= radius
+        )
+        support = (support_x & support_y).unsqueeze(1)
+        foreground = foreground * support
+        alpha = alpha * support
+        return foreground, alpha, support
+
+    def decode_object_slot_components(
+        self,
+        latents: torch.Tensor,
+    ) -> ObjectSlotDecodeComponents:
+        """Decode an object slot through an exactly local image write."""
+
+        if self.object_patch_decoder is None:
+            raise ValueError("object slot decoder is not enabled")
+        latent_grid = self._latent_grid(latents)
+        base = self.decoder_convolutions(latent_grid)
+        slot = self._predict_object_slot(latent_grid)
+        patch_output = self.object_patch_decoder(slot).reshape(
+            latent_grid.shape[0],
+            4,
+            self.object_slot_patch_size,
+            self.object_slot_patch_size,
+        )
+        local_foreground = torch.sigmoid(patch_output[:, :3])
+        local_alpha = torch.sigmoid(patch_output[:, 3:4])
+        foreground, alpha, support = self._place_object_patch(
+            local_foreground,
+            local_alpha,
+            slot[:, :2],
+        )
+        composite = base * (1.0 - alpha) + foreground * alpha
+        return ObjectSlotDecodeComponents(
+            base=base,
+            slot=slot,
+            foreground=foreground,
+            alpha=alpha,
+            support=support,
+            composite=composite,
+        )
+
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
         latent_grid = self._latent_grid(latents)
-        if (
-            not self.object_residual_decoder
-            or self.object_decoder_convolutions is None
-        ):
-            return self.decoder_convolutions(latent_grid)
-        return self.decode_components(latent_grid)[-1]
+        if self.object_residual_decoder:
+            return self.decode_components(latent_grid)[-1]
+        if self.object_slot_decoder:
+            return self.decode_object_slot_components(latent_grid).composite
+        return self.decoder_convolutions(latent_grid)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         return self.decode(self.encode(images))
