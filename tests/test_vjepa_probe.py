@@ -10,7 +10,10 @@ from tests.test_visual_windows import make_visual_dataset
 from world_model_lab.vjepa_probe import (
     FrozenVJEPAEncoder,
     build_probe_clip_batch,
+    fit_linear_state_probe,
+    mean_target_predictions,
     pool_vjepa_tokens,
+    representation_probe_gates,
     select_evenly_spaced_positions,
     state_probe_metrics,
     state_to_probe_targets,
@@ -343,6 +346,127 @@ class FrozenVJEPAEncoderTest(unittest.TestCase):
             with self.subTest(shape=clips.shape, dtype=clips.dtype):
                 with self.assertRaises(ValueError):
                     encoder.encode(clips)
+
+
+class LinearStateProbeTest(unittest.TestCase):
+    def test_primal_ridge_recovers_an_affine_state_mapping(self):
+        features = np.asarray(
+            [
+                [-2.0, 1.0],
+                [-1.0, -1.0],
+                [0.0, 2.0],
+                [1.0, -2.0],
+                [2.0, 0.5],
+                [3.0, 1.5],
+            ],
+            dtype=np.float32,
+        )
+        weights = np.asarray(
+            [
+                [1.0, 0.0, 0.5, -0.25, 2.0],
+                [0.0, 2.0, -1.0, 0.75, 0.5],
+            ],
+            dtype=np.float64,
+        )
+        bias = np.asarray([0.5, -1.0, 0.2, 0.4, 1.0])
+        targets = features @ weights + bias
+
+        probe = fit_linear_state_probe(features, targets, ridge=0.0)
+        predictions = probe.predict(features)
+
+        self.assertEqual(probe.feature_dim, 2)
+        np.testing.assert_allclose(predictions, targets, rtol=0.0, atol=1e-10)
+
+    def test_dual_ridge_is_deterministic_and_returns_finite_predictions(self):
+        features = np.asarray(
+            [
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        targets = np.asarray(
+            [
+                [1.0, 2.0, 0.0, 1.0, 0.5],
+                [2.0, 3.0, 1.0, 0.0, 1.0],
+                [3.0, 4.0, 0.0, -1.0, 1.5],
+            ],
+            dtype=np.float32,
+        )
+
+        first = fit_linear_state_probe(features, targets, ridge=1e-3)
+        second = fit_linear_state_probe(features, targets, ridge=1e-3)
+
+        np.testing.assert_array_equal(first.weight, second.weight)
+        np.testing.assert_array_equal(first.bias, second.bias)
+        self.assertTrue(np.all(np.isfinite(first.predict(features))))
+        self.assertEqual(first.solver, "dual")
+
+    def test_probe_and_fit_validation_fail_closed(self):
+        features = np.ones((3, 2), dtype=np.float32)
+        targets = np.ones((3, 5), dtype=np.float32)
+        invalid = (
+            (features[:0], targets[:0], 1e-3),
+            (features, targets[:2], 1e-3),
+            (features[:, :0], targets, 1e-3),
+            (features, targets[:, :4], 1e-3),
+            (features, targets, -1.0),
+            (features, targets, float("inf")),
+        )
+        for x, y, ridge in invalid:
+            with self.subTest(x_shape=x.shape, y_shape=y.shape, ridge=ridge):
+                with self.assertRaises(ValueError):
+                    fit_linear_state_probe(x, y, ridge=ridge)
+        probe = fit_linear_state_probe(features, targets, ridge=1e-3)
+        with self.assertRaises(ValueError):
+            probe.predict(np.ones((2, 3), dtype=np.float32))
+        with self.assertRaises(ValueError):
+            probe.predict(np.asarray([[np.nan, 0.0]], dtype=np.float32))
+
+    def test_mean_baseline_and_registered_gates_are_exact(self):
+        train_targets = np.asarray(
+            [
+                [1.0, 2.0, 0.0, 1.0, 0.5],
+                [3.0, 4.0, 1.0, 0.0, 1.5],
+            ],
+            dtype=np.float32,
+        )
+
+        baseline = mean_target_predictions(train_targets, count=3)
+        gates = representation_probe_gates(
+            recorded={
+                "mean_centre_error_pixels": 3.0,
+                "mean_heading_error_degrees": 44.0,
+                "mean_velocity_error": 0.90,
+            },
+            reversed_metrics={"mean_velocity_error": 1.00},
+            repeat_last_metrics={"mean_velocity_error": 1.10},
+        )
+
+        np.testing.assert_allclose(
+            baseline,
+            np.repeat(np.mean(train_targets, axis=0, keepdims=True), 3, axis=0),
+        )
+        self.assertEqual(
+            gates,
+            {
+                "centre_mean_le_3px": True,
+                "heading_mean_lt_45deg": True,
+                "velocity_beats_reversed_5pct": True,
+                "velocity_beats_repeat_last_5pct": True,
+            },
+        )
+        failing = representation_probe_gates(
+            recorded={
+                "mean_centre_error_pixels": 3.01,
+                "mean_heading_error_degrees": 45.0,
+                "mean_velocity_error": 0.96,
+            },
+            reversed_metrics={"mean_velocity_error": 1.00},
+            repeat_last_metrics={"mean_velocity_error": 1.00},
+        )
+        self.assertFalse(any(failing.values()))
 
 
 if __name__ == "__main__":

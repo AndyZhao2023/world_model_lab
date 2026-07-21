@@ -453,3 +453,190 @@ class FrozenVJEPAEncoder:
             features.detach().cpu(),
             dtype=np.float32,
         ).copy()
+
+
+@dataclass(frozen=True)
+class LinearStateProbe:
+    """Deterministic affine probe from frozen features to physical targets."""
+
+    weight: np.ndarray
+    bias: np.ndarray
+    ridge: float
+    solver: str
+
+    def __post_init__(self) -> None:
+        weight = np.asarray(self.weight, dtype=np.float64)
+        bias = np.asarray(self.bias, dtype=np.float64)
+        if (
+            weight.ndim != 2
+            or weight.shape[0] == 0
+            or weight.shape[1] != 5
+            or bias.shape != (5,)
+            or not np.all(np.isfinite(weight))
+            or not np.all(np.isfinite(bias))
+        ):
+            raise ValueError("probe weight and bias must be finite [D, 5] and [5]")
+        if (
+            not np.isfinite(self.ridge)
+            or self.ridge < 0.0
+            or self.solver not in {"lstsq", "primal", "dual"}
+        ):
+            raise ValueError("probe ridge or solver is invalid")
+        object.__setattr__(self, "weight", _readonly_copy(weight))
+        object.__setattr__(self, "bias", _readonly_copy(bias))
+        object.__setattr__(self, "ridge", float(self.ridge))
+
+    @property
+    def feature_dim(self) -> int:
+        return int(self.weight.shape[0])
+
+    def predict(self, features: np.ndarray) -> np.ndarray:
+        values = np.asarray(features, dtype=np.float64)
+        if (
+            values.ndim != 2
+            or values.shape[0] == 0
+            or values.shape[1] != self.feature_dim
+            or not np.all(np.isfinite(values))
+        ):
+            raise ValueError(
+                f"features must be finite non-empty [N, {self.feature_dim}]"
+            )
+        predictions = values @ self.weight + self.bias
+        if not np.all(np.isfinite(predictions)):
+            raise ValueError("probe predictions are non-finite")
+        return predictions
+
+
+def _validated_probe_fit_arrays(
+    features: np.ndarray,
+    targets: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(features, dtype=np.float64)
+    y = np.asarray(targets, dtype=np.float64)
+    if (
+        x.ndim != 2
+        or x.shape[0] == 0
+        or x.shape[1] == 0
+        or y.shape != (x.shape[0], 5)
+        or not np.all(np.isfinite(x))
+        or not np.all(np.isfinite(y))
+    ):
+        raise ValueError("features and targets must be finite [N, D] and [N, 5]")
+    return x, y
+
+
+def fit_linear_state_probe(
+    features: np.ndarray,
+    targets: np.ndarray,
+    *,
+    ridge: float,
+) -> LinearStateProbe:
+    """Fit an affine probe with a stable primal or dual ridge solve."""
+
+    x, y = _validated_probe_fit_arrays(features, targets)
+    penalty = float(ridge)
+    if not np.isfinite(penalty) or penalty < 0.0:
+        raise ValueError("ridge must be finite and non-negative")
+    if penalty == 0.0:
+        design = np.concatenate(
+            (x, np.ones((x.shape[0], 1), dtype=np.float64)),
+            axis=1,
+        )
+        solution, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
+        weight = solution[:-1]
+        bias = solution[-1]
+        solver = "lstsq"
+    else:
+        feature_mean = np.mean(x, axis=0)
+        target_mean = np.mean(y, axis=0)
+        centered_x = x - feature_mean
+        centered_y = y - target_mean
+        if x.shape[0] <= x.shape[1]:
+            system = (
+                centered_x @ centered_x.T
+                + penalty * np.eye(x.shape[0], dtype=np.float64)
+            )
+            weight = centered_x.T @ np.linalg.solve(system, centered_y)
+            solver = "dual"
+        else:
+            system = (
+                centered_x.T @ centered_x
+                + penalty * np.eye(x.shape[1], dtype=np.float64)
+            )
+            weight = np.linalg.solve(system, centered_x.T @ centered_y)
+            solver = "primal"
+        bias = target_mean - feature_mean @ weight
+    if not np.all(np.isfinite(weight)) or not np.all(np.isfinite(bias)):
+        raise ValueError("linear state probe fit produced non-finite values")
+    return LinearStateProbe(
+        weight=weight,
+        bias=bias,
+        ridge=penalty,
+        solver=solver,
+    )
+
+
+def mean_target_predictions(
+    train_targets: np.ndarray,
+    *,
+    count: int,
+) -> np.ndarray:
+    """Repeat the train-split mean as a no-visual-information baseline."""
+
+    targets = np.asarray(train_targets, dtype=np.float64)
+    sample_count = int(count)
+    if (
+        targets.ndim != 2
+        or targets.shape[0] == 0
+        or targets.shape[1] != 5
+        or not np.all(np.isfinite(targets))
+    ):
+        raise ValueError("train_targets must be finite non-empty [N, 5]")
+    if sample_count <= 0:
+        raise ValueError("count must be positive")
+    return np.repeat(
+        np.mean(targets, axis=0, keepdims=True),
+        sample_count,
+        axis=0,
+    )
+
+
+def _finite_metric(
+    metrics: Mapping[str, float | int],
+    name: str,
+) -> float:
+    try:
+        value = float(metrics[name])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(f"metrics must contain numeric {name}") from None
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError(f"metrics {name} must be finite and non-negative")
+    return value
+
+
+def representation_probe_gates(
+    *,
+    recorded: Mapping[str, float | int],
+    reversed_metrics: Mapping[str, float | int],
+    repeat_last_metrics: Mapping[str, float | int],
+) -> dict[str, bool]:
+    """Apply the pre-registered P1 state and temporal-sensitivity gates."""
+
+    centre = _finite_metric(recorded, "mean_centre_error_pixels")
+    heading = _finite_metric(recorded, "mean_heading_error_degrees")
+    velocity = _finite_metric(recorded, "mean_velocity_error")
+    reversed_velocity = _finite_metric(
+        reversed_metrics,
+        "mean_velocity_error",
+    )
+    repeated_velocity = _finite_metric(
+        repeat_last_metrics,
+        "mean_velocity_error",
+    )
+    return {
+        "centre_mean_le_3px": centre <= 3.0,
+        "heading_mean_lt_45deg": heading < 45.0,
+        "velocity_beats_reversed_5pct": velocity <= 0.95 * reversed_velocity,
+        "velocity_beats_repeat_last_5pct": velocity
+        <= 0.95 * repeated_velocity,
+    }
