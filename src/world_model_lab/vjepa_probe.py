@@ -4,14 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
+import torch
 
 from .visual_dataset import CONTEXT_FRAMES, IMAGE_SIZE, validate_visual_dataset
 from .visual_windows import VisualWindowIndex
 
 
 _CLIP_ORDERS = frozenset({"recorded", "reversed", "repeat_last"})
+DEFAULT_VJEPA_MODEL_ID = "facebook/vjepa2-vitl-fpc64-256"
+VJEPA_POOLING = "last_tubelet_mean_plus_last_minus_first"
 
 
 def _readonly_copy(
@@ -254,3 +258,198 @@ def state_probe_metrics(
         "mean_velocity_error": float(np.mean(velocity_errors)),
         "p95_velocity_error": float(np.quantile(velocity_errors, 0.95)),
     }
+
+
+def pool_vjepa_tokens(
+    tokens: torch.Tensor,
+    *,
+    tubelet_count: int,
+    spatial_tokens: int,
+) -> torch.Tensor:
+    """Pool encoder tokens into current-state and temporal-delta features."""
+
+    tubelets = int(tubelet_count)
+    patches = int(spatial_tokens)
+    if tubelets <= 0 or patches <= 0:
+        raise ValueError("tubelet_count and spatial_tokens must be positive")
+    if (
+        tokens.ndim != 3
+        or tokens.shape[0] == 0
+        or tokens.shape[1] != tubelets * patches
+        or tokens.shape[2] == 0
+        or not bool(torch.all(torch.isfinite(tokens)))
+    ):
+        raise ValueError(
+            "tokens must be finite [B, tubelet_count * spatial_tokens, D]"
+        )
+    grids = tokens.reshape(tokens.shape[0], tubelets, patches, tokens.shape[2])
+    tubelet_means = torch.mean(grids, dim=2)
+    first = tubelet_means[:, 0]
+    last = tubelet_means[:, -1]
+    return torch.cat((last, last - first), dim=1)
+
+
+class FrozenVJEPAEncoder:
+    """Lazy, frozen adapter around the Hugging Face V-JEPA 2 encoder."""
+
+    def __init__(
+        self,
+        *,
+        processor: Any,
+        model: torch.nn.Module,
+        model_id: str,
+        revision: str,
+        device: str,
+    ) -> None:
+        if not str(model_id).strip():
+            raise ValueError("model_id must be non-empty")
+        if not str(revision).strip():
+            raise ValueError("revision must be non-empty")
+        if not hasattr(model, "config") or not hasattr(
+            model,
+            "get_vision_features",
+        ):
+            raise ValueError(
+                "model must expose config and get_vision_features"
+            )
+        self.processor = processor
+        self.model = model
+        self.model_id = str(model_id)
+        self.revision = str(revision)
+        self.device = torch.device(device)
+        config = model.config
+        contract = {
+            "tubelet_size": getattr(config, "tubelet_size", None),
+            "crop_size": getattr(config, "crop_size", None),
+            "patch_size": getattr(config, "patch_size", None),
+            "hidden_size": getattr(config, "hidden_size", None),
+        }
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value <= 0
+            for value in contract.values()
+        ):
+            raise ValueError("model config has an invalid V-JEPA shape contract")
+        if contract["crop_size"] % contract["patch_size"] != 0:
+            raise ValueError("crop_size must be divisible by patch_size")
+        self.tubelet_size = int(contract["tubelet_size"])
+        self.crop_size = int(contract["crop_size"])
+        self.patch_size = int(contract["patch_size"])
+        self.hidden_size = int(contract["hidden_size"])
+        resolved = getattr(config, "_commit_hash", None)
+        self.resolved_revision = (
+            str(resolved) if resolved is not None else self.revision
+        )
+        self.model.requires_grad_(False)
+        self.model.eval()
+        self.model.to(self.device)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_id: str = DEFAULT_VJEPA_MODEL_ID,
+        *,
+        revision: str = "main",
+        device: str = "cpu",
+    ) -> FrozenVJEPAEncoder:
+        """Load the optional Transformers integration only when requested."""
+
+        try:
+            from transformers import AutoModel, AutoVideoProcessor
+        except ImportError as error:
+            raise RuntimeError(
+                "V-JEPA support requires `pip install world-model-lab[vjepa]`"
+            ) from error
+        processor = AutoVideoProcessor.from_pretrained(
+            model_id,
+            revision=revision,
+        )
+        model = AutoModel.from_pretrained(
+            model_id,
+            revision=revision,
+            attn_implementation="sdpa",
+        )
+        return cls(
+            processor=processor,
+            model=model,
+            model_id=model_id,
+            revision=revision,
+            device=device,
+        )
+
+    @property
+    def metadata(self) -> dict[str, str | int]:
+        """Return the exact frozen-encoder contract used for extraction."""
+
+        return {
+            "model_id": self.model_id,
+            "requested_revision": self.revision,
+            "resolved_revision": self.resolved_revision,
+            "device": str(self.device),
+            "tubelet_size": self.tubelet_size,
+            "crop_size": self.crop_size,
+            "patch_size": self.patch_size,
+            "hidden_size": self.hidden_size,
+            "feature_dim": self.hidden_size * 2,
+            "pooling": VJEPA_POOLING,
+        }
+
+    def encode(self, clips: np.ndarray) -> np.ndarray:
+        """Return owned float32 pooled features for uint8 four-frame clips."""
+
+        values = np.asarray(clips)
+        if (
+            values.ndim != 5
+            or values.shape[0] == 0
+            or values.shape[1:] != (
+                CONTEXT_FRAMES,
+                IMAGE_SIZE,
+                IMAGE_SIZE,
+                3,
+            )
+            or values.dtype != np.dtype(np.uint8)
+        ):
+            raise ValueError(
+                "clips must have dtype uint8 and shape [B, 4, 64, 64, 3]"
+            )
+        if CONTEXT_FRAMES % self.tubelet_size != 0:
+            raise ValueError("context frames must be divisible by tubelet size")
+        videos = [clip.copy() for clip in values]
+        processed = self.processor(videos, return_tensors="pt")
+        try:
+            pixel_values = processed["pixel_values_videos"]
+        except (KeyError, TypeError):
+            raise ValueError(
+                "processor must return pixel_values_videos"
+            ) from None
+        if (
+            not isinstance(pixel_values, torch.Tensor)
+            or pixel_values.ndim != 5
+            or pixel_values.shape[0] != values.shape[0]
+            or pixel_values.shape[1] != CONTEXT_FRAMES
+            or pixel_values.shape[2] != 3
+            or pixel_values.shape[3:] != (self.crop_size, self.crop_size)
+            or not bool(torch.all(torch.isfinite(pixel_values)))
+        ):
+            raise ValueError(
+                "processor output must be finite [B, 4, 3, crop, crop]"
+            )
+        pixel_values = pixel_values.to(self.device)
+        with torch.inference_mode():
+            tokens = self.model.get_vision_features(pixel_values)
+        if not isinstance(tokens, torch.Tensor):
+            raise ValueError("model must return a token tensor")
+        tubelet_count = CONTEXT_FRAMES // self.tubelet_size
+        grid_size = self.crop_size // self.patch_size
+        features = pool_vjepa_tokens(
+            tokens,
+            tubelet_count=tubelet_count,
+            spatial_tokens=grid_size * grid_size,
+        )
+        if features.shape != (values.shape[0], self.hidden_size * 2):
+            raise ValueError("pooled V-JEPA feature shape is inconsistent")
+        return np.asarray(
+            features.detach().cpu(),
+            dtype=np.float32,
+        ).copy()

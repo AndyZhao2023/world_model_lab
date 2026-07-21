@@ -3,10 +3,14 @@ from __future__ import annotations
 import unittest
 
 import numpy as np
+import torch
+from torch import nn
 
 from tests.test_visual_windows import make_visual_dataset
 from world_model_lab.vjepa_probe import (
+    FrozenVJEPAEncoder,
     build_probe_clip_batch,
+    pool_vjepa_tokens,
     select_evenly_spaced_positions,
     state_probe_metrics,
     state_to_probe_targets,
@@ -200,6 +204,145 @@ class StateProbeMetricTest(unittest.TestCase):
                 target,
                 world_bounds=np.asarray([0.0, 0.0, 0.0, 8.0]),
             )
+
+
+class FakeVideoProcessor:
+    def __init__(self):
+        self.videos_seen: list[np.ndarray] | None = None
+
+    def __call__(
+        self,
+        videos: list[np.ndarray],
+        *,
+        return_tensors: str,
+    ) -> dict[str, torch.Tensor]:
+        self.videos_seen = videos
+        if return_tensors != "pt":
+            raise AssertionError("expected PyTorch tensors")
+        return {
+            "pixel_values_videos": torch.zeros(
+                (len(videos), 4, 3, 256, 256),
+                dtype=torch.float32,
+            )
+        }
+
+
+class FakeVJEPAConfig:
+    tubelet_size = 2
+    crop_size = 256
+    patch_size = 16
+    hidden_size = 4
+    _commit_hash = "fake-revision"
+
+
+class FakeVJEPAModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(()))
+        self.config = FakeVJEPAConfig()
+        self.get_vision_features_called = False
+
+    def get_vision_features(
+        self,
+        pixel_values_videos: torch.Tensor,
+    ) -> torch.Tensor:
+        self.get_vision_features_called = True
+        batch_size = int(pixel_values_videos.shape[0])
+        first = torch.ones((batch_size, 256, 4), dtype=torch.float32)
+        last = torch.full((batch_size, 256, 4), 3.0, dtype=torch.float32)
+        return torch.cat((first, last), dim=1) * self.weight
+
+
+class FrozenVJEPAEncoderTest(unittest.TestCase):
+    def test_pooling_keeps_last_tubelet_and_temporal_delta(self):
+        tokens = torch.tensor(
+            [[[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]]
+        )
+
+        pooled = pool_vjepa_tokens(
+            tokens,
+            tubelet_count=2,
+            spatial_tokens=2,
+        )
+
+        torch.testing.assert_close(
+            pooled,
+            torch.tensor([[6.0, 7.0, 4.0, 4.0]]),
+        )
+
+    def test_encoder_freezes_model_and_returns_owned_finite_features(self):
+        processor = FakeVideoProcessor()
+        model = FakeVJEPAModel()
+        encoder = FrozenVJEPAEncoder(
+            processor=processor,
+            model=model,
+            model_id="fake/vjepa",
+            revision="fake-revision",
+            device="cpu",
+        )
+        clips = np.zeros((2, 4, 64, 64, 3), dtype=np.uint8)
+
+        features = encoder.encode(clips)
+
+        self.assertEqual(features.shape, (2, 8))
+        self.assertEqual(features.dtype, np.float32)
+        np.testing.assert_array_equal(features[:, :4], 3.0)
+        np.testing.assert_array_equal(features[:, 4:], 2.0)
+        self.assertTrue(model.get_vision_features_called)
+        self.assertFalse(model.training)
+        self.assertTrue(all(not parameter.requires_grad for parameter in model.parameters()))
+        self.assertEqual(len(processor.videos_seen or []), 2)
+        features[0, 0] = 100.0
+        self.assertEqual(float(model.weight), 1.0)
+
+    def test_encoder_metadata_exposes_the_effective_contract(self):
+        encoder = FrozenVJEPAEncoder(
+            processor=FakeVideoProcessor(),
+            model=FakeVJEPAModel(),
+            model_id="fake/vjepa",
+            revision="requested-revision",
+            device="cpu",
+        )
+
+        self.assertEqual(
+            encoder.metadata,
+            {
+                "model_id": "fake/vjepa",
+                "requested_revision": "requested-revision",
+                "resolved_revision": "fake-revision",
+                "device": "cpu",
+                "tubelet_size": 2,
+                "crop_size": 256,
+                "patch_size": 16,
+                "hidden_size": 4,
+                "feature_dim": 8,
+                "pooling": "last_tubelet_mean_plus_last_minus_first",
+            },
+        )
+
+    def test_pooling_and_encoder_validation_fail_closed(self):
+        with self.assertRaises(ValueError):
+            pool_vjepa_tokens(
+                torch.zeros((2, 5, 4)),
+                tubelet_count=2,
+                spatial_tokens=2,
+            )
+        encoder = FrozenVJEPAEncoder(
+            processor=FakeVideoProcessor(),
+            model=FakeVJEPAModel(),
+            model_id="fake/vjepa",
+            revision="fake-revision",
+            device="cpu",
+        )
+        invalid_clips = (
+            np.zeros((0, 4, 64, 64, 3), dtype=np.uint8),
+            np.zeros((1, 3, 64, 64, 3), dtype=np.uint8),
+            np.zeros((1, 4, 64, 64, 3), dtype=np.float32),
+        )
+        for clips in invalid_clips:
+            with self.subTest(shape=clips.shape, dtype=clips.dtype):
+                with self.assertRaises(ValueError):
+                    encoder.encode(clips)
 
 
 if __name__ == "__main__":
