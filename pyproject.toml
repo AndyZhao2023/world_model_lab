@@ -32,6 +32,7 @@ world-model-diagnose-visual-autoencoder = "world_model_lab.diagnose_visual_autoe
 world-model-diagnose-visual-rollout = "world_model_lab.diagnose_visual_rollout:main"
 world-model-evaluate-rollout = "world_model_lab.evaluate_rollout:main"
 world-model-multiseed = "world_model_lab.multiseed_experiment:main"
+world-model-vjepa-probe = "world_model_lab.run_vjepa_probe:main"
 world-model-plot-training = "world_model_lab.plot_training:main"
 world-model-train = "world_model_lab.train_world_model:main"
 world-model-train-visual-dynamics-objective = "world_model_lab.train_visual_dynamics_objective:main"
