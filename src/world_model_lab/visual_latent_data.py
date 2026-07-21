@@ -20,6 +20,7 @@ from .visual_latent_model import (
     ConvAutoencoder,
     SpatialConvAutoencoder,
 )
+from .visual_observation import CAR_COLOR, HEADING_COLOR
 from .visual_windows import VisualWindowIndex
 
 
@@ -78,6 +79,34 @@ def frames_to_tensor(frames: np.ndarray) -> torch.Tensor:
         .permute(0, 3, 1, 2)
         .to(dtype=torch.float32)
         .div_(255.0)
+    )
+    return tensor[0] if single else tensor
+
+
+def renderer_object_masks(frames: np.ndarray) -> torch.Tensor:
+    """Return exact binary masks for rendered car and heading pixels."""
+
+    values = np.asarray(frames)
+    single = values.ndim == 3
+    if single:
+        values = values[None, ...]
+    if (
+        values.ndim != 4
+        or values.shape[1:] != (IMAGE_SIZE, IMAGE_SIZE, 3)
+        or values.dtype != np.dtype(np.uint8)
+    ):
+        raise ValueError(
+            "frames must have dtype uint8 and shape "
+            "[64, 64, 3] or [N, 64, 64, 3]"
+        )
+    car_color = np.asarray(CAR_COLOR, dtype=np.uint8)
+    heading_color = np.asarray(HEADING_COLOR, dtype=np.uint8)
+    masks = np.all(values == car_color, axis=3) | np.all(
+        values == heading_color,
+        axis=3,
+    )
+    tensor = torch.from_numpy(masks.copy()).unsqueeze(1).to(
+        dtype=torch.float32
     )
     return tensor[0] if single else tensor
 
@@ -209,6 +238,41 @@ class VisualMotionFrameDataset(Dataset):
         return frames_to_tensor(frame), motion_mask
 
 
+class VisualObjectFrameDataset(Dataset):
+    """Return selected frames with exact renderer-derived object masks."""
+
+    def __init__(
+        self,
+        dataset: Mapping[str, np.ndarray],
+        selected_episode_ids: np.ndarray,
+    ) -> None:
+        self.frame_indices = frame_indices_for_episode_ids(
+            dataset,
+            selected_episode_ids,
+        )
+        self.frame_indices.setflags(write=False)
+        self._frames = np.asarray(dataset["frames"])
+
+    def __len__(self) -> int:
+        return int(self.frame_indices.size)
+
+    def __getitem__(self, item: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if isinstance(item, (bool, np.bool_)):
+            raise TypeError("object frame dataset index must be an integer")
+        try:
+            position = operator.index(item)
+        except TypeError:
+            raise TypeError(
+                "object frame dataset index must be an integer"
+            ) from None
+        if position < 0:
+            position += len(self)
+        if position < 0 or position >= len(self):
+            raise IndexError("object frame dataset index out of range")
+        frame = self._frames[int(self.frame_indices[position])]
+        return frames_to_tensor(frame), renderer_object_masks(frame)
+
+
 def fit_safe_normalizer(
     values: np.ndarray,
     *,
@@ -327,6 +391,79 @@ class LatentWindowArrays:
         return int(self.context_latents.shape[0])
 
 
+@dataclass(frozen=True)
+class LatentRolloutArrays:
+    """Compact episode-safe arrays for recursive latent dynamics training."""
+
+    context_latents: np.ndarray
+    history_actions: np.ndarray
+    rollout_actions: np.ndarray
+    target_latents: np.ndarray
+    initial_frame_indices: np.ndarray
+    target_frame_indices: np.ndarray
+    episode_ids: np.ndarray
+    start_step_ids: np.ndarray
+
+    def __post_init__(self) -> None:
+        context = np.asarray(self.context_latents)
+        actions = np.asarray(self.rollout_actions)
+        if (
+            context.ndim != 3
+            or context.shape[0] == 0
+            or context.shape[1] != CONTEXT_FRAMES
+            or context.shape[2] == 0
+        ):
+            raise ValueError(
+                "context_latents must have shape [N, 4, latent_dim]"
+            )
+        count, _, latent_dim = context.shape
+        if actions.ndim != 3 or actions.shape[0] != count:
+            raise ValueError("rollout_actions must have shape [N, H, 2]")
+        horizon = int(actions.shape[1])
+        if horizon <= 0 or actions.shape[2] != 2:
+            raise ValueError("rollout_actions must have shape [N, H, 2]")
+        expected_shapes = {
+            "history_actions": (count, CONTEXT_FRAMES - 1, 2),
+            "rollout_actions": (count, horizon, 2),
+            "target_latents": (count, horizon, latent_dim),
+            "initial_frame_indices": (count,),
+            "target_frame_indices": (count, horizon),
+            "episode_ids": (count,),
+            "start_step_ids": (count,),
+        }
+        for name, shape in expected_shapes.items():
+            if np.asarray(getattr(self, name)).shape != shape:
+                raise ValueError(f"{name} must have shape {list(shape)}")
+        for name in (
+            "context_latents",
+            "history_actions",
+            "rollout_actions",
+            "target_latents",
+        ):
+            if not np.all(np.isfinite(np.asarray(getattr(self, name)))):
+                raise ValueError(f"{name} must contain only finite values")
+        for name in (
+            "initial_frame_indices",
+            "target_frame_indices",
+            "episode_ids",
+            "start_step_ids",
+        ):
+            if np.asarray(getattr(self, name)).dtype != np.dtype(np.int64):
+                raise ValueError(f"{name} must have dtype int64")
+        for name in self.__dataclass_fields__:
+            values = np.asarray(getattr(self, name)).copy()
+            values.setflags(write=False)
+            object.__setattr__(self, name, values)
+
+    @property
+    def count(self) -> int:
+        return int(self.context_latents.shape[0])
+
+    @property
+    def horizon(self) -> int:
+        return int(self.rollout_actions.shape[1])
+
+
 def build_latent_window_arrays(
     dataset: Mapping[str, np.ndarray],
     index: VisualWindowIndex,
@@ -395,4 +532,130 @@ def build_latent_window_arrays(
         target_frame_indices=np.asarray(target_frame_indices, dtype=np.int64),
         episode_ids=np.asarray(episode_ids, dtype=np.int64),
         step_ids=np.asarray(step_ids, dtype=np.int64),
+    )
+
+
+def build_latent_rollout_arrays(
+    dataset: Mapping[str, np.ndarray],
+    selected_episode_ids: np.ndarray,
+    latent_frames: np.ndarray,
+    *,
+    horizon: int,
+) -> LatentRolloutArrays:
+    """Build every valid H-step latent rollout inside selected episodes."""
+
+    validate_visual_dataset(dataset)
+    if (
+        isinstance(horizon, (bool, np.bool_))
+        or not isinstance(horizon, (int, np.integer))
+        or int(horizon) <= 0
+    ):
+        raise ValueError("horizon must be a positive integer")
+    rollout_horizon = int(horizon)
+    _, positions = _selected_episode_positions(
+        dataset,
+        selected_episode_ids,
+    )
+    latents = np.asarray(latent_frames)
+    frame_count = int(np.asarray(dataset["frames"]).shape[0])
+    if (
+        latents.ndim != 2
+        or latents.shape[0] != frame_count
+        or latents.shape[1] == 0
+        or not np.all(np.isfinite(latents))
+    ):
+        raise ValueError(
+            "latent_frames must be finite [F, latent_dim] matching frames"
+        )
+
+    transition_offsets = np.asarray(
+        dataset["transition_offsets"],
+        dtype=np.int64,
+    )
+    episode_position_chunks: list[np.ndarray] = []
+    start_step_chunks: list[np.ndarray] = []
+    first_step = CONTEXT_FRAMES - 1
+    for position in positions.tolist():
+        transition_count = int(
+            transition_offsets[position + 1]
+            - transition_offsets[position]
+        )
+        starts = np.arange(
+            first_step,
+            transition_count - rollout_horizon + 1,
+            dtype=np.int64,
+        )
+        if starts.size:
+            episode_position_chunks.append(
+                np.full(starts.shape, position, dtype=np.int64)
+            )
+            start_step_chunks.append(starts)
+    if not start_step_chunks:
+        raise ValueError(
+            "selected episodes are not long enough for rollout horizon"
+        )
+    episode_positions = np.concatenate(episode_position_chunks)
+    start_steps = np.concatenate(start_step_chunks)
+    frame_offsets = np.asarray(dataset["frame_offsets"], dtype=np.int64)
+    frame_starts = (
+        frame_offsets[episode_positions]
+        + start_steps
+        - (CONTEXT_FRAMES - 1)
+    )
+    action_starts = (
+        transition_offsets[episode_positions]
+        + start_steps
+        - (CONTEXT_FRAMES - 1)
+    )
+    context_indices = (
+        frame_starts[:, None]
+        + np.arange(CONTEXT_FRAMES, dtype=np.int64)[None, :]
+    )
+    history_action_indices = (
+        action_starts[:, None]
+        + np.arange(CONTEXT_FRAMES - 1, dtype=np.int64)[None, :]
+    )
+    rollout_action_indices = (
+        action_starts[:, None]
+        + CONTEXT_FRAMES
+        - 1
+        + np.arange(rollout_horizon, dtype=np.int64)[None, :]
+    )
+    target_frame_indices = (
+        frame_starts[:, None]
+        + CONTEXT_FRAMES
+        + np.arange(rollout_horizon, dtype=np.int64)[None, :]
+    )
+    initial_frame_indices = frame_starts + CONTEXT_FRAMES - 1
+    actions = np.asarray(dataset["actions"], dtype=np.float64)
+    episode_ids = np.asarray(dataset["episode_ids"], dtype=np.int64)[
+        episode_positions
+    ]
+    return LatentRolloutArrays(
+        context_latents=np.asarray(
+            latents[context_indices],
+            dtype=np.float32,
+        ),
+        history_actions=np.asarray(
+            actions[history_action_indices],
+            dtype=np.float64,
+        ),
+        rollout_actions=np.asarray(
+            actions[rollout_action_indices],
+            dtype=np.float64,
+        ),
+        target_latents=np.asarray(
+            latents[target_frame_indices],
+            dtype=np.float32,
+        ),
+        initial_frame_indices=np.asarray(
+            initial_frame_indices,
+            dtype=np.int64,
+        ),
+        target_frame_indices=np.asarray(
+            target_frame_indices,
+            dtype=np.int64,
+        ),
+        episode_ids=np.asarray(episode_ids, dtype=np.int64),
+        start_step_ids=np.asarray(start_steps, dtype=np.int64),
     )

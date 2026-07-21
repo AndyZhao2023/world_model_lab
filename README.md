@@ -310,6 +310,149 @@ MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
 默认的 `--latent-layout global` 仍使用原来的 `ConvAutoencoder` 和
 `LatentDynamicsMLP`，所以旧命令和旧 checkpoint 保持兼容。
 
+### 使用冻结 Decoder 对齐 Dynamics 训练目标
+
+空间 CNN 的 latent MSE 与解码后的小车质量并不完全一致。下面的命令复用已经训练
+成功的空间 autoencoder、normalizer 和 episode split，只重新初始化并训练相同的
+CNN dynamics：
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
+  .venv/bin/python -m \
+  world_model_lab.train_visual_dynamics_objective \
+  --data data/visual_episodes.npz \
+  --source-checkpoint artifacts/visual_latent_spatial8.pt \
+  --output artifacts/visual_latent_spatial8_objective_w01.pt \
+  --preview artifacts/visual_latent_spatial8_objective_w01_predictions.png \
+  --changed-pixel-loss-weight 0.1 \
+  --dynamics-epochs 50 \
+  --dynamics-batch-size 256
+```
+
+训练目标为：
+
+```text
+total loss
+  = normalized latent MSE
+  + 0.1 * decoded changed-pixel MAE
+```
+
+预测 latent 会先反归一化，再通过冻结 decoder 生成图像。变化区域 mask 来自训练
+样本的真实目标帧与最后一张 context frame 的 RGB 差异，只作为监督信号；推理时
+模型仍然只能看到四帧历史和对齐动作。该路径不读取物理状态、小车位置标签、
+reward 或 done，也不会更新 autoencoder 权重或重新拟合 normalizer。
+
+在固定权重 `0.1` 的受控实验中，变化区 MAE 从 latent-only CNN 的
+`0.314072` 降至 `0.299908`，改善 `4.51%`；normalized latent MSE 从
+`0.0308590` 变为 `0.0313650`，恶化 `1.64%`。该候选通过预先设定的变化区改善
+和 latent 稳定性门槛，成为当前领先的一步 dynamics 目标。Mean-action 仍略优于
+真实动作的解码变化区指标，因此动作因果性仍需在后续多步实验中验证。
+
+### 视觉多步 Rollout 与 Action 反事实诊断
+
+下面的诊断冻结 latent-only 与 objective-aligned 两个 checkpoint，在相同测试
+episode 上比较 teacher forcing、递归 free rollout，以及只替换未来 action 序列后
+的轨迹分离：
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
+  .venv/bin/python -m world_model_lab.diagnose_visual_rollout \
+  --data data/visual_episodes.npz \
+  --baseline-checkpoint artifacts/visual_latent_spatial8.pt \
+  --aligned-checkpoint artifacts/visual_latent_spatial8_objective_w01.pt \
+  --output-dir \
+    artifacts/diagnostics/visual-rollout-objective-comparison \
+  --horizons 1 5 10 \
+  --windows-per-episode 8 \
+  --counterfactual-seeds 0 1 2 3 4 5 6 7 8 9
+```
+
+命令要求两个 checkpoint 具有完全相同的 spatial autoencoder、normalizer、测试
+划分、数据 SHA-256 和 CNN latent 结构。每个 episode 最多选择八个窗口，先在
+episode 内聚合，再对 episode 等权平均；结果以
+`manifest.json`、`metrics.json` 和 `visual_rollout_comparison.png` 三文件原子
+发布。重新 editable install 后也可使用
+`.venv/bin/world-model-diagnose-visual-rollout`。
+
+当前受控实验包含 18 个可用测试 episode 和 136 个窗口。Objective-aligned 的
+free-rollout 累计变化区 MAE 在 horizon 1、5、10 分别改善 `4.63%`、`13.79%`、
+`9.67%`。替换完整未来 action 序列后，它的 latent divergence 是 baseline 的
+`1.38×` 到 `1.59×`，说明 action 确实影响想象轨迹，而不是被模型完全忽略。
+
+但 horizon 10 的 free-rollout normalized latent MSE 已达到约 `0.857`，teacher
+forcing 只有约 `0.051`，递归误差仍很严重。Action divergence 只证明敏感性，
+不证明没有真实标签的反事实轨迹是正确的。因此当前模型还不应接入 MPC。完整协议
+和结果见
+`docs/experiments/2026-07-17-visual-multistep-rollout-diagnostics.md`。
+
+### H5 递归 Rollout 训练
+
+下一项受控实验复用 objective-aligned checkpoint 的 autoencoder、normalizer 和
+episode split，重新初始化相同的 CNN dynamics，同时训练单步目标和 H5
+free-rollout 目标：
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
+  .venv/bin/python -m \
+  world_model_lab.train_visual_dynamics_recursive \
+  --data data/visual_episodes.npz \
+  --source-checkpoint artifacts/visual_latent_spatial8_objective_w01.pt \
+  --output artifacts/visual_latent_spatial8_objective_w01_h5.pt \
+  --preview artifacts/visual_latent_spatial8_objective_w01_h5_predictions.png \
+  --changed-pixel-loss-weight 0.1 \
+  --rollout-horizon 5 \
+  --rollout-loss-weight 1.0 \
+  --dynamics-epochs 50 \
+  --dynamics-batch-size 256
+```
+
+每一步都会把自己的预测 latent 放回四帧 context，后续误差可以穿过之前的预测反向
+传播。总损失是原单步目标加上五步目标的平均值；decoder 仍冻结，变化区 mask 仍只
+用于监督。
+
+结果表明 H5 free-rollout latent MSE 改善 `30.04%`，但累计变化区 MAE 恶化
+`0.265%`，因此只通过四个预注册门槛中的三个，未晋级为默认模型。作为次要结果，
+H10 latent MSE 改善 `30.73%`，累计变化区 MAE 改善 `1.98%`。这说明递归训练确实
+缓解了 latent 漂移，但还没有在训练 horizon 上稳定改善小车像素轨迹。当前默认仍是
+`visual_latent_spatial8_objective_w01.pt`，两者都不接入 MPC；下一步应生成有真实
+标签的 action 反事实轨迹，或直接监督对象运动。完整协议、门槛和结果见
+`docs/experiments/2026-07-18-visual-recursive-rollout-training.md`。
+
+### 有真实模拟器标签的 Action 反事实诊断
+
+Action sensitivity 只能说明不同 action 会产生不同预测，不能说明预测正确。下面的
+诊断把每个测试窗口作为接收者，用 Sattolo permutation 捐赠另一窗口的完整未来
+action 行，然后从接收者完全相同的当前物理状态运行 `CarEnv`，得到与模型输入逐条
+匹配的反事实真值：
+
+```bash
+MPLBACKEND=Agg MPLCONFIGDIR=/tmp/matplotlib \
+  .venv/bin/python -m \
+  world_model_lab.diagnose_visual_counterfactual \
+  --data data/visual_episodes.npz \
+  --source-checkpoint artifacts/visual_latent_spatial8_objective_w01.pt \
+  --candidate-checkpoint \
+    artifacts/visual_latent_spatial8_objective_w01_h5.pt \
+  --output-dir \
+    artifacts/diagnostics/visual-matched-counterfactual-h5-comparison \
+  --horizons 1 5 10 \
+  --windows-per-episode 8 \
+  --counterfactual-seeds 0 1 2 3 4 5 6 7 8 9 \
+  --decision-horizon 5
+```
+
+环境实际裁剪后的 action 同时送入两个模型。导致终止的 transition 仍计入评价，
+后续无真值步骤才被 mask；指标继续先在 episode 内聚合、再对 episode 等权、最后
+汇总十个 action seed。
+
+H5 候选的 matched latent MSE 在 H5 改善 `27.40%`，真实 latent action-effect
+MSE 改善 `15.63%`，pixel MSE 改善 `10.48%`，说明递归训练确实提高了有真实标签
+的 action-conditioned prediction，而不只是增强敏感性。但 H5 累计变化区 MAE
+恶化 `0.093%`，因此只通过五个预注册门槛中的四个，仍不替换默认 H1 模型，也不
+接入 MPC。下一步应直接监督小车中心、heading 或对象 mask 轨迹，而不是在看到结果
+后修改门槛或立即扫 rollout 权重。完整协议与结果见
+`docs/experiments/2026-07-19-visual-matched-counterfactual-diagnostics.md`。
+
 ## 训练第一个 Learned World Model
 
 安装新增的 PyTorch 依赖：

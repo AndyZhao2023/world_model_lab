@@ -22,11 +22,18 @@ world-model-build-visual-data = "world_model_lab.build_visual_data:main"
 world-model-collect-data = "world_model_lab.collect_data:main"
 world-model-diagnose = "world_model_lab.diagnose_model:main"
 world-model-diagnose-ensemble = "world_model_lab.diagnose_ensemble:main"
+world-model-diagnose-visual-counterfactual = "world_model_lab.diagnose_visual_counterfactual:main"
+world-model-diagnose-visual-autoencoder = "world_model_lab.diagnose_visual_autoencoder:main"
+world-model-diagnose-visual-rollout = "world_model_lab.diagnose_visual_rollout:main"
 world-model-evaluate-rollout = "world_model_lab.evaluate_rollout:main"
 world-model-multiseed = "world_model_lab.multiseed_experiment:main"
 world-model-plot-training = "world_model_lab.plot_training:main"
 world-model-train = "world_model_lab.train_world_model:main"
+world-model-train-visual-dynamics-objective = "world_model_lab.train_visual_dynamics_objective:main"
+world-model-train-visual-dynamics-recursive = "world_model_lab.train_visual_dynamics_recursive:main"
 world-model-train-visual-latent = "world_model_lab.train_visual_latent_model:main"
+world-model-train-visual-object-residual = "world_model_lab.train_visual_object_residual:main"
+world-model-train-visual-object-slot = "world_model_lab.train_visual_object_slot:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

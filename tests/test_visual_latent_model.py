@@ -131,11 +131,71 @@ class SpatialConvAutoencoderTest(unittest.TestCase):
         self.assertEqual(model.latent_dim, 3 * 8 * 8)
         self.assertEqual(tuple(decoded_grid.shape), (2, 3, 64, 64))
         torch.testing.assert_close(decoded_flat, decoded_grid)
+        self.assertFalse(model.object_residual_decoder)
+        self.assertEqual(model.object_head_channels, 0)
+        self.assertFalse(
+            any(
+                name.startswith("object_decoder_convolutions")
+                for name, _ in model.named_parameters()
+            )
+        )
+
+    def test_object_residual_decoder_blends_foreground_with_predicted_alpha(
+        self,
+    ):
+        model = SpatialConvAutoencoder(
+            latent_channels=2,
+            base_channels=4,
+            object_residual_decoder=True,
+            object_head_channels=5,
+            object_initial_alpha=0.01,
+        )
+        latents = torch.zeros((2, 2, 8, 8), dtype=torch.float32)
+
+        base, foreground, mask_logits, composite = (
+            model.decode_components(latents)
+        )
+        decoded = model.decode(latents)
+        alpha = torch.sigmoid(mask_logits)
+
+        self.assertTrue(model.object_residual_decoder)
+        self.assertEqual(model.object_head_channels, 5)
+        self.assertEqual(tuple(base.shape), (2, 3, 64, 64))
+        self.assertEqual(tuple(foreground.shape), (2, 3, 64, 64))
+        self.assertEqual(tuple(mask_logits.shape), (2, 1, 64, 64))
+        self.assertEqual(tuple(composite.shape), (2, 3, 64, 64))
+        torch.testing.assert_close(
+            alpha,
+            torch.full_like(alpha, 0.01),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+        torch.testing.assert_close(
+            composite,
+            base * (1.0 - alpha) + foreground * alpha,
+        )
+        torch.testing.assert_close(decoded, composite)
 
     def test_invalid_configuration_and_shapes_are_rejected(self):
         for kwargs in (
             {"latent_channels": 0},
             {"base_channels": 0},
+            {
+                "object_residual_decoder": True,
+                "object_head_channels": 0,
+            },
+            {
+                "object_residual_decoder": True,
+                "object_initial_alpha": 0.0,
+            },
+            {
+                "object_residual_decoder": True,
+                "object_initial_alpha": 1.0,
+            },
+            {
+                "object_residual_decoder": False,
+                "object_head_channels": 4,
+            },
         ):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(ValueError):
@@ -151,6 +211,8 @@ class SpatialConvAutoencoderTest(unittest.TestCase):
             with self.subTest(shape=latents.shape):
                 with self.assertRaises(ValueError):
                     model.decode(latents)
+        with self.assertRaisesRegex(ValueError, "object residual"):
+            model.decode_components(torch.zeros((2, 2, 8, 8)))
 
 
 class SpatialLatentDynamicsCNNTest(unittest.TestCase):
