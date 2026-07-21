@@ -453,6 +453,39 @@ MSE 改善 `15.63%`，pixel MSE 改善 `10.48%`，说明递归训练确实提高
 后修改门槛或立即扫 rollout 权重。完整协议与结果见
 `docs/experiments/2026-07-19-visual-matched-counterfactual-diagnostics.md`。
 
+### Frozen V-JEPA 2 表征可行性探针
+
+该探针不生成像素，也不训练 action predictor。它把每个合法四帧窗口送入冻结的
+`facebook/vjepa2-vitl-fpc64-256` encoder，只取 encoder tokens，并将第一个和
+最后一个 tubelet 聚合为 `[last, last-first]` 的 2048 维特征。随后只用训练
+episode 拟合线性 ridge probe，预测
+`[x, y, sin(heading), cos(heading), velocity]`。
+
+V-JEPA 依赖保持为可选安装：
+
+```bash
+.venv/bin/python -m pip install -e '.[vjepa]'
+```
+
+CPU pilot：
+
+```bash
+PYTHONPATH=src .venv/bin/python -m world_model_lab.run_vjepa_probe \
+  --data data/visual_episodes.npz \
+  --features artifacts/vjepa2_probe_features.npz \
+  --result artifacts/vjepa2_probe_result.json \
+  --model facebook/vjepa2-vitl-fpc64-256 \
+  --revision main --device cpu --batch-size 1 \
+  --max-train 128 --max-validation 32 --max-test 32 \
+  --ridge 0.001 --split-seed 42
+```
+
+测试集同时提取 `recorded`、`reversed` 和 `repeat_last` 三种输入，但三者始终使用
+原始第 4 帧的物理状态作为标签。预注册门槛是：中心平均误差不超过 3 px、heading
+平均误差低于 45 度，并且 recorded velocity MAE 至少比两种时间消融各低 5%。
+输出 feature NPZ 和 result JSON 都拒绝覆盖；模型缓存、feature 和结果继续留在被
+忽略的本地 artifact 中。
+
 ## 训练第一个 Learned World Model
 
 安装新增的 PyTorch 依赖：
