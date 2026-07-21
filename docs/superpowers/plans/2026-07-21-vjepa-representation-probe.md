@@ -6,7 +6,7 @@
 
 **Architecture:** Reuse the existing episode split and four-frame visual-window contract. A lazy Hugging Face adapter freezes V-JEPA 2, extracts `[B, 512, 1024]` encoder tokens, and pools the first and last tubelets into a 2048-value feature `[last, last-first]`. A deterministic ridge probe predicts `[x, y, sin(heading), cos(heading), velocity]`; held-out recorded, reversed, and repeat-last clips measure state readability and temporal sensitivity.
 
-**Tech Stack:** Python 3.10+, NumPy, PyTorch, optional `transformers>=5.14,<6`, unittest, existing schema-v1 visual artifacts.
+**Tech Stack:** Python 3.10+, NumPy, PyTorch, optional `transformers>=5.14,<6` and `torchvision>=0.21,<0.29`, unittest, existing schema-v1 visual artifacts.
 
 ## Global Constraints
 
@@ -155,7 +155,7 @@ return pool_vjepa_tokens(tokens, tubelet_count=2, spatial_tokens=256)
 
 ```toml
 [project.optional-dependencies]
-vjepa = ["transformers>=5.14,<6"]
+vjepa = ["transformers>=5.14,<6", "torchvision>=0.21,<0.29"]
 ```
 
 - [ ] **Step 5: Run focused and base import tests, then commit**
@@ -361,7 +361,7 @@ git commit -m "feat: add V-JEPA feasibility runner"
 cp /Users/andyzhao/Workspace/world_model_lab/data/transitions.npz data/transitions.npz
 PYTHONPATH=src /Users/andyzhao/Workspace/world_model_lab/.venv/bin/python \
   -m world_model_lab.build_visual_data \
-  --input data/transitions.npz --output data/visual_episodes.npz \
+  --data data/transitions.npz --output data/visual_episodes.npz \
   --preview artifacts/visual_dataset_preview.gif
 shasum -a 256 data/visual_episodes.npz
 ```

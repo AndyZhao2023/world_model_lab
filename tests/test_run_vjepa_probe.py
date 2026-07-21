@@ -172,6 +172,8 @@ class RunVJEPAProbeTest(unittest.TestCase):
             'world-model-vjepa-probe = "world_model_lab.run_vjepa_probe:main"',
             pyproject,
         )
+        self.assertIn('"transformers>=5.14,<6"', pyproject)
+        self.assertIn('"torchvision>=0.21,<0.29"', pyproject)
         with mock.patch(
             "sys.argv",
             ["world-model-vjepa-probe", "--help"],
